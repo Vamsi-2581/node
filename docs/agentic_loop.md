@@ -303,6 +303,20 @@ on the daemon/worker event loop, so none may block it:
 - `read_file` / `write_file` / `edit_file` / `list_directory` do their
   disk I/O in a worker thread (`asyncio.to_thread`).
 
+## §18 Plain-text tool results
+
+`format_tool_result` (base.py) renders what the model reads; it used to
+`json.dumps` every result, wrapping shell output in quotes and escaped
+newlines.
+- string result: sent as-is.
+- shell-shaped dict (`output` and/or `exit_code`, optional `error`):
+  `Exit code: N` / `Error: ...` lines, then `Output:` and the raw text.
+- dict with one text field (`content`, `matches`, `output`, `text`,
+  `result`): that text. Dict with only `error`: `Error: ...`.
+- anything else (genuinely structured): JSON, as before.
+Always a string, so anthropic / openai_compat / ollama adapters pass it
+through unchanged as tool content. §6 head+tail truncation applies after.
+
 ## Testing (targeted only, never the full suite)
 
 New/updated files: `tests/atn/test_loop_hardening.py` (§1-§6, §8:

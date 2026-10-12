@@ -1024,7 +1024,9 @@ class Provider(ABC):
                         },
                     ))
 
-                result_json = json.dumps(result, default=str)
+                # §18: readable text for string / shell-shaped results, JSON
+                # only for genuinely structured ones.
+                result_json = format_tool_result(result)
                 # Cap oversized tool results (§6): head+tail, keeping the
                 # command echo and the error tail while eliding the middle.
                 # On small windows the cap scales down so one result can never
@@ -1492,6 +1494,52 @@ def _drain_queue(queue: "asyncio.Queue | None") -> list[str]:
         except asyncio.QueueEmpty:
             break
     return drained
+
+
+# Single-string result keys whose value IS the tool output (read_file's
+# "content", search_files' "matches", ...). A dict carrying only one of these
+# is sent as the bare text.
+_TEXT_RESULT_KEYS: tuple[str, ...] = ("content", "matches", "output", "text", "result")
+
+
+def format_tool_result(result: Any) -> str:
+    """Render a tool result as the text the model reads (§18).
+
+    JSON-encoding every result wraps shell output in quotes and escaped
+    newlines, which models read worse and which costs tokens. So:
+      - a string goes through as-is;
+      - a shell-shaped dict (``output`` and/or ``exit_code``, optional
+        ``error``) becomes ``Exit code: N`` / ``Error: ...`` + ``Output:``;
+      - a dict with a single text field (``content``, ``matches``, ...)
+        becomes that text; a dict with only ``error`` becomes ``Error: ...``;
+      - anything else (genuinely structured) stays JSON.
+    Always returns a str, so every adapter receives valid tool content.
+    """
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        keys = set(result.keys())
+        if keys and keys <= {"output", "exit_code", "error"} and (
+            "exit_code" in keys or "output" in keys
+        ) and isinstance(result.get("output", ""), str):
+            lines: list[str] = []
+            if "exit_code" in result:
+                lines.append(f"Exit code: {result.get('exit_code')}")
+            if result.get("error"):
+                lines.append(f"Error: {result['error']}")
+            lines.append("Output:")
+            lines.append(result.get("output") or "")
+            return "\n".join(lines)
+        if len(keys) == 1:
+            (k, v), = result.items()
+            if k in _TEXT_RESULT_KEYS and isinstance(v, str):
+                return v
+            if k == "error" and isinstance(v, str):
+                return f"Error: {v}"
+    try:
+        return json.dumps(result, default=str)
+    except (TypeError, ValueError):
+        return str(result)
 
 
 def _truncate_tool_result(result_json: str, cap: int = 0) -> str:

@@ -2,6 +2,7 @@
 
 Each section maps to one item of the port:
   §17 non-blocking shell tools (async subprocess, tree kill, head+tail)
+  §18 plain-text tool results
 """
 from __future__ import annotations
 
@@ -13,6 +14,13 @@ from typing import Any
 import pytest
 
 from atn import shell_tools
+from atn.providers.base import (
+    Provider,
+    ProviderResponse,
+    ToolCall,
+    Usage,
+    format_tool_result,
+)
 from atn.shell_tools import exec_bash, exec_search_files, _head_tail
 
 
@@ -84,3 +92,122 @@ class TestNonBlockingShell:
         assert r["status"] == "ok"
         names = [e["name"] for e in (await shell_tools.exec_list_dir({"path": str(tmp_path)}))["entries"]]
         assert names == ["a.txt"]
+
+
+# ---------------------------------------------------------------------------
+# Scripted provider (same shape as test_loop_hardening.ScriptedProvider)
+# ---------------------------------------------------------------------------
+
+class ScriptedProvider(Provider):
+    def __init__(self, script: list[Any], summary_responses: list[Any] | None = None,
+                 model: str = "test-model") -> None:
+        self._script = list(script)
+        self._summary = list(summary_responses or [])
+        self.stream_calls = 0
+        self.summary_calls = 0
+        self.seen_messages: list[list[dict]] = []
+        self.summary_requests: list[dict] = []
+        self._active_model = model
+
+    @property
+    def name(self) -> str:
+        return "scripted"
+
+    async def send(self, *, messages, system="", model="", max_tokens=1024,
+                   tools=None, temperature=0.0) -> ProviderResponse:
+        self.summary_calls += 1
+        self.summary_requests.append({
+            "messages": [dict(m) for m in messages], "system": system,
+            "tools": tools,
+        })
+        item = self._summary.pop(0) if self._summary else ProviderResponse(
+            text="SUMMARY", stop_reason="end_turn")
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def send_stream(self, *, messages, system="", model="", max_tokens=1024,
+                          tools=None, temperature=0.0, on_chunk=None,
+                          on_thinking=None) -> ProviderResponse:
+        self.stream_calls += 1
+        self.seen_messages.append([dict(m) for m in messages])
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _resp(**kw) -> ProviderResponse:
+    kw.setdefault("usage", Usage(input_tokens=5, output_tokens=2))
+    return ProviderResponse(**kw)
+
+
+def _tool_results(messages: list[dict]) -> list[dict]:
+    out = []
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list):
+            out.extend(b for b in c if isinstance(b, dict) and b.get("type") == "tool_result")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# §18 Plain-text tool results
+# ---------------------------------------------------------------------------
+
+class TestPlainTextResults:
+    def test_string_passthrough(self):
+        assert format_tool_result("hello\nworld") == "hello\nworld"
+
+    def test_shell_shape(self):
+        txt = format_tool_result({"output": "line1\nline2", "exit_code": 2})
+        assert txt == "Exit code: 2\nOutput:\nline1\nline2"
+
+    def test_shell_timeout_shape(self):
+        txt = format_tool_result({"error": "timed out", "output": "partial"})
+        assert "Error: timed out" in txt and txt.endswith("partial")
+
+    def test_single_text_field(self):
+        assert format_tool_result({"content": "1\tfoo"}) == "1\tfoo"
+        assert format_tool_result({"matches": "a.py:1:x"}) == "a.py:1:x"
+        assert format_tool_result({"error": "nope"}) == "Error: nope"
+
+    def test_structured_stays_json(self):
+        import json
+        r = {"entries": [{"name": "a", "type": "file", "size": 1}]}
+        assert json.loads(format_tool_result(r)) == r
+        r2 = {"status": "ok", "path": "/x", "bytes": 3}
+        assert json.loads(format_tool_result(r2)) == r2
+
+    async def test_loop_sends_plain_text(self):
+        p = ScriptedProvider([
+            _resp(tool_calls=[ToolCall(id="c1", name="bash", input={"command": "x"})],
+                  stop_reason="tool_use"),
+            _resp(text="done", stop_reason="end_turn"),
+        ])
+
+        async def ex(name, inp):
+            return {"output": "hi there", "exit_code": 0}
+
+        await p.run_agent_loop(message="go", tools=[{"name": "bash"}],
+                               tool_executor=ex)
+        (tr,) = _tool_results(p.seen_messages[1])
+        assert tr["content"] == "Exit code: 0\nOutput:\nhi there"
+
+    def test_adapters_accept_text_results(self):
+        from atn.providers.openai_compat import _to_openai_messages
+        from atn.providers.ollama import _translate_history
+        hist = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "bash", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c1",
+                 "content": format_tool_result({"output": "ok", "exit_code": 0})}]},
+        ]
+        oai = _to_openai_messages(hist, "")
+        tool_msgs = [m for m in oai if m.get("role") == "tool"]
+        assert tool_msgs and tool_msgs[0]["content"].startswith("Exit code: 0")
+        oll = _translate_history(hist)
+        tool_msgs = [m for m in oll if m.get("role") == "tool"]
+        assert tool_msgs and tool_msgs[0]["content"].startswith("Exit code: 0")
