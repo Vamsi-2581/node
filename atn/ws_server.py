@@ -248,7 +248,7 @@ INTEGRATION_DENIED_MESSAGES = frozenset({
     # Providers, connectors, OAuth, daemon control, profile.
     "provider_configure", "provider_remove", "custom_provider_add",
     "custom_provider_remove", "provider_list", "provider_refresh_usage",
-    "provider_rate_limits", "provider_record",
+    "provider_rate_limits", "provider_record", "provider_bridge_update",
     "add_connector", "remove_connector", "use_connector", "oauth_start",
     "oauth_status", "daemon_restart", "update_status", "skip_onboarding",
     "autonet_publish_standards", "autonet_set_capture_config",
@@ -1478,6 +1478,19 @@ class WebSocketBridge:
                 result = await self.runtime.configure_provider(provider_id, api_key)
                 return {"msg_id": msg_id, "ok": True, "result": result}
             except ValueError as exc:
+                return {"msg_id": msg_id, "ok": False, "error": str(exc)}
+
+        if msg_type == "provider_bridge_update":
+            # Manual trigger for the bridge SDK updater: check the registry
+            # now (past the 24h gate and the opt-out) and swap in a newer
+            # in-range install if it passes the ping probe. {"rollback": true}
+            # points the bridge back at the previous install instead.
+            try:
+                result = await self.runtime.providers.check_bridge_update(
+                    force=True, rollback=bool(msg.get("rollback")), reason="manual")
+                result["status_detail"] = self.runtime.providers.bridge_update_status()
+                return {"msg_id": msg_id, "ok": True, "result": result}
+            except Exception as exc:  # noqa: BLE001
                 return {"msg_id": msg_id, "ok": False, "error": str(exc)}
 
         if msg_type == "provider_rate_limits":

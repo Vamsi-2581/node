@@ -296,6 +296,10 @@ class ProviderManager:
 
         self._custom_providers: set[str] = set()
         self._active_providers: dict[str, Any] = {}
+        # Bridge npm-dependency updater (built lazily; see bridge_updater.py)
+        # and the background check a provider configure kicks off.
+        self._bridge_updater: Any = None
+        self._bridge_check_task: asyncio.Task | None = None
         self._p2p_host: Any = None  # Set by runtime when P2P is available
         # Phase 6.4: substrate provider needs the daemon's WorldService
         # to probe. Two ways to attach it:
@@ -1063,7 +1067,14 @@ class ProviderManager:
                 rl = dict(BridgeProvider._shared_rate_limits)
                 if rl:
                     entry["rate_limits"] = rl
-            elif pid == "codex_max":
+            if pid in ("claude_max", "codex_max"):
+                # Installed bridge SDK versions + last update check (shared
+                # by both bridges: one install serves both).
+                try:
+                    entry["bridge_runtime"] = self.bridge_update_status()
+                except Exception:  # noqa: BLE001 — status must never break the list
+                    log.debug("bridge_update_status failed", exc_info=True)
+            if pid == "codex_max":
                 # Codex keeps its cache per instance, so read the registered
                 # one. Same shape, same panel.
                 _cx = self.get_registered_provider(pid)
@@ -1448,10 +1459,13 @@ class ProviderManager:
         except Exception:
             return None
 
-    async def probe_bridge(self) -> bool:
+    async def probe_bridge(self, bridge_dir: Path | None = None) -> bool:
+        """Spawn the Claude bridge and ping it. ``bridge_dir`` probes that
+        install (the updater's candidate) instead of the current one."""
         try:
             # Ping needs no model; the probe instance never serves an agent.
-            provider = BridgeProvider()
+            provider = BridgeProvider(
+                bridge_script=(bridge_dir / "claude-bridge.ts") if bridge_dir else None)
             resp = await asyncio.wait_for(provider._send_request({"type": "ping"}), timeout=15)
             ok = resp.get("ok", False)
             await provider.close()
@@ -1469,11 +1483,13 @@ class ProviderManager:
         except Exception:
             return False
 
-    async def probe_codex_bridge(self) -> bool:
+    async def probe_codex_bridge(self, bridge_dir: Path | None = None) -> bool:
         """Spawn the codex bridge and ping it — no model call, just proves
-        the subprocess + SDK import + pipe protocol work."""
+        the subprocess + SDK import + pipe protocol work. ``bridge_dir``
+        probes that install instead of the current one."""
         try:
-            provider = CodexBridgeProvider()
+            provider = CodexBridgeProvider(
+                bridge_script=(bridge_dir / "codex-bridge.ts") if bridge_dir else None)
             resp = await asyncio.wait_for(provider._send_request({"type": "ping"}), timeout=20)
             ok = resp.get("ok", False)
             await provider.close()
@@ -1737,97 +1753,125 @@ class ProviderManager:
                 seen.add(e["id"])
         return merged
 
-    async def _ensure_bridge_deps(self) -> None:
-        """Stage the bridge sources into ``~/.atn/bridge`` and install its
-        dependencies there (site-packages is often read-only). Loud failure:
-        raises ``ValueError`` — surfaced to the frontend provider card — when
-        neither bun nor npm is available, or the install fails.
+    # ------------------------------------------------------------------
+    # Bridge dependency install + auto-update (atn/providers/bridge_updater.py)
+    # ------------------------------------------------------------------
 
-        Dev fast-path (repo checkout with node_modules already next to the
-        packaged sources) is used in place with no copy/install.
+    def bridge_auto_update_enabled(self) -> bool:
+        """``providers.bridge_auto_update`` in config.yaml (default on). A
+        scalar under ``providers`` is not a provider entry, so it is read from
+        the raw config."""
+        raw = (getattr(self._config, "raw", None) or {}).get("providers") or {}
+        val = raw.get("bridge_auto_update", True) if isinstance(raw, dict) else True
+        if isinstance(val, str):
+            return val.strip().lower() not in ("0", "false", "no", "off")
+        return bool(val)
+
+    def _get_bridge_updater(self) -> Any:
+        if self._bridge_updater is None:
+            from ..providers.bridge_updater import BridgeUpdater, make_installer
+            self._bridge_updater = BridgeUpdater(
+                probe=self._probe_bridge_install,
+                installer=make_installer(find_bun=self._auto_install_bun),
+            )
+        return self._bridge_updater
+
+    async def _probe_bridge_install(self, bridge_dir: Path) -> tuple[bool, str]:
+        """Gate for a candidate install: the Claude bridge must answer ping;
+        the Codex bridge too, unless it also fails on the current install
+        (then this machine cannot run it either way, and that must not block
+        Claude bridge updates forever)."""
+        if not await self.probe_bridge(bridge_dir):
+            return False, "claude bridge ping failed"
+        if (bridge_dir / "codex-bridge.ts").exists() \
+                and not await self.probe_codex_bridge(bridge_dir):
+            cur = self._get_bridge_updater().current_dir()
+            if cur is not None and cur != bridge_dir and await self.probe_codex_bridge(cur):
+                return False, "codex bridge ping failed (it passes on the current install)"
+            log.warning("Codex bridge ping fails on the candidate and the current "
+                        "install alike; not blocking the update on it")
+        return True, "ok"
+
+    def bridge_update_status(self) -> dict[str, Any]:
+        """Installed bridge SDK versions + last update check (provider_list
+        ``bridge_runtime``)."""
+        return self._get_bridge_updater().status(self.bridge_auto_update_enabled())
+
+    async def check_bridge_update(
+        self, *, force: bool = False, rollback: bool = False, reason: str = "",
+    ) -> dict[str, Any]:
+        """Check for newer in-range bridge deps and update (probe-gated swap).
+
+        Periodic calls honor the opt-out (a source-change rebuild still runs,
+        pinned to the installed versions). A manual trigger (``force``)
+        consults the registry regardless. ``rollback`` points the bridge back
+        at the previous install instead.
         """
-        from ..providers.bridge import stage_bridge_sources, _node_modules_ready
-
-        try:
-            bridge_dir, needs_install = stage_bridge_sources()
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError(
-                f"Claude Max bridge sources could not be staged into "
-                f"~/.atn/bridge: {exc}"
-            )
-
-        pkg_json = bridge_dir / "package.json"
-        if not pkg_json.exists():
-            raise ValueError(
-                f"Claude Max bridge is missing package.json (looked in "
-                f"{bridge_dir}). The install is corrupt — reinstall the atn "
-                "package."
-            )
-
-        if not needs_install and _node_modules_ready(bridge_dir):
-            return  # Already installed and sources unchanged.
-
-        import shutil
-        # Prefer bun; auto-install it if absent (its failure is now loud too).
-        bun = shutil.which("bun")
-        if not bun:
-            bun = await self._auto_install_bun()
-
-        install_err = ""
-        if bun:
-            log.info("Installing bridge dependencies with bun in %s ...", bridge_dir)
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    bun, "install",
-                    cwd=str(bridge_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
-                if proc.returncode == 0 and _node_modules_ready(bridge_dir):
-                    log.info("Bridge dependencies installed successfully (bun)")
-                    return
-                install_err = (stderr.decode(errors="replace")[:400]
-                               or f"bun install exit {proc.returncode}")
-            except asyncio.TimeoutError:
-                install_err = "bun install timed out after 180s"
-            except Exception as e:  # noqa: BLE001
-                install_err = f"bun install error: {e}"
-
-        # Fall back to npm.
-        npm = shutil.which("npm")
-        if npm:
-            log.info("Installing bridge dependencies with npm in %s ...", bridge_dir)
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    npm, "install",
-                    cwd=str(bridge_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-                if proc.returncode == 0 and _node_modules_ready(bridge_dir):
-                    log.info("Bridge dependencies installed successfully (npm)")
-                    return
-                install_err = (stderr.decode(errors="replace")[:400]
-                               or f"npm install exit {proc.returncode}") or install_err
-            except asyncio.TimeoutError:
-                install_err = "npm install timed out after 300s"
-            except Exception as e:  # noqa: BLE001
-                install_err = f"npm install error: {e}"
-
-        # If we get here, install did not succeed. Fail LOUD.
-        if not bun and not npm:
-            raise ValueError(
-                "Claude Max bridge dependencies could not be installed: neither "
-                "'bun' nor 'npm' was found (and bun auto-install failed). "
-                "Install bun from https://bun.sh and reconnect the provider."
-            )
-        raise ValueError(
-            "Claude Max bridge dependencies failed to install "
-            f"(in {bridge_dir}): {install_err or 'unknown error'}. "
-            "Install bun from https://bun.sh and reconnect the provider."
+        upd = self._get_bridge_updater()
+        if rollback:
+            return await upd.rollback()
+        result = await upd.check(
+            force=force,
+            allow_registry=force or self.bridge_auto_update_enabled(),
+            reason=reason or ("manual" if force else "periodic"),
         )
+        if result.get("status") == "updated":
+            # A boot-time rebuild (sources changed under a daemon upgrade)
+            # may have made a bridge reachable that the boot probe missed.
+            try:
+                await self.auto_detect_providers()
+            except Exception:  # noqa: BLE001
+                log.debug("post-update auto-detect failed", exc_info=True)
+        return result
+
+    async def bridge_update_loop(self, *, interval: float = 3600.0,
+                                 initial_delay: float = 30.0) -> None:
+        """Hourly tick; the updater itself gates registry checks to once per
+        24h and rebuilds right away when the packaged sources changed. Does
+        nothing on machines that never installed a bridge."""
+        await asyncio.sleep(initial_delay)
+        while True:
+            try:
+                await self.check_bridge_update(reason="periodic")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Bridge update check errored: %s", exc)
+            await asyncio.sleep(interval)
+
+    async def _ensure_bridge_deps(self) -> None:
+        """Make sure a working bridge install exists (provider configure).
+
+        No install yet, or one built from other packaged sources: build one
+        now (fresh dir, ping-probed, then made current) and fail LOUD with a
+        ``ValueError`` (surfaced on the provider card) if that leaves no
+        usable install. An install that already works is kept and an update
+        check runs in the background (forced past the 24h gate), so connect
+        never waits on a download. The dev fast-path (repo checkout with
+        node_modules next to the sources) is used in place.
+        """
+        upd = self._get_bridge_updater()
+        if upd.is_dev():
+            return
+        auto = self.bridge_auto_update_enabled()
+
+        if upd.current_dir() is None or upd.needs_rebuild():
+            result = await upd.check(force=True, allow_registry=auto,
+                                     install_if_missing=True, reason="configure")
+            if upd.current_dir() is None:
+                raise ValueError(
+                    "Claude Max bridge dependencies could not be installed in "
+                    f"{upd.home}: {result.get('error') or result.get('reason') or 'unknown error'}. "
+                    "Install bun from https://bun.sh and reconnect the provider."
+                )
+            if result.get("status") not in ("updated", "up_to_date"):
+                log.warning("Bridge rebuild did not complete (%s); keeping the "
+                            "existing install", result.get("error") or result.get("reason"))
+            return
+
+        if auto and (self._bridge_check_task is None or self._bridge_check_task.done()):
+            self._bridge_check_task = asyncio.create_task(
+                upd.check(force=True, reason="configure"))
 
     async def _auto_install_bun(self) -> str | None:
         """Download and install bun without requiring npm/node.

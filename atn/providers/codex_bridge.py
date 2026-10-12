@@ -81,6 +81,9 @@ class CodexBridgeProvider(Provider):
         # agent; a request that needs a model then fails loud (no fallback).
         self._model = model
         self._bridge_script = Path(bridge_script) if bridge_script else _BRIDGE_SCRIPT
+        # Default script: re-resolved at every spawn (follows the updater's
+        # current install; see bridge._resolve_spawn_script).
+        self._script_is_default = self._bridge_script == _BRIDGE_SCRIPT
         self._api_key = api_key
         self._process: asyncio.subprocess.Process | None = None
         self._request_id = 0
@@ -746,17 +749,12 @@ class CodexBridgeProvider(Provider):
         if self._process and self._process.returncode is None:
             return
 
-        # A provider built before configure_provider staged the sources may
-        # still point at a script that is not there yet: re-resolve once.
-        if self._bridge_script == _BRIDGE_SCRIPT and not (
-            self._bridge_script.parent / "node_modules"
-        ).exists():
-            try:
-                from .bridge import stage_bridge_sources
-                staged_dir, _ = stage_bridge_sources()
-                self._bridge_script = staged_dir / "codex-bridge.ts"
-            except Exception as exc:  # noqa: BLE001
-                log.debug("Codex bridge re-stage failed: %s", exc)
+        # Resolve per spawn: a default-script provider follows the current
+        # managed install, so an update swap applies on the next spawn and
+        # never under a running process.
+        from .bridge import _resolve_spawn_script
+        self._bridge_script = _resolve_spawn_script(
+            self._bridge_script, "codex-bridge.ts", self._script_is_default)
 
         if not self._bridge_script.exists():
             raise ProviderError(
@@ -821,6 +819,8 @@ class CodexBridgeProvider(Provider):
             **kwargs,
         )
 
+        from .bridge import register_live_bridge
+        register_live_bridge(self)
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         log.info("Codex bridge process started (pid=%s)", self._process.pid)
 

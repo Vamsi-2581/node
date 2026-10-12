@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,15 +42,24 @@ from ..events import Event, EventBus, EventType
 log = logging.getLogger(__name__)
 
 # Bridge source files that ship as package-data (pyproject: package-data
-# "bridge" = ["*.ts", "package.json", "bun.lock"]). These are copied into the
-# runtime dir; their hashes form the version stamp.
-_BRIDGE_SOURCE_GLOBS = ("*.ts", "package.json", "bun.lock")
+# "bridge" = ["*.ts", "package.json"]). These are copied into each runtime
+# install; their hashes form the source stamp. No lockfile ships: dependency
+# versions are resolved per install (bridge_updater.py), so a user is never
+# pinned to the versions that were current at daemon release time.
+_BRIDGE_SOURCE_GLOBS = ("*.ts", "package.json")
 # Marker files under node_modules/@anthropic-ai/claude-agent-sdk that mean the
 # dependency install succeeded (SDK 0.2.119+ ships sdk.mjs, older cli.js).
 _SDK_MARKER_RELS = (
     Path("@anthropic-ai") / "claude-agent-sdk" / "cli.js",
     Path("@anthropic-ai") / "claude-agent-sdk" / "sdk.mjs",
 )
+# Runtime layout under ~/.atn/bridge (managed by bridge_updater.py):
+#   installs/<id>/   a complete bridge (sources + node_modules + install.json)
+#   current.json     {"install": <id>, "previous": <id>|null, ...}
+# Older daemons ran from a flat ~/.atn/bridge (sources + node_modules in the
+# root); that layout is still honored until the first managed install lands.
+_INSTALLS_DIRNAME = "installs"
+_CURRENT_FILE = "current.json"
 
 
 def _packaged_bridge_dir() -> Path:
@@ -64,14 +74,14 @@ def _packaged_bridge_dir() -> Path:
 
 
 def _runtime_bridge_home() -> Path:
-    """Writable per-user runtime dir the bridge is copied to and run from."""
+    """Writable per-user runtime dir the bridge installs live under."""
     return Path.home() / ".atn" / "bridge"
 
 
 def _source_stamp(src_dir: Path) -> str:
-    """Content marker over the packaged bridge sources — hash of each source
-    file's (name, sha256). Changing any *.ts / package.json / bun.lock changes
-    the stamp, which triggers a re-copy + re-install into the runtime dir."""
+    """Content marker over the packaged bridge sources: hash of each source
+    file's (name, sha256). Changing any *.ts / package.json changes the
+    stamp, which triggers a fresh runtime install."""
     import hashlib
     h = hashlib.sha256()
     files: list[Path] = []
@@ -92,6 +102,10 @@ def _node_modules_ready(bridge_dir: Path) -> bool:
     return any((nm / rel).exists() for rel in _SDK_MARKER_RELS)
 
 
+def _install_usable(bridge_dir: Path) -> bool:
+    return (bridge_dir / "claude-bridge.ts").exists() and _node_modules_ready(bridge_dir)
+
+
 def _dir_is_writable(path: Path) -> bool:
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -103,68 +117,121 @@ def _dir_is_writable(path: Path) -> bool:
         return False
 
 
+def read_current_pointer(home: Path | None = None) -> dict[str, Any]:
+    """The ``current.json`` pointer of the managed install layout ({} if none)."""
+    home = home or _runtime_bridge_home()
+    try:
+        data = json.loads((home / _CURRENT_FILE).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _managed_install_dir(home: Path | None = None) -> Path | None:
+    """The install ``current.json`` points at, or its ``previous`` when the
+    current one is missing or broken (automatic rollback). None if neither."""
+    home = home or _runtime_bridge_home()
+    ptr = read_current_pointer(home)
+    for key in ("install", "previous"):
+        name = ptr.get(key)
+        if not name or not isinstance(name, str):
+            continue
+        d = home / _INSTALLS_DIRNAME / name
+        if _install_usable(d):
+            if key == "previous":
+                log.warning("Bridge install %s is unusable; running previous "
+                            "install %s", ptr.get("install"), name)
+            return d
+    return None
+
+
+def is_dev_bridge_dir() -> bool:
+    """True when the bridge runs in place from a repo checkout (dev fast-path)."""
+    src = _packaged_bridge_dir()
+    return _node_modules_ready(src) and _dir_is_writable(src)
+
+
 def resolve_bridge_dir() -> Path:
-    """Resolve the directory the bridge process should run from.
+    """Resolve the directory a NEW bridge process should run from.
 
     Dev fast-path: if the packaged sources sit next to an already-installed,
     writable ``node_modules`` (a repo checkout that ran ``bun install`` in
-    place), use that directory directly — no copy.
+    place), use that directory directly, no copy.
 
-    Otherwise the runtime dir is ``~/.atn/bridge``: on first use, or when the
-    packaged source stamp differs from the staged copy, the sources are copied
-    there (the caller then installs deps there). site-packages is often
-    read-only, so we never install into the packaged dir.
+    Otherwise the managed install ``~/.atn/bridge/current.json`` points at
+    (bridge_updater.py builds, probes and swaps those), falling back to the
+    legacy flat ``~/.atn/bridge`` of older daemons. Resolved per spawn, so an
+    update swap reaches the next bridge process while running ones keep
+    their own install. site-packages is often read-only, so nothing is ever
+    installed into the packaged dir.
     """
-    src = _packaged_bridge_dir()
-    # Dev fast-path: node_modules already present next to the sources AND the
-    # dir is writable (a real checkout, not read-only site-packages).
-    if _node_modules_ready(src) and _dir_is_writable(src):
-        return src
+    if is_dev_bridge_dir():
+        return _packaged_bridge_dir()
+    managed = _managed_install_dir()
+    if managed is not None:
+        return managed
     return _runtime_bridge_home()
 
 
 def stage_bridge_sources() -> tuple[Path, bool]:
-    """Ensure the runtime bridge dir holds the current packaged sources.
+    """Report the runtime bridge dir and whether it needs a (re)install.
 
-    Returns ``(bridge_dir, needs_install)``. When the resolved dir is the dev
-    checkout, this is a no-op (``needs_install`` reflects whether node_modules
-    is present). When it is ``~/.atn/bridge``, sources are (re-)copied whenever
-    the stamp differs, and ``needs_install`` is True if deps are missing OR the
-    sources were just refreshed.
+    Returns ``(bridge_dir, needs_install)``. Dev checkout: ``needs_install``
+    reflects whether node_modules is present. Runtime dir: True when no usable
+    install exists or its source stamp differs from the packaged sources.
+    Building an install is bridge_updater.py's job (into a fresh dir, probed
+    before it becomes current); nothing is copied here.
     """
-    import shutil
     src = _packaged_bridge_dir()
     bridge_dir = resolve_bridge_dir()
-
     if bridge_dir == src:
-        # Dev fast-path — use in place.
         return bridge_dir, not _node_modules_ready(bridge_dir)
-
-    bridge_dir.mkdir(parents=True, exist_ok=True)
-    stamp_file = bridge_dir / ".source_stamp"
-    want = _source_stamp(src)
-    have = ""
     try:
-        have = stamp_file.read_text(encoding="utf-8").strip()
+        have = (bridge_dir / ".source_stamp").read_text(encoding="utf-8").strip()
     except OSError:
         have = ""
+    needs = (not _install_usable(bridge_dir)) or have != _source_stamp(src)
+    return bridge_dir, needs
 
-    refreshed = False
-    if want != have:
-        for pat in _BRIDGE_SOURCE_GLOBS:
-            for f in src.glob(pat):
-                try:
-                    shutil.copy2(f, bridge_dir / f.name)
-                except OSError as exc:
-                    log.warning("Failed to copy bridge source %s: %s", f.name, exc)
+
+# Bridge providers with a spawned subprocess (Claude and Codex). Weak: an
+# instance that is garbage-collected drops out. Tells the updater which
+# install dirs are serving a process, so it never deletes one in use.
+_LIVE_BRIDGES: "weakref.WeakSet[Any]" = weakref.WeakSet()
+
+
+def register_live_bridge(provider: Any) -> None:
+    _LIVE_BRIDGES.add(provider)
+
+
+def bridge_dirs_in_use() -> set[Path]:
+    """Install dirs a live bridge subprocess was spawned from."""
+    out: set[Path] = set()
+    for prov in list(_LIVE_BRIDGES):
+        proc = getattr(prov, "_process", None)
+        if proc is None or proc.returncode is not None:
+            continue
         try:
-            stamp_file.write_text(want, encoding="utf-8")
-        except OSError:
-            pass
-        refreshed = True
+            out.add(Path(prov._bridge_script).parent.resolve())
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
-    needs_install = refreshed or not _node_modules_ready(bridge_dir)
-    return bridge_dir, needs_install
+
+def _resolve_spawn_script(current: Path, script_name: str, is_default: bool) -> Path:
+    """Script a bridge process is about to spawn from. A default-script
+    provider re-resolves at every spawn (so it picks up an update swap). An
+    explicit script is kept, unless it pointed into ~/.atn/bridge and is gone
+    (an install the updater since retired): then the current install is used."""
+    if is_default:
+        return resolve_bridge_dir() / script_name
+    if not current.exists():
+        try:
+            Path(current).resolve().relative_to(_runtime_bridge_home().resolve())
+        except ValueError:
+            return current
+        return resolve_bridge_dir() / script_name
+    return current
 
 
 _BRIDGE_DIR = resolve_bridge_dir()
@@ -242,6 +309,9 @@ class BridgeProvider(Provider):
         # agent; a request that needs a model then fails loud (no fallback).
         self._model = model
         self._bridge_script = Path(bridge_script) if bridge_script else _BRIDGE_SCRIPT
+        # Default script: re-resolved at every spawn so an updater swap
+        # reaches the next process (see _resolve_spawn_script).
+        self._script_is_default = self._bridge_script == _BRIDGE_SCRIPT
         self._process: asyncio.subprocess.Process | None = None
         self._request_id = 0
         self._lock = asyncio.Lock()
@@ -1530,16 +1600,11 @@ class BridgeProvider(Provider):
         if self._process and self._process.returncode is None:
             return
 
-        # If pointed at the default runtime script but the sources haven't been
-        # staged yet (provider constructed before configure_provider ran the
-        # install), stage them now so the script/node_modules checks below are
-        # against the real runtime dir. A custom bridge_script is left as-is.
-        if self._bridge_script == _BRIDGE_SCRIPT and not self._bridge_script.exists():
-            try:
-                staged_dir, _ = stage_bridge_sources()
-                self._bridge_script = staged_dir / "claude-bridge.ts"
-            except Exception as exc:  # noqa: BLE001 — staging is best-effort here
-                log.warning("Bridge source staging failed: %s", exc)
+        # Resolve per spawn: a default-script provider follows the current
+        # managed install, so an update swap applies on the next spawn and
+        # never under a running process.
+        self._bridge_script = _resolve_spawn_script(
+            self._bridge_script, "claude-bridge.ts", self._script_is_default)
 
         if not self._bridge_script.exists():
             raise ProviderError(
@@ -1615,6 +1680,8 @@ class BridgeProvider(Provider):
             limit=32 * 1024 * 1024,
             **kwargs,
         )
+
+        register_live_bridge(self)
 
         # Background task to drain stderr (debug logs)
         self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -1920,10 +1987,16 @@ class BridgeProvider(Provider):
             self._stderr_task = None
         if proc is None or proc.returncode is not None:
             return
-        # Ask the bridge to exit cleanly
+        # Ask the bridge to exit cleanly. Write straight to the live process:
+        # going through _send_raw would hit _ensure_process (self._process is
+        # already None) and spawn a FRESH bridge just to tell it to shut down
+        # (same fix as codex_bridge.close).
         try:
-            async with self._lock:
-                await self._send_raw({"type": "shutdown"}, _retry=False)
+            if proc.stdin:
+                self._request_id += 1
+                proc.stdin.write((json.dumps(
+                    {"type": "shutdown", "id": f"req-{self._request_id}"}) + "\n").encode())
+                await asyncio.wait_for(proc.stdin.drain(), timeout=2)
         except Exception:
             pass
         # Wait for graceful exit, then force-kill

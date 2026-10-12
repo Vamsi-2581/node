@@ -152,7 +152,8 @@ include = ["atn*", "nodes*", "bridge", "world_model*"]
 # Keyed on the child package: package-data patterns resolve relative to the
 # package they are keyed under, and browser_relay is itself a package.
 "atn.connectors.browser_relay" = ["extension/*", "extension/icons/*"]
-"bridge" = ["*.ts", "package.json", "bun.lock"]
+# No lockfile: bridge deps resolve per install (atn/providers/bridge_updater.py).
+"bridge" = ["*.ts", "package.json"]
 "atn._vendor.kevin.vault" = ["*.md"]
 # ABI-only contract copies (artifacts/ is gitignored and never ships).
 # Resolved by nodes/common/contract_artifacts.py; refresh with

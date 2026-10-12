@@ -47,6 +47,32 @@ does the inference, paid for by a sponsor relationship or by ATN per call.
 | Marketplace Service | service (ATN pay-per-call) |
 | World-Model Substrate | local |
 
+**Bridge dependencies stay current on their own.** Both bridges run on npm
+packages (`@anthropic-ai/claude-agent-sdk`, `@anthropic-ai/claude-code`,
+`@openai/codex-sdk`) that move faster than daemon releases. Connecting a
+bridge installs them under `~/.atn/bridge/installs/<id>/` (bun, npm as
+fallback; no lockfile ships). After that the daemon checks the npm registry
+at most once a day, plus on connect, for the newest version each caret range
+in `bridge/package.json` allows (same major). A newer set is installed into a
+fresh dir with exact pins (bun and npm land the same versions), both bridges
+must answer a ping from it, and only then does `~/.atn/bridge/current.json`
+switch to it. The old install stays as `previous`, and the daemon falls back
+to it if the current one breaks. Running bridge processes keep the install
+they started from: an update reaches the next spawn, and an install in use is
+never deleted. A daemon upgrade that changes the bridge sources rebuilds the
+same way. Installed versions and the last check show up as `bridge_runtime`
+on the Claude Max / Codex entries of `provider_list`. The WS message
+`provider_bridge_update` checks now (`{"rollback": true}` goes back to the
+previous install). To opt out of registry checks:
+
+```yaml
+providers:
+  bridge_auto_update: false
+```
+
+A repo checkout that ran `bun install` in `bridge/` runs in place and is
+never touched by the updater.
+
 **Anthropic API keys and workspaces.** A key scoped to a workspace works as
 pasted. A key scoped to the whole organization is rejected by Anthropic
 unless every request names a workspace, so either create a workspace-scoped

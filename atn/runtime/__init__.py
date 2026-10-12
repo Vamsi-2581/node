@@ -124,6 +124,8 @@ class Runtime:
         # Periodic idle-connector reaper task (started in start(), cancelled
         # in stop()). None until start().
         self._connector_reaper: asyncio.Task | None = None
+        # Bridge npm-dependency updater loop (providers.bridge_auto_update).
+        self._bridge_update_task: asyncio.Task | None = None
         inject_connector_credentials(self.connectors, self.credential_store)
 
         # Delegate registry
@@ -714,6 +716,14 @@ class Runtime:
         # Auto-detect providers (async probes)
         await self.providers.auto_detect_providers()
 
+        # Keep the subscription bridges' SDKs current without a daemon
+        # release: hourly tick, registry check at most once a day, probe-gated
+        # swap (atn/providers/bridge_updater.py). No-op on machines that never
+        # installed a bridge, and under the provider-autodetect test gate.
+        if os.environ.get("ATN_DISABLE_PROVIDER_AUTODETECT", "").strip() != "1":
+            self._bridge_update_task = asyncio.create_task(
+                self.providers.bridge_update_loop())
+
         # Spawn the semantic embed worker now, on its own thread, so the
         # first caller (Services-page topic clustering, substrate coords)
         # finds the model loaded instead of paying the import + load at
@@ -864,6 +874,14 @@ class Runtime:
             self._connector_reaper = None
 
         await self.connectors.stop_all()
+
+        if self._bridge_update_task is not None:
+            self._bridge_update_task.cancel()
+            try:
+                await self._bridge_update_task
+            except (asyncio.CancelledError, Exception):  # noqa: B014
+                pass
+            self._bridge_update_task = None
 
         # Close active cognitive-mode providers
         for provider in list(self.providers._active_providers.values()):
