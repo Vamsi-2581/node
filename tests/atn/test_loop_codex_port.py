@@ -211,3 +211,59 @@ class TestPlainTextResults:
         oll = _translate_history(hist)
         tool_msgs = [m for m in oll if m.get("role") == "tool"]
         assert tool_msgs and tool_msgs[0]["content"].startswith("Exit code: 0")
+
+
+# ---------------------------------------------------------------------------
+# §19 Context fullness from provider-reported usage
+# ---------------------------------------------------------------------------
+
+from atn.providers.base import _next_input_estimate  # noqa: E402
+
+
+class TestUsageBasedEstimate:
+    def test_anchor_plus_appended(self):
+        msgs = [{"role": "user", "content": "x" * 400},
+                {"role": "assistant", "content": "y" * 40}]
+        # Reported 1000 tokens for a 1-message request; 40 chars appended since.
+        assert _next_input_estimate("", msgs, (1000, 1)) == 1000 + 10
+
+    def test_fallback_without_anchor(self):
+        msgs = [{"role": "user", "content": "x" * 400}]
+        assert _next_input_estimate("s" * 40, msgs, None) == 110
+
+    def test_stale_anchor_falls_back(self):
+        msgs = [{"role": "user", "content": "x" * 400}]
+        # Anchor longer than the stack (rewritten) -> chars/4.
+        assert _next_input_estimate("", msgs, (5000, 3)) == 100
+
+    async def test_ceiling_uses_reported_usage(self):
+        # Tiny stack, but the provider says the request was 50k tokens (tool
+        # schemas, system prompt...). chars/4 alone would never trip 10k.
+        p = ScriptedProvider([
+            _resp(tool_calls=[ToolCall(id="c1", name="t", input={"a": 1})],
+                  stop_reason="tool_use",
+                  usage=Usage(input_tokens=2_000, cache_read_tokens=48_000)),
+            _resp(text="never", stop_reason="end_turn"),
+        ])
+
+        async def ex(name, inp):
+            return "ok"
+
+        r = await p.run_agent_loop(message="go", tools=[{"name": "t"}],
+                                   tool_executor=ex, per_turn_input_max=10_000)
+        assert r.stop_reason == "per_turn_input_exceeded"
+        assert p.stream_calls == 1
+
+    async def test_zero_usage_uses_char_estimate(self):
+        p = ScriptedProvider([
+            _resp(tool_calls=[ToolCall(id="c1", name="t", input={"a": 1})],
+                  stop_reason="tool_use", usage=Usage()),
+            _resp(text="done", stop_reason="end_turn", usage=Usage()),
+        ])
+
+        async def ex(name, inp):
+            return "ok"
+
+        r = await p.run_agent_loop(message="go", tools=[{"name": "t"}],
+                                   tool_executor=ex, per_turn_input_max=10_000)
+        assert r.stop_reason == "end_turn"

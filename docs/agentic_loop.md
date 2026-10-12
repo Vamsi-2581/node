@@ -69,8 +69,8 @@ Wrap the per-turn `send_stream` call:
 
 ## §2 Context reduction: prune, then compact
 
-Trigger **pre-send**: estimated next-request tokens (chars/4 estimate,
-calibrated by the last turn's actual `input_tokens` when available) >
+Trigger **pre-send**: estimated next-request tokens (last response's
+reported input + chars/4 of what was appended since, see §19) >
 `ctx_window − max_tokens − 8k buffer`. `ctx_window` from
 `model_specs.get_context_window` (see §7).
 
@@ -316,6 +316,20 @@ newlines.
 - anything else (genuinely structured): JSON, as before.
 Always a string, so anthropic / openai_compat / ollama adapters pass it
 through unchanged as tool content. §6 head+tail truncation applies after.
+
+## §19 Context fullness from real usage
+
+The per-turn ceiling and the §2 pre-send trigger no longer use chars/4
+over the whole stack. `_next_input_estimate`: the provider-reported
+input of the last response (`input + cache_read + cache_creation`,
+which already counts system prompt and tool schemas) plus chars/4 of
+the messages appended since that request. The anchor is per run and is
+dropped whenever a reduction rewrites the stack (pre-send, reactive
+overflow, manual compaction); without an anchor (first turn, usage of
+0, or right after a reduction) the old chars/4 estimate is used.
+`_reduce_context(est_tokens=...)` carries the gap between the real size
+and chars/4 as a fixed offset on its char budget, so reduction aims at
+the real size.
 
 ## Testing (targeted only, never the full suite)
 

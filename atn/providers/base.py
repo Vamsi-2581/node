@@ -551,6 +551,10 @@ class Provider(ABC):
         self._live_messages = messages
         self._live_max_tokens = max_tokens
 
+        # §19: (provider-reported input tokens of the last response, length of
+        # the message stack that request carried). None = no usable usage yet.
+        usage_anchor: tuple[int, int] | None = None
+
         for turn in range(max_turns):
             if self._interrupted:
                 return Provider._finalize_agent_loop(self, 
@@ -581,6 +585,7 @@ class Provider(ABC):
                 self._compact_requested_by = ""
                 log.info("Manual compaction requested by %s for agent %s",
                          requested_by or "?", self.source_agent_id or "?")
+                usage_anchor = None
                 try:
                     await Provider._reduce_context(
                         self, messages, system, model, message, max_tokens,
@@ -598,9 +603,12 @@ class Provider(ABC):
                     )
 
             # Pre-flight per-turn input ceiling — refuse a turn whose estimated
-            # input would exceed the configured cap. Estimate via chars/4 across
-            # the message stack plus the system prompt.
-            estimated_input = _estimate_chars(system, messages) // 4
+            # input would exceed the configured cap. §19: the estimate is the
+            # provider-reported input of the last response (system + tools +
+            # the stack as it was then) plus chars/4 of what was appended
+            # since; chars/4 over the whole stack only when no usage is known
+            # yet (first turn, or right after a reduction rewrote the stack).
+            estimated_input = _next_input_estimate(system, messages, usage_anchor)
             if effective_per_turn_max > 0 and estimated_input > effective_per_turn_max:
                 log.warning(
                     "Per-turn input ceiling hit (estimated %d > %d) — aborting cognitive loop "
@@ -631,7 +639,9 @@ class Provider(ABC):
                 try:
                     await Provider._reduce_context(
                         self, messages, system, model, message, max_tokens,
+                        est_tokens=estimated_input,
                     )
+                    usage_anchor = None  # stack rewritten; usage no longer maps
                 except ContextOverflowError as exc:
                     log.warning("Pre-send context reduction gave up: %s", exc)
                     return Provider._finalize_agent_loop(self, 
@@ -646,6 +656,8 @@ class Provider(ABC):
             async def _reduce() -> None:
                 # Reactive path (overflow 400) — force compaction even if our
                 # estimate looks under budget; the provider disagrees.
+                nonlocal usage_anchor
+                usage_anchor = None
                 await self._reduce_context(
                     messages, system, model, message, max_tokens, force=True,
                 )
@@ -703,6 +715,12 @@ class Provider(ABC):
                 response.usage.input_tokens
                 + response.usage.cache_read_tokens
                 + response.usage.cache_creation_tokens
+            )
+            # §19 anchor: that input covered exactly messages[:len(messages)]
+            # (nothing has been appended for this response yet).
+            usage_anchor = (
+                (self._last_input_tokens, len(messages))
+                if self._last_input_tokens > 0 else None
             )
             if response.model:
                 self._active_model = response.model
@@ -1177,8 +1195,15 @@ class Provider(ABC):
         force: bool = False,
         manual: bool = False,
         requested_by: str = "",
+        est_tokens: int = 0,
     ) -> None:
         """Two-tier context reduction: prune, then compact (§2).
+
+        ``est_tokens`` (§19): the caller's usage-calibrated estimate of the
+        next request. When it exceeds the raw chars/4 figure (tool schemas,
+        tokenizer density), the gap is carried as a fixed char offset on every
+        budget comparison below, so reduction targets the real size and not
+        the optimistic chars/4 one.
 
         Operates on ``messages`` IN PLACE. Tier 1 prunes old tool_result
         bodies (free). Tier 2 compacts via the LLM summarizer with a spiral
@@ -1197,6 +1222,13 @@ class Provider(ABC):
         budget_chars = max(
             0, (ctx_window - max_tokens - _reduction_buffer(ctx_window))
         ) * 4
+        # §19 calibration: shrink the char budget by the gap between the real
+        # (usage-derived) size and chars/4, so the comparisons below stay in
+        # raw chars but account for what chars/4 cannot see.
+        if est_tokens > 0:
+            gap = est_tokens * 4 - _estimate_chars(system, messages)
+            if gap > 0:
+                budget_chars = max(0, budget_chars - gap)
 
         # Tier 1 — prune old tool_result bodies (no LLM call).
         est_before = _estimate_chars(system, messages)
@@ -1644,6 +1676,26 @@ def _estimate_chars(system: str, messages: list[dict[str, Any]]) -> int:
         else len(json.dumps(m.get("content"), default=str))
         for m in messages
     )
+
+
+def _next_input_estimate(
+    system: str,
+    messages: list[dict[str, Any]],
+    usage_anchor: "tuple[int, int] | None",
+) -> int:
+    """Tokens the next request will carry (§19).
+
+    With an anchor ``(reported_input_tokens, stack_len_at_that_send)``: the
+    provider's own count for that request (system, tool schemas and the stack
+    as it was, which chars/4 cannot see) plus chars/4 of the messages appended
+    since. Without one (first turn, or the stack was rewritten by a
+    reduction): chars/4 over system + the whole stack.
+    """
+    if usage_anchor is not None:
+        reported, n = usage_anchor
+        if reported > 0 and 0 <= n <= len(messages):
+            return reported + _estimate_chars("", messages[n:]) // _CHARS_PER_TOKEN
+    return _estimate_chars(system, messages) // _CHARS_PER_TOKEN
 
 
 def _trim_tail_tool_results(messages: list[dict[str, Any]], budget_chars: int) -> bool:
