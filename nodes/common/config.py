@@ -382,19 +382,22 @@ def load_config(path: Optional[str] = None) -> AutonetConfig:
 def _registry_substrate_address(config_path: Optional[str]) -> str:
     """Resolve the deployed Substrate.sol address from registry.json.
 
-    Looks next to the loaded config file first, then the repo root
-    (two levels up from this module), then the CWD, then the copy packaged
-    with atn.
+    The copy packaged with atn comes first: it is the one the atn daemon
+    registers agents against (atn.config._load_registry_seed), so the
+    federated close must anchor to the same Substrate. Stale copies next to
+    the config file (e.g. ~/.atn/registry.json from an older release) or in
+    the CWD used to win here and silently pointed anchoring at a retired
+    Substrate after a redeploy. They remain fallbacks only.
     """
     import json as _json
 
     candidates = []
-    if config_path:
-        candidates.append(Path(config_path).resolve().parent / "registry.json")
-    candidates.append(Path(__file__).resolve().parents[2] / "registry.json")
-    candidates.append(Path("registry.json"))
     # The copy packaged with atn (the only one a pip install has).
     candidates.append(Path(__file__).resolve().parents[2] / "atn" / "registry.json")
+    candidates.append(Path(__file__).resolve().parents[2] / "registry.json")
+    if config_path:
+        candidates.append(Path(config_path).resolve().parent / "registry.json")
+    candidates.append(Path("registry.json"))
     for candidate in candidates:
         try:
             if not candidate.exists():
