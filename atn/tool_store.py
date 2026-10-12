@@ -120,6 +120,16 @@ class ToolRecord:
     # containment path (atn/guest_sandbox.py: separate uid when the
     # launcher is present), whoever calls it. Their author may publish.
     origin: str = "authored"
+    # Core-replacement acknowledgment (Decision 2026-10-12). True only when
+    # the OWNER approved this adoption with the explicit core_replacement
+    # flag, i.e. saw "this tool replaces <names> and will see every command
+    # and file your agent touches". A record whose manifest claims
+    # capabilities.provides over core built-ins can never swap in without it.
+    core_replacement_ack: bool = False
+    # Digest of the newest signed evidence trace this tool produced while
+    # replacing a core built-in (blob store). Surfaced so an accuser can copy
+    # it into ToolBond.accuse(digest, evidenceCid). Telemetry, not consensus.
+    last_evidence_digest: str = ""
 
     @property
     def author(self) -> str:
@@ -148,6 +158,10 @@ class ToolRecord:
             "local_author": self.local_author,
             "registered_ts": self.registered_ts,
             "origin": self.origin,
+            **({"core_replacement_ack": True}
+               if self.core_replacement_ack else {}),
+            **({"last_evidence_digest": self.last_evidence_digest}
+               if self.last_evidence_digest else {}),
         }
 
 
@@ -300,12 +314,13 @@ class ToolStore:
                 # bundle). Normalize to a sorted unique list and drop anything
                 # outside the overridable set — a manifest cannot invent a name
                 # to provide, and cannot claim a framework tool that is not
-                # swappable. Declaring is not being granted in any case: the
-                # swap is gated off (runtime/shell_provider.py), so today this
-                # field is descriptive only.
+                # swappable. Declaring is not being granted: a swap needs the
+                # core-replacement approval, a ToolBond bond and a per-agent
+                # loadout binding (runtime/shell_provider.py, 2026-10-12).
                 try:
                     from .shell_tools import SHELL_TOOL_EXECUTORS as _SHELL
-                    allowed = frozenset(_SHELL)
+                    from .harness_policy import POLICY_HOOKS as _HOOKS
+                    allowed = frozenset(_SHELL) | frozenset(_HOOKS)
                 except Exception:  # noqa: BLE001 — fail closed
                     allowed = frozenset()
                 raw = capabilities.get("provides")
@@ -583,6 +598,77 @@ class ToolStore:
     def visible_to(self, caller_id: str | None) -> list[ToolRecord]:
         return [r for r in self._records.values() if self.allowed(caller_id, r)]
 
+    # ------------------------------------------------------------------
+    # Loadouts / distros (Decision 2026-10-12)
+    # ------------------------------------------------------------------
+
+    def loadout_for(self, agent_id: str | None) -> str:
+        """The distro digest an attestation by ``agent_id`` must carry: the
+        agent's OWN bound loadout (AgentDefinition.loadout) when set, else the
+        daemon's reference distro (``active_loadout``). Never raises."""
+        if agent_id:
+            try:
+                defn = self._runtime.get_agent(agent_id)
+            except Exception:  # noqa: BLE001
+                defn = None
+            bound = str(getattr(defn, "loadout", "") or "") if defn else ""
+            if bound:
+                return bound
+        return self.active_loadout
+
+    def list_distros(self) -> list[dict[str, Any]]:
+        """Distro manifests available on this daemon: pinned records whose
+        code blob is a harness distro config (atn/harness_policy.py). The
+        reference distro is first and flagged."""
+        from .harness_policy import parse_distro_config, reference_policy
+        try:
+            blobs = self._blob_store()
+        except RuntimeError:
+            return []
+        ref = reference_policy().to_dict()
+        out: list[dict[str, Any]] = []
+        for rec in self._records.values():
+            code_digest = str(rec.manifest.get("code_digest") or "")
+            if not code_digest or not rec.manifest.get("dependencies"):
+                continue
+            try:
+                cfg = parse_distro_config(blobs.get_bytes(code_digest))
+            except Exception:  # noqa: BLE001
+                cfg = None
+            if cfg is None:
+                continue
+            policy = cfg.get("policy") if isinstance(cfg.get("policy"), dict) else {}
+            out.append({
+                "digest": rec.digest,
+                "name": rec.name,
+                "description": str(rec.manifest.get("description") or ""),
+                "author": rec.author,
+                "origin": rec.origin,
+                "enabled": rec.enabled,
+                "is_reference": rec.digest == self.active_loadout,
+                "modules": list(rec.manifest.get("dependencies") or []),
+                "policy_overrides": sorted(
+                    k for k, v in policy.items() if ref.get(k) != v),
+                "core_providers": self._core_providers_in(rec),
+            })
+        out.sort(key=lambda d: (not d["is_reference"], d["name"], d["digest"]))
+        return out
+
+    def _core_providers_in(self, distro: ToolRecord) -> list[dict[str, Any]]:
+        """Deps of ``distro`` that claim to provide core built-in names."""
+        from .runtime.shell_provider import core_claims
+        rows = []
+        for dep in distro.manifest.get("dependencies") or []:
+            rec = self.get(str(dep))
+            if rec is None:
+                continue
+            claims = core_claims(rec.manifest)
+            if claims and not (rec.name == "atn_shell" and rec.origin != "adopted"):
+                rows.append({"digest": rec.digest, "name": rec.name,
+                             "provides": claims,
+                             "core_replacement_ack": rec.core_replacement_ack})
+        return rows
+
     def get(self, digest: str) -> ToolRecord | None:
         return self._records.get(digest)
 
@@ -637,6 +723,7 @@ class ToolStore:
         caller_id: str | None = None,
         via: str = "",
         _depth: int = 0,
+        trace_path: str | None = None,
     ) -> dict[str, Any]:
         """Execute a registered tool. Scoping is the CALLER's job
         (``ToolRegistry.call_tool``) — this only dispatches.
@@ -656,7 +743,8 @@ class ToolStore:
             else:
                 # Sealed path — byte-for-byte legacy contract.
                 result = await self._call_pinned(
-                    record, arguments, caller_id=caller_id)
+                    record, arguments, caller_id=caller_id,
+                    trace_path=trace_path)
         elif manifest.get("connector_id"):
             result = await self._call_connector(record, arguments)
         else:
@@ -669,6 +757,7 @@ class ToolStore:
     def _exec_spec(
         self, record: ToolRecord, script: Path,
         secrets: frozenset[str] | None = None,
+        trace_path: str | None = None,
     ) -> tuple[list[str], dict[str, str] | None, str | None]:
         """(argv, env, cwd) for a pinned tool subprocess.
 
@@ -733,6 +822,8 @@ class ToolStore:
                 hosts = _authorized_hosts_for(secrets or ())
                 if hosts:
                     policy["hosts"] = sorted(hosts)
+            if trace_path:
+                policy["trace_path"] = str(trace_path)
             env["ATN_TOOL_POLICY"] = json.dumps(policy)
             return ([sys.executable, str(guard), str(script)], env, None)
 
@@ -769,6 +860,10 @@ class ToolStore:
             hosts = _authorized_hosts_for(secrets or ())
             if hosts:
                 policy["hosts"] = sorted(hosts)
+        if trace_path:
+            # Evidence capture (Decision 2026-10-12): the guard appends one
+            # JSON line per observed open / socket / spawn audit event.
+            policy["trace_path"] = str(trace_path)
         env["ATN_TOOL_POLICY"] = json.dumps(policy)
         return ([sys.executable, str(guard), str(script)], env, str(sandbox))
 
@@ -835,7 +930,8 @@ class ToolStore:
 
     async def _call_pinned(self, record: ToolRecord,
                            arguments: dict[str, Any],
-                           *, caller_id: str | None = None) -> dict[str, Any]:
+                           *, caller_id: str | None = None,
+                           trace_path: str | None = None) -> dict[str, Any]:
         """Run the pinned code blob as a subprocess: JSON args on stdin,
         JSON result on stdout. The blob is materialized to a cache file
         named by its digest, so what runs is exactly what was judged.
@@ -859,7 +955,8 @@ class ToolStore:
             script.write_bytes(raw)
 
         session, services = self._tool_secret_session(record, caller_id)
-        argv, env, cwd = self._exec_spec(record, script, services)
+        argv, env, cwd = self._exec_spec(record, script, services,
+                                         trace_path=trace_path)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -1455,10 +1552,12 @@ class ToolStore:
             }
             if axes:
                 row["axes"] = dict(sorted(axes.items()))
-            # Stamp the active harness distro (docs/tool_substrate.md —
-            # loadout digest is atomic with the attestation). Only when set.
-            if self.active_loadout:
-                row["loadout"] = self.active_loadout
+            # Stamp the CALLER's harness distro (docs/tool_substrate.md —
+            # loadout digest is atomic with the attestation; Decision
+            # 2026-10-12: per-agent binding, not the daemon-wide default).
+            _loadout = self.loadout_for(caller)
+            if _loadout:
+                row["loadout"] = _loadout
             receipt_digest = ""
             if blobs is not None:
                 try:
@@ -1489,8 +1588,8 @@ class ToolStore:
                 }
                 if axes:
                     event["axes"] = dict(sorted(axes.items()))
-                if self.active_loadout:
-                    event["loadout"] = self.active_loadout
+                if _loadout:
+                    event["loadout"] = _loadout
                 try:
                     self.event_sink(event)
                 except Exception as exc:
@@ -1611,6 +1710,8 @@ class ToolStore:
 
         caps = dict(payload.get("capabilities") or {})
         authored_via = str(payload.get("authored_via") or "")
+        from .runtime.shell_provider import core_claims
+        replaces = core_claims(payload)
         proposal = {
             "digest": digest,
             "name": str(payload.get("name") or ""),
@@ -1624,6 +1725,10 @@ class ToolStore:
             "ts": int(time.time()),
             "status": "pending",
             "capabilities": caps,
+            # Non-empty => approving installs a CORE REPLACEMENT candidate:
+            # the owner must approve with core_replacement_ack (a distinct,
+            # explicit act; the UI shows an extra warning).
+            "core_replacement": replaces,
             "provenance": {
                 "signed": self._verify_manifest_sig(payload),
                 "greenlit": (bool(vet_status.get("greenlit"))
@@ -1642,6 +1747,7 @@ class ToolStore:
                  proposal["name"], digest[:16], caller)
         return {"status": "pending", "digest": digest,
                 "capabilities": caps, "provenance": proposal["provenance"],
+                "core_replacement": replaces,
                 "note": "proposed; awaiting owner approval"}
 
     def list_adoption_proposals(
@@ -1652,7 +1758,9 @@ class ToolStore:
             rows = [r for r in rows if r.get("status") == status]
         return [dict(r) for r in rows]
 
-    async def approve_adoption(self, digest: str) -> dict[str, Any]:
+    async def approve_adoption(
+        self, digest: str, core_replacement_ack: bool = False,
+    ) -> dict[str, Any]:
         """Owner-side half (WS surface, never an agent tool): verify,
         install as an ADOPTED record — original author preserved on the
         manifest (their mint keeps flowing from our attestations),
@@ -1698,15 +1806,31 @@ class ToolStore:
             return {"error": "tool is CON-busted on the substrate — refusing "
                              "to install; clear the evidence claim first"}
 
+        # Core-replacement privilege class (Decision 2026-10-12). A tool that
+        # claims to provide core built-in names would see every command and
+        # file body the agent touches once swapped in, so approving it is a
+        # visibly different act: the approval must carry the explicit
+        # acknowledgment, and is rejected without it.
+        from .runtime.shell_provider import core_claims
+        replaces = core_claims(payload)
+        if replaces and not core_replacement_ack:
+            return {"error": "core_replacement_ack required: this tool "
+                             "replaces " + ", ".join(replaces) + " and will "
+                             "see every command and file your agent touches",
+                    "core_replacement": replaces}
+
         record = ToolRecord(
             digest=digest,
             manifest=payload,
             local_author=str(proposal.get("proposed_by") or ""),
             registered_ts=int(time.time()),
             origin="adopted",
+            core_replacement_ack=bool(replaces and core_replacement_ack),
         )
         self._records[digest] = record
         proposal["status"] = "approved"
+        if record.core_replacement_ack:
+            proposal["core_replacement_ack"] = True
         proposal["resolved_ts"] = int(time.time())
         self._persist()
         self._save_proposals()
@@ -1714,7 +1838,9 @@ class ToolStore:
                  record.name, digest[:16], record.local_author)
         return {"digest": digest, "name": record.name,
                 "origin": "adopted", "author": record.author,
-                "adopted_for": record.local_author}
+                "adopted_for": record.local_author,
+                "core_replacement": replaces,
+                "core_replacement_ack": record.core_replacement_ack}
 
     def reject_adoption(self, digest: str, reason: str = "") -> dict[str, Any]:
         proposal = self._proposals.get(digest)
@@ -2373,6 +2499,8 @@ class ToolStore:
                 local_author=str(row.get("local_author") or ""),
                 registered_ts=int(row.get("registered_ts") or 0),
                 origin=str(row.get("origin") or "authored"),
+                core_replacement_ack=bool(row.get("core_replacement_ack")),
+                last_evidence_digest=str(row.get("last_evidence_digest") or ""),
             )
 
     def _persist(self) -> None:

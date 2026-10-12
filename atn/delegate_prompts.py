@@ -220,10 +220,18 @@ def review_owed_tools(tool_calls) -> list[str]:
     return owed
 
 
-def format_review_prompt(owed: list[str] | None) -> str:
-    """REVIEW_STEP_PROMPT with the actual tool names interpolated."""
+def format_review_prompt(owed: list[str] | None, policy=None) -> str:
+    """The review prompt (the distro policy's, REVIEW_STEP_PROMPT by
+    default) with the actual tool names interpolated."""
     names = ", ".join(owed[:10]) if owed else "the registered tools you called"
-    return REVIEW_STEP_PROMPT.format(tools=names)
+    template = policy.review_step_prompt if policy is not None else REVIEW_STEP_PROMPT
+    return template.format(tools=names)
+
+
+def format_verify_prompt(files, policy=None) -> str:
+    """The verify prompt (distro policy's, VERIFY_STEP_PROMPT by default)."""
+    template = policy.verify_step_prompt if policy is not None else VERIFY_STEP_PROMPT
+    return template.format(files=", ".join(sorted(files)[:20]))
 
 # stop_reasons after which a review re-invoke would be wrong (aborted or
 # resource-limited runs get no extra turn).
@@ -444,6 +452,7 @@ def build_common_base(
     agent_type: str = "",
     parent_id: str | None = None,
     tool_categories: list[str] | None = None,
+    policy=None,
 ) -> str:
     """Build the common base prompt (layer 1) for any cognitive agent.
 
@@ -460,10 +469,15 @@ def build_common_base(
     matching _TOOL_CATEGORY_NOTES blocks (stable strings, sorted for
     determinism). The base itself never claims specific tools — the agent's
     tool definitions are authoritative — so an agent without a category is
-    never told it has those tools."""
-    parts = [_COMMON_BASE]
+    never told it has those tools.
+
+    ``policy``: the agent's distro HarnessPolicy (None = reference, which
+    holds exactly _COMMON_BASE / _TOOL_CATEGORY_NOTES)."""
+    base = policy.common_base if policy is not None else _COMMON_BASE
+    notes = policy.tool_category_notes if policy is not None else _TOOL_CATEGORY_NOTES
+    parts = [base]
     for cat in sorted(set(tool_categories or [])):
-        note = _TOOL_CATEGORY_NOTES.get(cat)
+        note = notes.get(cat)
         if note:
             parts.append(note)
     return "".join(parts)
@@ -491,6 +505,7 @@ def build_identity_header(
     agent_type: str = "",
     parent_id: str | None = None,
     context_window: int = 0,
+    policy=None,
 ) -> str:
     """The per-agent identity block. It never enters the cached system prompt
     (keeps the prefix invariant across agents) and is never stored in the
@@ -509,15 +524,20 @@ def build_identity_header(
         f"Agent Type: {agent_type or 'general'}\n"
         f"Parent: {parent_id or 'none (you are a root agent)'}"
     )
-    if 0 < context_window < _SMALL_CONTEXT_WINDOW:
-        header += "\n\n" + _SMALL_CONTEXT_NOTE.format(
+    small_window = (policy.small_context_window if policy is not None
+                    else _SMALL_CONTEXT_WINDOW)
+    note = policy.small_context_note if policy is not None else _SMALL_CONTEXT_NOTE
+    if 0 < context_window < small_window:
+        header += "\n\n" + note.format(
             ctx_k=max(1, context_window // 1000))
     return header
 
 
-def build_type_layer(agent_type: str) -> str:
+def build_type_layer(agent_type: str, policy=None) -> str:
     """Build the type-specialization layer (layer 2) for a given agent type."""
-    return _TYPE_GUIDANCE.get(agent_type, _TYPE_GUIDANCE["general"])
+    guidance = policy.type_guidance if policy is not None else _TYPE_GUIDANCE
+    return guidance.get(agent_type, guidance.get("general")
+                        or _TYPE_GUIDANCE["general"])
 
 
 def build_system_prompt(
@@ -525,6 +545,7 @@ def build_system_prompt(
     agent_id: str,
     parent_id: str | None = None,
     tool_categories: list[str] | None = None,
+    policy=None,
 ) -> str:
     """Build a complete system prompt: common base + type specialization.
 
@@ -534,12 +555,14 @@ def build_system_prompt(
             (cache invariant) — kept for signature compatibility.
         parent_id: Parent agent's ID. Same — not baked in.
         tool_categories: Granted tool categories; renders matching tool notes.
+        policy: The agent's distro HarnessPolicy (None = reference).
 
     Returns:
         Complete system prompt string.
     """
-    base = build_common_base(agent_id, agent_type, parent_id, tool_categories)
-    type_layer = build_type_layer(agent_type)
+    base = build_common_base(agent_id, agent_type, parent_id, tool_categories,
+                             policy=policy)
+    type_layer = build_type_layer(agent_type, policy=policy)
     return base + type_layer
 
 

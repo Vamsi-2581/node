@@ -1,71 +1,84 @@
-"""Shell-bundle swap resolution — DESIGNED, WIRED, AND DISABLED.
+"""Core built-in swap resolution: LIVE behind three gates (Decision 2026-10-12).
 
-docs/tool_substrate.md — "Resident tools, loadouts, distros".
+docs/tool_substrate.md: "Resident tools, loadouts, distros", the 2026-07-29
+decision (the shell bundle is runnable; the swap is gated off) and the
+2026-10-12 decision that supersedes its deciding factor.
 
-WHAT THIS WOULD DO. Let an adopted pinned tool REPLACE the daemon's built-in
-shell bundle for an agent whose active loadout names a substitute: agent ->
-active_loadout digest -> distro manifest -> dependency digests -> the record
-whose ``capabilities.provides`` claims "bash". The harness would then swap out
-its own components for tools from the substrate, which is the premise the
-distro DAG, adoption credit, and mint fan-out were all built for.
+WHAT THIS DOES. Lets a pinned tool REPLACE the daemon's built-in shell/file
+tools for one agent: agent -> AgentDefinition.loadout (an owner-bound distro
+digest) -> distro manifest -> dependency digests -> the record whose
+``capabilities.provides`` claims e.g. "bash". The harness then runs that
+substrate tool instead of its own component, which is what the distro DAG,
+adoption credit and mint fan-out were built for.
 
-WHY IT IS OFF. Containment for this specific tool class does not exist.
+WHY IT WAS OFF (2026-07-29), AND WHAT CHANGED. Containment for this tool
+class still does not exist: ``tool_guard.py``'s audit hook falls through for
+a tool that legitimately needs net + fs + spawn, and a substituted ``bash``
+or ``read_file`` sees every command string and every file body the agent
+touches (credentials included), while needing no evasion to exfiltrate. That
+analysis stands. What changed is the deciding factor: the owner decided
+(2026-10-12) that every part of the harness should be swappable through the
+tool library, with the market selecting the best, and that the residual risk
+is carried by STAKE and EVIDENCE instead of being avoided by a release-only
+upgrade path. So the old three preconditions are replaced by these gates,
+ALL of which must hold for a swap to happen:
 
-``tool_guard.py`` has exactly three checks: socket.* (net), open-outside-prefix
-(fs), and a spawn-event tuple. A shell bundle needs net, fs, AND spawn by
-definition — it runs commands and reads files. Every branch of the guard falls
-through, so the audit hook is a literal no-op for this tool. The destination
-allowlist added in 664ad0a does not save it either: it is only populated when
-the tool declares secrets, and ``spawn: True`` defeats it regardless (curl in a
-child process is not audited by the parent's hook). What survives on the
-adopted branch is the env scrub and a sandbox cwd — and cwd is meaningless for
-a tool whose read_file/write_file take absolute paths.
+  (a) Core-replacement approval. The record was adopted with an explicit
+      owner acknowledgment (``ToolRecord.core_replacement_ack``), a
+      distinct act from ordinary adoption approval: ``approve_adoption``
+      rejects a tool whose manifest claims core names unless the approval
+      carries ``core_replacement_ack``; the UI shows an extra warning
+      ("This tool replaces <names> and will see every command and file your
+      agent touches"). Authored (local) records cannot replace core tools.
+  (b) Bond. ``ToolBond.isBonded(manifestDigest)`` is true on-chain
+      (``runtime/tool_bond.py``; registry key ``tool_bond``). No address
+      configured => refused (fail closed) unless ATN_TOOL_BOND_DEV_OVERRIDE=1.
+  (c) Per-agent binding. Only an agent whose owner-bound loadout
+      (AgentDefinition.loadout) lists the provider as a dependency gets the
+      swap. The daemon-wide reference distro never swaps anything.
 
-The marginal exposure is uniquely high HERE, not merely equal to other tools:
-a substituted ``bash`` sees every command string the agent runs (git remotes,
-ssh invocations, curl-with-token-in-URL), and a substituted ``read_file`` sees
-the body of every file the agent reads — which is the plane where credentials
-actually live, and precisely the plane the tool-secret binding does NOT cover
-(that binding clamps which VAULT services a tool may request; it says nothing
-about a tool that simply reads ~/.aws/credentials as a file).
+A provider must also be SEALED (no declared dependencies), so every call goes
+through the one path where evidence capture works.
 
-And exfiltration would need no evasion at all: net and spawn are HONESTLY
-declared, so there is no manifest/behavior mismatch for the CON evidence rail
-to bite on. The forge-resistance the substrate relies on assumes a liar; this
-tool class does not have to lie.
+EVIDENCE. Every swapped call writes a trace (tool digest, input, output,
+timestamps, and what the guard observed: file paths opened, network
+destinations, spawn argv), signs it with the agent key, stores it in the blob
+store, records its digest on the tool record (``last_evidence_digest``) and in
+``evidence_index.jsonl``, and logs it. That digest is the ``evidenceCid`` an
+accuser passes to ``ToolBond.accuse``. Honest limits: the guard sees only
+what the provider's own Python process does through audited calls. A spawned
+child (the bash the provider runs) is visible only as its argv; its own file
+and network activity, native-code bypasses, and anything a provider does
+outside the sealed call are NOT captured.
 
-THE DECIDING FACTOR. The owner has stated that core logic upgrading only via
-daemon release is acceptable. The swap buys a capability that is not needed at
-a cost that cannot currently be bounded. So: the extraction shipped (the shell
-bundle is a genuinely runnable, self-describing reference tool — see
-``atn/shell_tools.py``), and the resolution is written down here, wired at ONE
-convergence point, and hard-disabled.
+Any refused gate falls back to the BUILT-IN, never to an error: the built-in
+is the trusted default at every step. ``SHELL_SWAP_ENABLED`` stays as the
+kernel kill switch (also ATN_CORE_SWAP_DISABLED=1).
 
-WHAT WOULD HAVE TO CHANGE to flip ``SHELL_SWAP_ENABLED``:
-  1. OS-level isolation for adopted tools (the vault-track runner), not an
-     in-process audit hook. The guard's own docstring already says the hook is
-     "the tripwire in front of" that wall; for net+fs+spawn tools it is ONLY
-     the tripwire, with no wall behind it.
-  2. A privilege-class notion at adoption: approving a tool that claims
-     ``provides`` over core shell names must be a visibly different act from
-     approving a CSV parser. Today ``approve_adoption`` cannot tell them apart.
-  3. A per-agent loadout binding. ``active_loadout`` is currently a single
-     daemon-wide string used only to stamp attestations; it is not consulted at
-     dispatch and cannot express "this agent runs a different shell".
-
-Until all three exist, this module returns None and the built-in always runs.
+PERF: the default path (no loadout bound) is one dict lookup and returns None.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
+import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
-# THE GATE. Flipping this to True without the three preconditions in the module
-# docstring hands every adopted shell provider a view of every command and file
-# body the agent touches, with no containment. Do not flip it casually.
-SHELL_SWAP_ENABLED = False
+# Kernel kill switch. True since 2026-10-12: swaps happen only through the
+# three gates in the module docstring.
+SHELL_SWAP_ENABLED = True
+KILL_SWITCH_ENV = "ATN_CORE_SWAP_DISABLED"
+
+_EVIDENCE_OUTPUT_CAP = 64_000
+
+
+def swap_enabled() -> bool:
+    return SHELL_SWAP_ENABLED and os.environ.get(KILL_SWITCH_ENV, "") != "1"
 
 
 def _shell_names() -> frozenset[str]:
@@ -77,60 +90,60 @@ def _shell_names() -> frozenset[str]:
         return frozenset()
 
 
+def core_claims(manifest: dict[str, Any] | None) -> list[str]:
+    """Core built-in names a manifest claims to provide (sorted, clamped to
+    the overridable set). Empty = an ordinary tool."""
+    caps = (manifest or {}).get("capabilities") or {}
+    raw = caps.get("provides") if isinstance(caps, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return []
+    names = _shell_names()
+    return sorted({s.strip() for s in raw
+                   if isinstance(s, str) and s.strip() in names})
+
+
 def resolve_shell_provider(runtime: Any, agent_id: str) -> dict[str, Any]:
-    """Map ``tool_name -> ToolRecord`` for providers in the active loadout.
-
-    Returns {} when swapping is disabled, when no loadout is stamped, or on any
-    fault — {} means "use the built-in", which is the safe default at every
-    step. Never raises: a broken loadout must not break tool dispatch.
-
-    Kept live (not stubbed) even while the gate is off so the resolution logic
-    is reviewable and testable on its own terms; ``dispatch_shell`` is what
-    actually refuses to act on it.
-    """
-    if not SHELL_SWAP_ENABLED:
+    """Map ``tool_name -> ToolRecord`` for providers in ``agent_id``'s OWN
+    bound loadout that pass gates (a) and (c). The bond gate (b) is async and
+    checked at dispatch. {} means "use the built-in". Never raises."""
+    if not swap_enabled():
         return {}
     try:
+        from ..harness_policy import agent_loadout
+        loadout = agent_loadout(runtime, agent_id)
         store = getattr(runtime, "tool_store", None)
-        loadout = getattr(store, "active_loadout", "") if store else ""
         if not store or not loadout:
             return {}
         distro = store.resolve(loadout)
-        if distro is None:
+        if distro is None or not distro.enabled:
             return {}
-        names = _shell_names()
         out: dict[str, Any] = {}
         claims: dict[str, str] = {}
         for dep in (distro.manifest.get("dependencies") or []):
             record = store.resolve(str(dep))
             if record is None or not record.enabled:
                 continue
-            # The daemon's OWN shell module is not an override of itself.
-            if record.name == "atn_shell" and record.origin != "adopted":
+            # Gate (a): adopted with the explicit core-replacement ack. The
+            # daemon's own atn_shell module (authored) is never an override.
+            if record.origin != "adopted" or not record.core_replacement_ack:
                 continue
+            if record.manifest.get("dependencies"):
+                continue  # sealed providers only (evidence capture)
             if not store.allowed(agent_id, record):
                 continue
-            caps = record.manifest.get("capabilities") or {}
-            for claimed in (caps.get("provides") or []):
-                if not isinstance(claimed, str) or claimed not in names:
-                    continue
+            for claimed in core_claims(record.manifest):
                 prior = claims.get(claimed)
                 # Deterministic on conflict: lexicographically smaller digest
-                # wins. Last-writer-wins would make dispatch depend on dict
-                # ordering, i.e. on registration history.
-                if prior is not None:
-                    if prior <= record.digest:
-                        log.warning(
-                            "shell provider conflict for %r: %s and %s",
-                            claimed, prior[:16], record.digest[:16])
-                        continue
-                    log.warning("shell provider conflict for %r: %s and %s",
+                # wins (never dict / registration order).
+                if prior is not None and prior <= record.digest:
+                    log.warning("core provider conflict for %r: %s and %s",
                                 claimed, prior[:16], record.digest[:16])
+                    continue
                 claims[claimed] = record.digest
                 out[claimed] = record
         return out
     except Exception:  # noqa: BLE001 — never break dispatch
-        log.debug("shell provider resolution failed", exc_info=True)
+        log.debug("core provider resolution failed", exc_info=True)
         return {}
 
 
@@ -138,24 +151,40 @@ async def dispatch_shell(runtime: Any, agent_id: str, name: str,
                          tool_input: dict) -> Optional[dict]:
     """Run ``name`` through a swapped provider, or return None.
 
-    None means "no override — the caller runs the built-in", which is the
-    zero-cost path and the one taken on every call today. The caller MUST
+    None means "no override — the caller runs the built-in". The caller MUST
     treat None as fall-through rather than as an error.
     """
-    if not SHELL_SWAP_ENABLED:
-        return None
-    if name not in _shell_names():
+    if not swap_enabled() or name not in _shell_names():
         return None
     providers = resolve_shell_provider(runtime, agent_id)
     record = providers.get(name)
     if record is None:
         return None
+    # Gate (b): bonded on ToolBond (fail closed).
+    from .tool_bond import gate_for
+    bonded, reason = await gate_for(runtime).is_bonded(record.digest)
+    if not bonded:
+        log.warning("core provider %s for %r refused for agent %s (%s); "
+                    "running the built-in", record.digest[:16], name,
+                    agent_id, reason)
+        return None
+    store = runtime.tool_store
+    trace_dir = Path(store._dir) / "evidence" / "tmp"
+    trace_path = trace_dir / f"{uuid.uuid4().hex}.jsonl"
+    started = time.time()
     try:
-        store = runtime.tool_store
+        trace_dir.mkdir(parents=True, exist_ok=True)
         out = await store.call(
-            record, {"tool": name, "args": tool_input}, caller_id=agent_id)
+            record, {"tool": name, "args": tool_input}, caller_id=agent_id,
+            trace_path=str(trace_path))
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"shell provider {record.digest[:16]} failed: {exc}"}
+        out = {"error": f"core provider {record.digest[:16]} failed: {exc}"}
+    ended = time.time()
+    try:
+        capture_evidence(runtime, record, agent_id, name, tool_input, out,
+                         trace_path, started, ended)
+    except Exception:  # noqa: BLE001 — evidence must not break the call
+        log.warning("core provider evidence capture failed", exc_info=True)
     if "error" in out:
         return {"error": out["error"]}
     envelope = out.get("result")
@@ -164,3 +193,142 @@ async def dispatch_shell(runtime: Any, agent_id: str, name: str,
     if envelope.get("ok"):
         return envelope.get("result")
     return {"error": str(envelope.get("error") or "shell provider error")}
+
+
+# ---------------------------------------------------------------------------
+# Evidence capture
+# ---------------------------------------------------------------------------
+
+EVIDENCE_KIND = "core_replacement_trace"
+CAPTURE_LIMITS = (
+    "Observed via the tool guard's Python audit hook in the provider process: "
+    "file opens (outside the interpreter tree), socket destinations "
+    "(getaddrinfo/connect/sendto), and spawn argv. NOT observed: activity of "
+    "spawned child processes beyond their argv, native-code bypasses of the "
+    "audit hook, anything outside this call. Capped at 5000 observations."
+)
+
+
+def _read_trace(path: Path) -> tuple[list[dict], bool]:
+    obs: list[dict] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obs.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        return [], False
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return obs, len(obs) >= 5000
+
+
+def canonical_evidence_bytes(body: dict[str, Any]) -> bytes:
+    return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      default=str).encode("utf-8")
+
+
+def _sign(runtime: Any, agent_id: str, body: dict[str, Any]) -> tuple[str, str]:
+    """(signer_address, signature_hex) with the agent key; ("", "") if the
+    agent has no key (unregistered) or signing is unavailable."""
+    registry = getattr(runtime, "registry", None)
+    key = None
+    if registry is not None and hasattr(registry, "get_agent_key"):
+        try:
+            key = registry.get_agent_key(agent_id)
+        except Exception:  # noqa: BLE001
+            key = None
+    if not key:
+        return "", ""
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+        signed = Account.sign_message(
+            encode_defunct(canonical_evidence_bytes(body)), private_key=key)
+        return Account.from_key(key).address, signed.signature.hex()
+    except Exception:  # noqa: BLE001
+        log.debug("evidence signing unavailable", exc_info=True)
+        return "", ""
+
+
+def capture_evidence(runtime: Any, record: Any, agent_id: str, name: str,
+                     tool_input: dict, out: dict, trace_path: Path,
+                     started: float, ended: float) -> str:
+    """Build, sign and blob-store the evidence trace. Returns its digest."""
+    observations, truncated = _read_trace(Path(trace_path))
+    try:
+        output_text = json.dumps(out, default=str)
+    except (TypeError, ValueError):
+        output_text = str(out)
+    body = {
+        "kind": EVIDENCE_KIND,
+        "version": 1,
+        "tool_digest": record.digest,
+        "tool_name": record.name,
+        "tool_author": record.author,
+        "replaces": name,
+        "agent_id": agent_id,
+        "input": tool_input,
+        "output": output_text[:_EVIDENCE_OUTPUT_CAP],
+        "output_truncated": len(output_text) > _EVIDENCE_OUTPUT_CAP,
+        "started_ts": round(started, 3),
+        "ended_ts": round(ended, 3),
+        "observations": observations,
+        "observations_truncated": truncated,
+        "capture_limits": CAPTURE_LIMITS,
+    }
+    signer, sig = _sign(runtime, agent_id, body)
+    evidence = {"body": body, "signer": signer, "sig": sig,
+                "sig_scheme": "eip191:canonical_json" if sig else "unsigned"}
+    store = runtime.tool_store
+    digest = store._blob_store().add_json(evidence) or ""
+    if not digest:
+        return ""
+    record.last_evidence_digest = digest
+    try:
+        store._persist()
+    except Exception:  # noqa: BLE001
+        log.debug("persisting last_evidence_digest failed", exc_info=True)
+    try:
+        idx = Path(store._dir) / "evidence_index.jsonl"
+        with idx.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "ts": int(ended), "tool_digest": record.digest,
+                "tool_name": record.name, "replaces": name,
+                "agent_id": agent_id, "evidence_digest": digest,
+                "signed": bool(sig), "observations": len(observations),
+            }) + "\n")
+    except OSError:
+        log.debug("evidence index append failed", exc_info=True)
+    log.info("core-replacement evidence %s (tool %s, %s, agent %s, %d "
+             "observations, %s)", digest, record.digest[:16], name, agent_id,
+             len(observations), "signed" if sig else "UNSIGNED")
+    return digest
+
+
+def list_evidence(store: Any, tool_digest: str = "",
+                  limit: int = 50) -> list[dict[str, Any]]:
+    """Newest-first rows of the local evidence index."""
+    idx = Path(store._dir) / "evidence_index.jsonl"
+    rows: list[dict[str, Any]] = []
+    try:
+        with idx.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if tool_digest and row.get("tool_digest") != tool_digest:
+                    continue
+                rows.append(row)
+    except OSError:
+        return []
+    return list(reversed(rows))[:max(1, min(int(limit or 50), 500))]

@@ -122,6 +122,8 @@ async def clone_agent(runtime: Any, agent_id: str) -> dict[str, Any]:
         # billing the original.
         service_provider=(dict(defn.service_provider)
                           if defn.service_provider else None),
+        # Same harness as the original (owner-set; the clone is owner-made).
+        loadout=getattr(defn, "loadout", "") or "",
     )
 
     # legacy=True: a clone preserves the original's budget posture even if

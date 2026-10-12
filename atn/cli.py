@@ -399,7 +399,11 @@ async def _handle_command(line: str, runtime: Runtime) -> bool:
             console.print("  [dim]approve <digest> / reject <digest> to resolve.[/]")
 
     elif cmd == "approve" and args:
-        result = await runtime.tool_store.approve_adoption(args[0].strip().lower())
+        # A tool replacing core built-ins needs the explicit acknowledgment
+        # (Decision 2026-10-12): `approve <digest> --core-replacement`.
+        result = await runtime.tool_store.approve_adoption(
+            args[0].strip().lower(),
+            core_replacement_ack="--core-replacement" in args[1:])
         if result.get("error"):
             console.print(f"  [red]{result['error']}[/]")
         else:

@@ -1,4 +1,4 @@
-"""The shell bundle is a runnable reference tool; the swap is gated off.
+"""The shell bundle is a runnable reference tool; the swap is gated (2026-10-12).
 
 docs/tool_substrate.md — "Resident tools, loadouts, distros".
 
@@ -177,25 +177,27 @@ def test_daemon_coupled_bundles_do_not_claim_to_provide():
 # --------------------------------------------------------------------------
 # The gate
 # --------------------------------------------------------------------------
-def test_swap_is_disabled():
-    """PROPERTY: the gate is OFF. This test failing means someone enabled the
-    swap -- read shell_provider.py's docstring before changing it, and do not
-    'fix' this test to match."""
-    assert shell_provider.SHELL_SWAP_ENABLED is False
+def test_swap_path_is_live_but_gated():
+    """PROPERTY (Decision 2026-10-12): the kernel switch is on, but a swap
+    needs core-replacement approval + a ToolBond bond + a per-agent loadout.
+    tests/atn/test_swappable_harness.py exercises each gate."""
+    assert shell_provider.SHELL_SWAP_ENABLED is True
 
 
-def test_dispatch_shell_is_a_noop_while_gated():
-    """PROPERTY: None means fall through to the built-in. Every shell call
-    today takes this path."""
-    rt = SimpleNamespace(tool_store=None)
+def test_dispatch_shell_falls_through_without_a_loadout():
+    """PROPERTY: None means fall through to the built-in. Every agent with no
+    owner-bound loadout takes this path."""
+    rt = SimpleNamespace(tool_store=None, get_agent=lambda a: None)
     for name in SHELL_TOOL_EXECUTORS:
         got = asyncio.run(shell_provider.dispatch_shell(rt, "a1", name, {}))
-        assert got is None, f"{name} was overridden while the gate is off"
+        assert got is None, f"{name} was overridden with no loadout bound"
 
 
-def test_resolution_returns_nothing_while_gated():
-    store, _ = _bootstrap()
-    rt = SimpleNamespace(tool_store=store)
+def test_reference_distro_resolves_no_provider():
+    """The daemon's own atn_shell module is never an override of itself."""
+    store, digest = _bootstrap()
+    agent = SimpleNamespace(loadout=digest)
+    rt = SimpleNamespace(tool_store=store, get_agent=lambda a: agent)
     assert shell_provider.resolve_shell_provider(rt, "a1") == {}
 
 

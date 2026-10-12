@@ -269,6 +269,14 @@ class AgentDefinition:
     # --- Marketplace inference binding (docs/services_market.md,
     #     ratified 2026-07-26: employer-chooses-the-tool) ---
     service_provider: dict[str, Any] | None = None
+
+    # --- Harness loadout (docs/tool_substrate.md, Decision 2026-10-12) ---
+    loadout: str = ""
+    # The 64-hex digest of the harness DISTRO this agent runs: its loop
+    # policy (prompts, compaction, guards) and, for code swaps, which pinned
+    # providers may replace core built-ins for THIS agent. "" = the daemon's
+    # reference distro. OWNER-set only (update_agent from the owner surface);
+    # never an agent tool, never self-set. Attestations carry this digest.
     # ``{"provider_address": "0x...", "spec_digest": "<sha256 hex>"}`` — the
     # marketplace inference service that backs THIS agent's provider. Set ONLY
     # by the agent's PARENT (create_agent / update_agent): an agent must never

@@ -280,6 +280,14 @@ def _validate_agent(raw: dict, file: Path) -> tuple[AgentDefinition | None, list
             errors.append(LoadError(file, f"'service_provider': {exc}"))
             return None, errors
 
+    # --- Harness loadout (owner-set distro digest; 2026-10-12) ---
+    loadout = raw.get("loadout") or ""
+    if not isinstance(loadout, str) or (
+            loadout and (len(loadout) != 64 or any(
+                c not in "0123456789abcdef" for c in loadout.lower()))):
+        errors.append(LoadError(file, "'loadout' must be a 64-hex distro digest"))
+        return None, errors
+
     return AgentDefinition(
         id=agent_id,
         name=name,
@@ -308,6 +316,7 @@ def _validate_agent(raw: dict, file: Path) -> tuple[AgentDefinition | None, list
         tool_input_schema=tool_input_schema,
         secrets_allowance=secrets_allowance,
         service_provider=service_provider,
+        loadout=loadout.lower(),
     ), errors
 
 
@@ -468,6 +477,8 @@ def save_agent(defn: AgentDefinition, directory: Path) -> Path:
     # re-route the spend to the daemon owner after a restart.
     if defn.service_provider:
         data["service_provider"] = dict(defn.service_provider)
+    if getattr(defn, "loadout", ""):
+        data["loadout"] = defn.loadout
 
     # Heartbeat
     if defn.heartbeat:

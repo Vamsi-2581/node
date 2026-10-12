@@ -195,6 +195,13 @@ async def run_cognitive_loop(
     history = manifest.get("history") or None
     per_turn_input_max = manifest.get("per_turn_input_max")
     repeat_call_limit = manifest.get("repeat_call_limit")
+    # Distro loop policy (Decision 2026-10-12): a dict overlay, or None for
+    # the reference. Core built-ins this agent's loadout swaps out: those
+    # route to the daemon (framework_tool RPC -> route_tool_call ->
+    # dispatch_shell) instead of the local executor.
+    from ..harness_policy import as_policy
+    harness_policy = as_policy(manifest.get("harness_policy"))
+    core_swap_names = frozenset(manifest.get("core_swap_names") or ())
 
     # --- Wire the provider's event bus to the daemon over the pipe. The base
     # provider emits AGENT_TOOL_USE_* + usage events on ``event_bus``; we bridge
@@ -234,7 +241,8 @@ async def run_cognitive_loop(
     accumulated_tool_calls: list[dict[str, Any]] = []
 
     async def _tool_executor(name: str, tool_input: dict) -> dict:
-        result = await _route_tool(client, name, tool_input, agent_label)
+        result = await _route_tool(client, name, tool_input, agent_label,
+                                   swapped=core_swap_names)
         is_error = isinstance(result, dict) and "error" in result
         accumulated_tool_calls.append({
             "tool": name,
@@ -319,6 +327,8 @@ async def run_cognitive_loop(
         send_kwargs["per_turn_input_max"] = per_turn_input_max
     if repeat_call_limit is not None:
         send_kwargs["repeat_call_limit"] = repeat_call_limit
+    if manifest.get("harness_policy"):
+        send_kwargs["harness_policy"] = harness_policy
 
     response = await provider.run_agent_loop(**send_kwargs)
 
@@ -327,7 +337,7 @@ async def run_cognitive_loop(
     # attest_tools. Mirrors the in-process engine block exactly.
     from ..delegate_prompts import (
         format_review_prompt,
-        VERIFY_STEP_PROMPT,
+        format_verify_prompt,
         needs_review_reinvoke,
         needs_verify_reinvoke,
         review_owed_tools,
@@ -337,7 +347,7 @@ async def run_cognitive_loop(
     # agent loop resets the provider's tracking.
     _modified_code = set(getattr(
         provider, "last_modified_code_files", None) or ())
-    if _review_session and needs_verify_reinvoke(
+    if _review_session and harness_policy.verify_enabled and needs_verify_reinvoke(
             provider, _modified_code, response.stop_reason):
         log.info("[%s] verify step: follow-up verification turn (%d code "
                  "files)", agent_label, len(_modified_code))
@@ -345,16 +355,15 @@ async def run_cognitive_loop(
             verify_kwargs = dict(send_kwargs)
             verify_kwargs.pop("history", None)  # session carries context
             verify_kwargs.update(
-                message=VERIFY_STEP_PROMPT.format(
-                    files=", ".join(sorted(_modified_code)[:20])),
-                max_turns=8,
+                message=format_verify_prompt(_modified_code, harness_policy),
+                max_turns=harness_policy.verify_follow_up_max_turns,
                 session_id=_review_session,
             )
             await provider.run_agent_loop(**verify_kwargs)
         except Exception:
             log.warning("[%s] verify follow-up turn failed; continuing",
                         agent_label, exc_info=True)
-    if _review_session and needs_review_reinvoke(
+    if _review_session and harness_policy.review_enabled and needs_review_reinvoke(
             provider, accumulated_tool_calls, response.stop_reason):
         log.info("[%s] review step: follow-up attest turn", agent_label)
         try:
@@ -362,8 +371,8 @@ async def run_cognitive_loop(
             review_kwargs.pop("history", None)  # session carries context
             review_kwargs.update(
                 message=format_review_prompt(
-                    review_owed_tools(accumulated_tool_calls)),
-                max_turns=4,
+                    review_owed_tools(accumulated_tool_calls), harness_policy),
+                max_turns=harness_policy.review_follow_up_max_turns,
                 session_id=_review_session,
             )
             await provider.run_agent_loop(**review_kwargs)
@@ -475,7 +484,8 @@ async def run_cognitive_loop(
 # Tool routing
 # ---------------------------------------------------------------------------
 
-async def _route_tool(client: Any, name: str, tool_input: dict, agent_label: str) -> dict:
+async def _route_tool(client: Any, name: str, tool_input: dict, agent_label: str,
+                      swapped: frozenset = frozenset()) -> dict:
     """Route one tool call: LOCAL executors run here; AUTHORITY tools RPC out."""
     # Spawn family (P6): issue a dedicated ``spawn_child`` RPC BEFORE the
     # LOCAL/AUTHORITY split. The daemon is the trusted launcher — it runs the
@@ -501,7 +511,7 @@ async def _route_tool(client: Any, name: str, tool_input: dict, agent_label: str
     if name in _SECRET_TOOLS:
         return await _handle_secret_tool(name, tool_input)
 
-    if not _is_authority_tool(name):
+    if not _is_authority_tool(name) and name not in swapped:
         try:
             _local = _SHELL_TOOL_EXECUTORS.get(name) or _WEB_TOOL_EXECUTORS[name]
             return await _local(tool_input)

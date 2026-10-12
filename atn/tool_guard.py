@@ -201,7 +201,67 @@ def main() -> None:
         return any(p == d or p.startswith(d.rstrip("/\\") + os.sep)
                    for d in deny_paths)
 
+    # Evidence capture (docs/tool_substrate.md, Decision 2026-10-12). When the
+    # daemon runs a CORE-REPLACING tool it passes trace_path; every observed
+    # file open, network destination and spawn argv is appended as one JSON
+    # line. The fd is opened BEFORE the hook is installed (so it is not itself
+    # traced) and written with os.write (not an audited event). Interpreter
+    # internals (stdlib / site-packages / the tool's own code dir) are skipped.
+    # What a spawned child does is NOT visible here: only the spawn's argv.
+    trace_fd = -1
+    trace_path = str(policy.get("trace_path") or "")
+    if trace_path:
+        try:
+            trace_fd = os.open(trace_path,
+                               os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        except OSError:
+            trace_fd = -1
+    trace_state = {"n": 0}
+    trace_cap = 5000
+    internal_prefixes = tuple({
+        _real(sys.prefix), _real(sys.base_prefix),
+        _real(os.path.dirname(_real(script))),
+    })
+    import time as _time
+
+    def _emit(rec: dict) -> None:
+        if trace_state["n"] >= trace_cap:
+            return
+        trace_state["n"] += 1
+        rec["ts"] = round(_time.time(), 3)
+        try:
+            os.write(trace_fd, (json.dumps(rec, default=str) + "\n")
+                     .encode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001 — tracing never breaks the tool
+            pass
+
+    def _observe(event: str, args: tuple) -> None:
+        if event == "open":
+            path = args[0] if args else None
+            if path is None or isinstance(path, int):
+                return
+            p = _real(os.fsdecode(path) if isinstance(path, bytes) else str(path))
+            if p.startswith(internal_prefixes):
+                return
+            mode = args[1] if len(args) > 1 else ""
+            _emit({"kind": "file", "path": p, "mode": str(mode)})
+        elif event in ("socket.connect", "socket.sendto", "socket.sendmsg"):
+            addr = args[1] if len(args) > 1 else None
+            _emit({"kind": "net", "event": event, "dest": addr})
+        elif event == "socket.getaddrinfo" and args:
+            _emit({"kind": "net", "event": event, "dest": [args[0],
+                   args[1] if len(args) > 1 else None]})
+        elif event == "subprocess.Popen":
+            _emit({"kind": "spawn", "executable": args[0] if args else None,
+                   "argv": args[1] if len(args) > 1 else None,
+                   "cwd": args[2] if len(args) > 2 else None})
+        elif event in ("os.system", "os.posix_spawn", "os.spawn", "os.exec",
+                       "os.startfile"):
+            _emit({"kind": "spawn", "event": event, "argv": list(args)[:3]})
+
     def hook(event: str, args: tuple) -> None:
+        if trace_fd >= 0:
+            _observe(event, args)
         if not allow_net and event.startswith("socket."):
             raise PermissionError(f"undeclared capability: net ({event})")
         if allow_net and event.startswith("socket."):

@@ -1601,6 +1601,8 @@ async def _get_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
         # parent actually needs when reading this back.
         result["service_provider"] = dict(defn.service_provider)
         result["inference_payer"] = "self" if defn.identity else "unregistered"
+    # Harness distro (Decision 2026-10-12). "" = the reference distro.
+    result["loadout"] = getattr(defn, "loadout", "") or ""
     if defn.is_cognitive:
         result["agent_type"] = defn.agent_type
         result["max_turns"] = defn.max_turns
@@ -1768,6 +1770,28 @@ async def _update_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
         # substrate the agent thinks on and whose wallet pays, so the cached
         # provider instance must be evicted (see the eviction block below).
         provider_or_model_changed = True
+    if "loadout" in input:
+        # Harness distro binding (docs/tool_substrate.md, Decision
+        # 2026-10-12). An OWNER ACTION: the loadout decides which prompts and
+        # loop policy an agent runs and which pinned providers may replace its
+        # core shell/file tools, i.e. code that sees every command and file
+        # the agent touches. No agent may set it, on itself or on a child.
+        caller_id = input.get("_caller_id")
+        if caller_id is not None and not is_owner_caller(caller_id):
+            return {"error": "loadout is owner-set only: binding a harness "
+                             "distro is an owner action, not an agent tool."}
+        raw_loadout = str(input.get("loadout") or "").strip().lower()
+        if raw_loadout:
+            store = getattr(runtime, "tool_store", None)
+            distros = {d["digest"] for d in (store.list_distros()
+                                             if store is not None else [])}
+            if raw_loadout not in distros:
+                return {"error": f"loadout {raw_loadout[:16]} is not a "
+                                 "distro manifest available on this daemon"}
+            if raw_loadout == getattr(store, "active_loadout", ""):
+                raw_loadout = ""  # the reference distro is the default
+        defn.loadout = raw_loadout
+        changed.append("loadout")
     if "notify_parent" in input:
         defn.notify_parent = input["notify_parent"]
         changed.append("notify_parent")

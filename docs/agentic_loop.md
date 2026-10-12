@@ -418,6 +418,46 @@ run; falling back under 70% (after a reduction) re-arms them.
   jitter, separate from the 2/8/30s 429/5xx schedule. `Retry-After` is
   honored up to 300s.
 
+## §25 Loop policy comes from the agent's distro (2026-10-12)
+
+Every policy in this document that is a CHOICE rather than a safety
+property is now a field of `HarnessPolicy` (`atn/harness_policy.py`),
+carried in the harness distro's config blob (docs/tool_substrate.md,
+Decision 2026-10-12). The loop reads it per run:
+
+- **Prompts:** common base, per-category tool notes, type guidance,
+  small-context note (`delegate_prompts.build_system_prompt(...,
+  policy=)` / `build_identity_header(..., policy=)`).
+- **Closing turns:** verify on/off, verify prompt, code-file suffixes;
+  review on/off, review prompt; bridge follow-up turn caps (8 / 4).
+- **Compaction (§2, §20):** inline instruction, prune protect/min
+  savings, retained turns + user chars, max compactions, min reduction,
+  summary max tokens, overflow retries + drop fraction, hard-reset cap,
+  reset digest cap.
+- **Guards (§4, §24):** repeat limit, oscillation window, per-turn input
+  ceiling, loop warning text, truncated-tool-call prompt.
+- **Headroom (§23):** levels and note template. **Parallel (§21):**
+  safe tool list and concurrency cap. **Tool bundles:** an optional
+  list that NARROWS the agent's granted categories (never widens).
+
+Resolution: agent definition knobs (`per_turn_input_max`,
+`repeat_call_limit`) > the agent's bound distro (`AgentDefinition.
+loadout`, owner-set) > the reference policy. The reference policy is
+built from the module constants, so an agent with no loadout runs a
+byte-identical loop (`tests/atn/test_swappable_harness.py`). A distro
+policy is an overlay: missing keys inherit, unknown keys are ignored,
+bad values (wrong type, template missing its placeholders) keep the
+reference value, numbers are clamped. In-process runs pass the policy
+object; worker runs carry it as a dict in the run manifest (only when
+it differs from the reference).
+
+NOT policy (kernel, never distro-settable): the budget gate and usage
+recorder, tool dispatch + containment, the constitutional preamble, the
+governance heartbeat, history storage, `_repair_history`, `update_plan`
+validation. Policy-as-code hooks (`capabilities.provides:
+["policy:compaction"]`, etc.) are declarable but not dispatched yet;
+see `POLICY_HOOKS` in `atn/harness_policy.py` for the intended contract.
+
 ## Not ported: AGENTS.md
 
 Codex loads AGENTS.md from repo root down to the working directory.
@@ -436,6 +476,7 @@ from spec), `tests/atn/test_ollama_translation.py` (§9 round-trip,
 num_ctx presence), `tests/atn/test_provider_routing.py` (§10 fail-loud
 + eviction), `tests/atn/test_input_arbiter.py` (§12 ghost recovery).
 Codex-port items §17-§24: `tests/atn/test_loop_codex_port.py`.
+§25 (distro policy, loadouts, core swaps): `tests/atn/test_swappable_harness.py`.
 Run alongside existing `test_provider_base.py`,
 `test_long_horizon_safeguards.py`, `test_budget_inner_loop.py`.
 

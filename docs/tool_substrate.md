@@ -444,6 +444,63 @@ money-only leaf, Substrate gains the earnings counter, and the DAO gains
 the claim rail. Fresh Substrate + daemons on the new build before the
 next close, same drill as v4.1.
 
+## Decision (2026-10-12): anchor authority + on-chain conservation
+
+User-approved breaking change, BUILT 2026-10-12. Closes a critical hole:
+`submitAnchor` had no caller check and `recordTrainingForEpoch` only
+checked the proof against whatever root was anchored, so anyone could
+anchor a fake epoch paying themselves, mint unbounded ATN, claim REP 1:1
+DAO-side and take over the DAO (or anchor first and fork honest daemons
+out). Two layers, both enforced by Substrate.sol:
+
+1. **On-chain conservation.** `payForService` adds its burned fee share to
+   `burnedSinceAnchor`. Each `submitAnchor` closes that window into the
+   anchor's `windowBurned` and sets its `mintPool` to the PREVIOUS anchor's
+   `windowBurned` (lag-1, exactly the window the close already priced
+   from). `recordTrainingForEpoch` reverts `EpochPoolExceeded` once an
+   epoch's cumulative mint would pass `mintPool`. The first anchor's pool
+   is 0. Daemon side: `voice_state` now reads the pool from the snapshot
+   anchor's `windowBurned` (not a log sum), and the close floors every
+   share to integer base units (`floor_mint_to_pool`) so the leaves sum
+   to <= the on-chain pool exactly; `scale_mint` rounds instead of
+   truncating so a floored k/1e6 scales back to k. Dust stays unminted.
+2. **Anchor authority.** `submitAnchor(..., bytes[] signatures)` needs
+   EIP-712 `AnchorApproval(string epochId,bytes32 epochRoot,bytes32
+   prevEpochRoot,bytes32 prevAnchorHash,string agentMintCid,bytes32
+   payloadHash,bytes32 agentMintRoot)` signatures (domain
+   AutonetSubstrate/1, chainId, Substrate address), recovered signers
+   strictly ascending, max 64, from registered active agents whose summed
+   `RepToken.getPastVotes(agent, t)` STRICTLY EXCEEDS `anchorQuorumBps` of
+   `RepToken.getPastTotalSupply(t)`, t = previous anchor's timestamp
+   (deploy timestamp for the first anchor). The relayer (msg.sender) has
+   no authority. Delegated votes, not balances: REP mints to the agent
+   address (AutonetRepClaim), but a holder who delegates elsewhere (or a
+   default delegate) moves that voice; any EOA REP holder, including the
+   genesis REP wallet, must delegate to a registered agent for its weight
+   to sign anchors. Undelegated REP still counts in the denominator.
+3. **Genesis bootstrap.** While REP past total supply is 0 (or no
+   RepToken is wired), weight is a COUNT of distinct, registered members
+   of an immutable deployer-chosen genesis signer set, which must reach
+   `genesisQuorum`. Rejected alternative: a quorum over registered agents
+   (registration is permissionless, so sybilable). Tradeoff: the genesis
+   set is trusted until the first REP exists, then powerless forever.
+   `repToken = 0` means genesis-only forever: local dev only.
+
+Constructor: `(treasury, vaultMinter, governor, repToken,
+anchorQuorumBps, genesisSigners[], genesisQuorum)`. **USER CALL OPEN:**
+`anchorQuorumBps` (proposed 5000 = strict majority of past REP supply;
+liveness risk if much REP sits undelegated, safety risk if set low) and
+the genesis set/quorum. Daemon: every daemon prepares the identical
+anchor, each local agent signs the digest, signatures gossip on
+`<event topic>/anchor-sig/1`, the rotating winner waits (default 60 s)
+until `Substrate.anchorQuorum` reports reached, then relays; a daemon
+whose own agents carry quorum submits at once. A daemon never signs a
+close whose voice/pool snapshot was read at a different `anchorCount`.
+
+**FLAG-DAY:** ABI change (constructor, `submitAnchor`, Anchor struct gains
+`windowBurned/mintPool/minted`) + mint scaling change. Fresh Substrate and
+all daemons on this build before the next close.
+
 ## Decision (2026-07-24): claimable authorship, never unclaimable rewards
 
 Ratified in discussion 2026-07-24; BUILT same day (`tool_store.py`).
@@ -797,6 +854,10 @@ session's question, deliberately deferred.
 
 ### Decision (2026-07-29): the shell bundle is runnable; the swap is gated off
 
+**[Deciding factor and the three preconditions SUPERSEDED by Decision
+(2026-10-12) below: swaps are live behind core-replacement approval, a
+ToolBond bond and a per-agent loadout. The containment analysis stands.]**
+
 The section above says "customization = forking a distro (swap a dep)".
 That was true of the ECONOMICS and false of the EXECUTION, and the gap
 went unnoticed because the two halves were built at different times.
@@ -867,6 +928,74 @@ zero-cost fall-through rather than raising or wrapping.
 (`daemon` | `external` | `provider`), `swappable`, and `swap_enabled`.
 Sixteen daemon-coupled, one external (shell), one provider-native
 (sdk_builtin). The UI must not present these as the same kind of thing.
+
+### Decision (2026-10-12): swappable harness parts; code swaps allowed behind approval + bond
+
+**Supersedes the 07-29 deciding factor** ("core logic upgrades only via
+daemon release"). The goal (user-approved): every part of the harness is
+swappable through the tool library and the market (reviews, ratings)
+selects the best; the daemon keeps only a minimal safety kernel (budget
+gate, tool dispatch, sandbox, governance heartbeat, history storage). The
+07-29 containment analysis is NOT retracted: a substituted `bash` /
+`read_file` still sees every command and file body, and the audit hook
+still cannot contain a net+fs+spawn tool. What changed is who carries
+that risk: an explicit owner act, an on-chain stake, and signed evidence.
+
+1. **Loop policy is a distro part.** `atn/harness_policy.py`
+   (`HarnessPolicy`): system prompt templates, compaction instruction +
+   reduction ladder, verify/review closing turns, loop-guard limits,
+   headroom thresholds, parallel-safe list, tool bundle selection
+   (narrow only). The distro manifest's code blob is now JSON
+   (`kind: atn_harness_distro`, `modules`, `policy`); the reference
+   distro carries the reference values, built from the live constants,
+   so the default is byte-identical. Forking = copy the blob, edit the
+   policy, register with the same (or swapped) dependencies. Overlay
+   semantics, validation and the kernel boundary: docs/agentic_loop.md
+   §25.
+2. **Per-agent loadout binding.** `AgentDefinition.loadout` (distro
+   digest, "" = reference) is set by the OWNER only (`update_agent
+   {loadout}` from the owner surface; any agent caller is refused; the
+   atn_web agent settings show a distro picker fed by the owner-only WS
+   `list_distros`). `active_loadout` is now just the daemon's reference
+   distro; attestations carry `ToolStore.loadout_for(caller)`, the
+   agent's actual loadout.
+3. **Code swaps are allowed** (`runtime/shell_provider.py`,
+   `SHELL_SWAP_ENABLED = True`, kill switch `ATN_CORE_SWAP_DISABLED=1`).
+   A pinned tool whose `capabilities.provides` claims core built-in
+   names replaces them for an agent only when ALL hold:
+   (a) **core-replacement approval:** it was adopted with an explicit
+   owner acknowledgment; `approve_adoption` rejects such a tool unless
+   the approval carries `core_replacement_ack` (WS field, CLI
+   `approve <digest> --core-replacement`), and the UI shows a second
+   warning modal; proposals carry `core_replacement: [names]`. Locally
+   authored records cannot replace core tools.
+   (b) **bond:** `ToolBond.isBonded(manifestDigest)` is true
+   (`runtime/tool_bond.py`, address from registry key `tool_bond` or
+   `ATN_TOOL_BOND_ADDRESS`, 60s/15s cache). No address or any RPC fault
+   = refused (fail closed); `ATN_TOOL_BOND_DEV_OVERRIDE=1` is the local
+   testing escape hatch only.
+   (c) **per-agent binding:** the provider is a dependency of the
+   agent's owner-bound loadout (the reference distro never swaps).
+   Providers must be sealed (no dependencies). A refused gate falls back
+   to the built-in, never to an error. In worker isolation, swapped names
+   route to the daemon (`framework_tool` RPC) so gates and evidence stay
+   daemon-side. Bridge (SDK-native) tools are not swappable.
+4. **Policy as code**: deferred. The hook names (`policy:compaction`,
+   `policy:system_prompt`, `policy:review_step`) are declarable in
+   `capabilities.provides` and kept by registration, but nothing
+   dispatches them yet (`POLICY_HOOKS` documents the intended contract).
+5. **Evidence for disputes.** Every swapped call records a trace: tool
+   digest, input, output (64k cap), timestamps, and what the guard
+   observed in the provider process (file opens outside the interpreter
+   tree, socket destinations, spawn argv; 5000-line cap). It is signed by
+   the agent key (EIP-191 over canonical JSON; unsigned when the agent
+   has no key), stored as a blob, logged, stamped on the record
+   (`last_evidence_digest`) and indexed (`evidence_index.jsonl`, WS
+   `core_replacement_evidence`). That digest is the `evidenceCid` for
+   `ToolBond.accuse`. NOT captured: what spawned children do beyond
+   their argv, native-code bypasses of the audit hook, kernel-level
+   activity. The trace proves what the provider was given and what it
+   did in Python, which is the claim/behavior surface a CON needs.
 
 ## Vetting: the candidate pool (ratified 2026-07-05; BUILT same day)
 

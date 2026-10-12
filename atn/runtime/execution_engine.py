@@ -398,6 +398,20 @@ class ExecutionEngine:
             "per_turn_input_max": defn.per_turn_input_max,
             "repeat_call_limit": defn.repeat_call_limit,
         }
+        # Distro policy + core swaps (Decision 2026-10-12). Only carried when
+        # non-reference, so a reference agent's manifest is unchanged.
+        try:
+            from ..harness_policy import policy_for_agent
+            _pol = policy_for_agent(getattr(self, "_runtime_ref", None), defn)
+            if not _pol.is_reference():
+                manifest["harness_policy"] = _pol.to_dict()
+            from .shell_provider import resolve_shell_provider
+            _swaps = resolve_shell_provider(
+                getattr(self, "_runtime_ref", None), agent_id)
+            if _swaps:
+                manifest["core_swap_names"] = sorted(_swaps)
+        except Exception:
+            log.debug("worker manifest: harness policy skipped", exc_info=True)
 
         # The finalize-done event this driver parks on. Set by
         # _finalize_execution at the very end (clean OR on-behalf path).
@@ -605,14 +619,13 @@ class ExecutionEngine:
         # concrete routing below still decides the exact authority target
         # (surface vs connector vs framework tool).
         if name in _SHELL_TOOL_EXECUTORS:
-            # Shell-bundle swap (docs/tool_substrate.md). CURRENTLY A NO-OP:
-            # dispatch_shell hard-returns None while SHELL_SWAP_ENABLED is
-            # False, so this is one function call and a None check before the
-            # unchanged in-process await. Wired here — the single convergence
-            # point both the daemon and (via the framework_tool RPC) the worker
-            # pass through — so that if the swap is ever enabled there is
-            # exactly ONE place it takes effect. Read shell_provider.py's
-            # docstring before flipping that flag.
+            # Core built-in swap (docs/tool_substrate.md, Decision
+            # 2026-10-12). dispatch_shell returns None (fall through to the
+            # built-in) unless the agent's owner-bound loadout names an
+            # adopted, core-replacement-approved, ToolBond-bonded provider
+            # for this name. No loadout bound => one lookup and a None check.
+            # This is the single convergence point both the daemon and (via
+            # the framework_tool RPC) the worker pass through.
             from .shell_provider import dispatch_shell
             override = await dispatch_shell(
                 getattr(self, "_runtime_ref", None), agent_id, name, tool_input)
@@ -901,6 +914,12 @@ class ExecutionEngine:
     ) -> None:
         from ..delegate_prompts import build_delegate_prompt
         from ..agent_tools import resolve_tool_surface
+        from ..harness_policy import policy_for_agent
+
+        # The agent's distro loop policy (Decision 2026-10-12): its bound
+        # loadout's config, else the reference (byte-identical default).
+        _policy = policy_for_agent(getattr(self, "_runtime_ref", None), defn)
+        _agent_tool_cats = _policy.select_tools(defn.tools or [])
 
         sub_provider = None
         owns_provider = True
@@ -966,7 +985,8 @@ class ExecutionEngine:
             else:
                 system_prompt = build_delegate_prompt(
                     defn.agent_type, defn.id, defn.parent_id,
-                    tool_categories=defn.tools,
+                    tool_categories=_agent_tool_cats,
+                    policy=_policy,
                 )
                 _inject_identity = True
 
@@ -984,14 +1004,14 @@ class ExecutionEngine:
                     system_prompt = preamble + system_prompt
 
             # --- Tool surface ---
-            agent_tools = resolve_tool_surface(defn.tools or [])
+            agent_tools = resolve_tool_surface(_agent_tool_cats)
 
             # Whether this agent should also get the SDK's native built-in
             # tools (Bash/Read/Write/Edit/Glob/Grep/WebSearch/...). These are
             # heavy in first-turn context, so they're OFF unless the agent's
             # definition explicitly asks via "sdk_builtin". A lean agent (no
             # sdk_builtin) runs with just the ATN MCP tools, much smaller prefix.
-            native_tools = "sdk_builtin" in (defn.tools or [])
+            native_tools = "sdk_builtin" in _agent_tool_cats
 
             # §9 lean tool surface: non-bridge providers no longer get the full
             # _SHELL_TOOLS schema block unconditionally (it bloated every lean
@@ -999,7 +1019,7 @@ class ExecutionEngine:
             # category — an agent opts in via tools=["shell", ...]. Back-compat:
             # the bridge-native flags "atn_full"/"sdk_builtin" still imply shell
             # access so pre-existing agents are unaffected.
-            _tool_spec = defn.tools or []
+            _tool_spec = _agent_tool_cats
             _wants_shell = (
                 "shell" in _tool_spec
                 or "atn_full" in _tool_spec
@@ -1121,6 +1141,7 @@ class ExecutionEngine:
                     parent_id=defn.parent_id,
                     context_window=get_context_window(
                         defn.cognitive_model or ""),
+                    policy=_policy,
                 )
 
             # --- Session resume / history (unified for all agents) ---
@@ -1323,6 +1344,8 @@ class ExecutionEngine:
                 send_kwargs["per_turn_input_max"] = defn.per_turn_input_max
             if defn.repeat_call_limit is not None:
                 send_kwargs["repeat_call_limit"] = defn.repeat_call_limit
+            if not _policy.is_reference():
+                send_kwargs["harness_policy"] = _policy
 
             response = await sub_provider.run_agent_loop(**send_kwargs)
 
@@ -1336,7 +1359,7 @@ class ExecutionEngine:
             # bookkeeping, never the answer.
             from ..delegate_prompts import (
                 format_review_prompt,
-                VERIFY_STEP_PROMPT,
+                format_verify_prompt,
                 needs_review_reinvoke,
                 needs_verify_reinvoke,
                 review_owed_tools,
@@ -1348,7 +1371,7 @@ class ExecutionEngine:
             # follow-up agent loop resets the provider's tracking.
             _modified_code = set(getattr(
                 sub_provider, "last_modified_code_files", None) or ())
-            if _review_session and needs_verify_reinvoke(
+            if _review_session and _policy.verify_enabled and needs_verify_reinvoke(
                     sub_provider, _modified_code,
                     response.stop_reason) and not cancel.is_set():
                 log.info("Verify step: follow-up verification turn for "
@@ -1358,9 +1381,8 @@ class ExecutionEngine:
                     verify_kwargs = dict(send_kwargs)
                     verify_kwargs.pop("history", None)  # session carries it
                     verify_kwargs.update(
-                        message=VERIFY_STEP_PROMPT.format(
-                            files=", ".join(sorted(_modified_code)[:20])),
-                        max_turns=8,
+                        message=format_verify_prompt(_modified_code, _policy),
+                        max_turns=_policy.verify_follow_up_max_turns,
                         session_id=_review_session,
                     )
                     await sub_provider.run_agent_loop(**verify_kwargs)
@@ -1368,7 +1390,7 @@ class ExecutionEngine:
                     log.warning(
                         "verify follow-up turn failed for %s; continuing",
                         defn.id, exc_info=True)
-            if _review_session and needs_review_reinvoke(
+            if _review_session and _policy.review_enabled and needs_review_reinvoke(
                     sub_provider, _accumulated_tool_calls,
                     response.stop_reason) and not cancel.is_set():
                 log.info("Review step: follow-up attest turn for agent %s",
@@ -1378,8 +1400,8 @@ class ExecutionEngine:
                     review_kwargs.pop("history", None)  # session carries it
                     review_kwargs.update(
                         message=format_review_prompt(
-                            review_owed_tools(_accumulated_tool_calls)),
-                        max_turns=4,
+                            review_owed_tools(_accumulated_tool_calls), _policy),
+                        max_turns=_policy.review_follow_up_max_turns,
                         session_id=_review_session,
                     )
                     await sub_provider.run_agent_loop(**review_kwargs)

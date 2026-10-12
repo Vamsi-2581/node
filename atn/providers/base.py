@@ -205,6 +205,31 @@ def format_plan(plan: list[dict[str, str]] | None, explanation: str = "") -> str
     return "\n".join(lines)
 
 
+# §4 loop guard warning turn (one per run, before an abort).
+LOOP_WARNING_PROMPT = (
+    "You appear to be looping — repeating the same tool "
+    "call(s) without progress. Change your approach or "
+    "conclude with a final answer. Do not repeat the last "
+    "call as-is."
+)
+
+# Loop-guard defaults when neither the agent definition nor its distro
+# policy sets them (atn/harness_policy.py reads these for the reference).
+_DEFAULT_PER_TURN_INPUT_MAX = 200_000
+# §4: exact-repeat threshold drops 5 → 3 (opencode DOOM_LOOP_THRESHOLD).
+_DEFAULT_REPEAT_CALL_LIMIT = 3
+
+
+def _policy_of(obj: Any = None) -> Any:
+    """The HarnessPolicy in force for ``obj`` (a provider mid-run), else the
+    reference policy (docs/tool_substrate.md, Decision 2026-10-12)."""
+    pol = getattr(obj, "_run_policy", None) if obj is not None else None
+    if pol is not None:
+        return pol
+    from ..harness_policy import reference_policy
+    return reference_policy()
+
+
 # §24: sent when a reply hit the output token cap in the middle of a tool call.
 TRUNCATED_TOOL_CALL_PROMPT = (
     "Your last reply reached the output token limit before its tool call was "
@@ -350,6 +375,9 @@ class Provider(ABC):
     # Per-run plan (§22), set by the update_plan tool. Reset each run.
     _run_plan: list = []
     _run_plan_explanation: str = ""
+    # Distro loop policy for the current run (atn/harness_policy.py). None =
+    # reference. Set at the top of run_agent_loop.
+    _run_policy: Any = None
 
     @property
     def session_stats(self) -> dict[str, Any]:
@@ -525,6 +553,7 @@ class Provider(ABC):
         usage_recorder: Any = None,
         history: list[dict[str, Any]] | None = None,
         review_tools: bool = True,
+        harness_policy: Any = None,
         **_unused: Any,
     ) -> ProviderResponse:
         """Multi-turn agent-loop run with tool relay.
@@ -551,7 +580,14 @@ class Provider(ABC):
             tool_executor:  async (name, input) -> result dict.
             on_chunk:       Optional async callback for streaming text deltas.
             session_id:     Session ID to resume (ignored by generic impl).
+            harness_policy: The agent's distro loop policy (HarnessPolicy or
+                            its dict overlay). None = the reference policy,
+                            byte-identical to the pre-policy loop.
         """
+        from ..harness_policy import as_policy
+        pol = as_policy(harness_policy)
+        # Read by _reduce_context / _compact_messages / helpers via _policy_of.
+        self._run_policy = pol
         self._interrupted = False
         # Open the steering queue for the duration of this run (§5). Any
         # send_user_message() call now enqueues instead of returning False.
@@ -588,7 +624,7 @@ class Provider(ABC):
         # loop's prompt-cache prefix.
         self._run_tool_defs = tool_defs
         # §21: tools that may run concurrently within one turn.
-        parallel_names = parallel_safe_tool_names(tools or [])
+        parallel_names = parallel_safe_tool_names(tools or [], policy=pol)
 
         # Prior conversation as real messages (NOT baked into the system
         # prompt). Keeping the system prompt byte-stable across executions
@@ -603,9 +639,11 @@ class Provider(ABC):
         # Estimate input tokens for the next turn as chars/4 across all messages
         # — rough but sufficient for runaway prevention. Refuse when the
         # estimate exceeds per_turn_input_max.
-        effective_per_turn_max = per_turn_input_max if per_turn_input_max is not None else 200_000
-        # §4: exact-repeat threshold drops 5 → 3 (opencode DOOM_LOOP_THRESHOLD).
-        effective_repeat_limit = repeat_call_limit if repeat_call_limit is not None else 3
+        # Precedence: agent definition > distro policy > reference.
+        effective_per_turn_max = (per_turn_input_max if per_turn_input_max is not None
+                                  else pol.per_turn_input_max)
+        effective_repeat_limit = (repeat_call_limit if repeat_call_limit is not None
+                                  else pol.repeat_call_limit)
         recent_call_signatures: list[str] = []  # last N tool-call fingerprints
         # §4 oscillation guard: fingerprints of the last few tool calls, plus a
         # one-shot "already warned" flag so the model gets one chance to self-
@@ -922,7 +960,7 @@ class Provider(ABC):
                         messages.append(
                             {"role": "assistant", "content": response.text})
                     messages.append({"role": "user",
-                                     "content": TRUNCATED_TOOL_CALL_PROMPT})
+                                     "content": pol.truncated_tool_call_prompt})
                     continue
             elif response.tool_calls and response.stop_reason == "tool_use":
                 truncated_retry_used = False
@@ -944,6 +982,7 @@ class Provider(ABC):
                 # run modified code files. Same one-shot injection pattern as
                 # the review step below; spends a turn of the same budget.
                 if (modified_code_files and not verify_injected
+                        and pol.verify_enabled
                         and tool_executor is not None):
                     verify_injected = True
                     log.info(
@@ -954,17 +993,16 @@ class Provider(ABC):
                     if response.text:
                         messages.append(
                             {"role": "assistant", "content": response.text})
-                    from ..delegate_prompts import VERIFY_STEP_PROMPT
                     messages.append({
                         "role": "user",
-                        "content": VERIFY_STEP_PROMPT.format(
+                        "content": pol.verify_step_prompt.format(
                             files=", ".join(sorted(modified_code_files)[:20])),
                     })
                     continue
                 from ..delegate_prompts import review_owed_tools
                 _owed = (
                     review_owed_tools(called_tool_calls)
-                    if (review_tools and not review_injected
+                    if (review_tools and pol.review_enabled and not review_injected
                         and tool_executor is not None
                         and "attest_tools" not in called_tool_names)
                     else []
@@ -984,7 +1022,7 @@ class Provider(ABC):
                     from ..delegate_prompts import format_review_prompt
                     messages.append(
                         {"role": "user",
-                         "content": format_review_prompt(_owed)})
+                         "content": format_review_prompt(_owed, policy=pol)})
                     continue
                 return Provider._finalize_agent_loop(self,
                     response, messages, cumulative_usage,
@@ -1005,7 +1043,7 @@ class Provider(ABC):
                 called_tool_calls.append((tc.name, tc.input or {}))
                 if tc.name in ("write_file", "edit_file"):
                     _p = str((tc.input or {}).get("path", ""))
-                    if _p.endswith(_CODE_FILE_SUFFIXES):
+                    if _p.endswith(pol.code_file_suffixes):
                         modified_code_files.add(_p)
                 assistant_content.append({
                     "type": "tool_use",
@@ -1029,14 +1067,15 @@ class Provider(ABC):
                 # Trim each window to what it needs.
                 if len(recent_call_signatures) > effective_repeat_limit:
                     recent_call_signatures = recent_call_signatures[-effective_repeat_limit:]
-                if len(osc_fingerprints) > _OSCILLATION_WINDOW:
-                    osc_fingerprints = osc_fingerprints[-_OSCILLATION_WINDOW:]
+                if len(osc_fingerprints) > pol.oscillation_window:
+                    osc_fingerprints = osc_fingerprints[-pol.oscillation_window:]
 
                 exact_repeat = (
                     len(recent_call_signatures) >= effective_repeat_limit
                     and len(set(recent_call_signatures)) == 1
                 )
-                oscillating = _is_oscillating(osc_fingerprints)
+                oscillating = _is_oscillating(osc_fingerprints,
+                                              window=pol.oscillation_window)
 
                 if exact_repeat or oscillating:
                     kind = "repeat" if exact_repeat else "oscillation"
@@ -1062,12 +1101,8 @@ class Provider(ABC):
                             for tc in response.tool_calls
                         ]
                         messages.append({"role": "user", "content": _tr})
-                        messages.append({"role": "user", "content": (
-                            "You appear to be looping — repeating the same tool "
-                            "call(s) without progress. Change your approach or "
-                            "conclude with a final answer. Do not repeat the last "
-                            "call as-is."
-                        )})
+                        messages.append({"role": "user",
+                                         "content": pol.loop_warning_prompt})
                         # Reset the windows so a genuinely-corrected next turn
                         # isn't instantly re-flagged by stale fingerprints.
                         recent_call_signatures.clear()
@@ -1217,6 +1252,7 @@ class Provider(ABC):
             # finished (read/write-lock semantics). Results keep call order.
             tool_result_content = await _execute_tool_batches(
                 response.tool_calls, _run_one, parallel_names,
+                max_parallel=pol.max_parallel_tool_calls,
             )
             messages.append({"role": "user", "content": tool_result_content})
 
@@ -1231,11 +1267,13 @@ class Provider(ABC):
             )
             if _trigger > 0 and tool_result_content:
                 _est = _next_input_estimate(system, messages, usage_anchor)
-                _level = _headroom_level(_est, _trigger)
+                _level = _headroom_level(_est, _trigger,
+                                         levels=pol.headroom_levels)
                 if _level > headroom_noted:
                     last = tool_result_content[-1]
                     if isinstance(last.get("content"), str):
-                        last["content"] += _headroom_note(_est, _trigger)
+                        last["content"] += _headroom_note(
+                            _est, _trigger, template=pol.headroom_note_template)
                     headroom_noted = _level
                 elif _level == 0:
                     headroom_noted = 0
@@ -1469,11 +1507,12 @@ class Provider(ABC):
             if gap > 0:
                 budget_chars = max(0, budget_chars - gap)
 
+        pol = _policy_of(self)
         # Tier 1 — prune old tool_result bodies (no LLM call).
         est_before = _estimate_chars(system, messages)
         if force or est_before > budget_chars:
-            saved = _prune_tool_results(messages)
-            if saved >= _PRUNE_MIN_SAVINGS:
+            saved = _prune_tool_results(messages, policy=pol)
+            if saved >= pol.prune_min_savings:
                 log.info(
                     "Context prune freed ~%d chars for agent %s",
                     saved, self.source_agent_id or "?",
@@ -1484,7 +1523,7 @@ class Provider(ABC):
         if not force and est_after_prune <= budget_chars:
             return
 
-        if self._compactions_this_run >= _MAX_COMPACTIONS_PER_RUN:
+        if self._compactions_this_run >= pol.max_compactions_per_run:
             log.warning(
                 "Compaction spiral guard: %d compactions already this run for "
                 "agent %s — refusing further compaction",
@@ -1510,7 +1549,7 @@ class Provider(ABC):
         # Spiral guard: a compaction that barely moves the needle means the
         # summarizer isn't helping — abort rather than loop.
         reduction = 1.0 - (est_after_compact / est_before) if est_before > 0 else 0.0
-        if reduction < _COMPACTION_MIN_REDUCTION:
+        if reduction < pol.compaction_min_reduction:
             # Last resort before giving up: the usual reason compaction can't
             # help on a small window is an oversized tool_result inside the
             # retained tail (which prune protects and compact keeps verbatim).
@@ -1522,7 +1561,7 @@ class Provider(ABC):
             log.warning(
                 "Compaction reduced estimate by only %.1f%% (<%.0f%%) for agent "
                 "%s", reduction * 100,
-                _COMPACTION_MIN_REDUCTION * 100, self.source_agent_id or "?",
+                pol.compaction_min_reduction * 100, self.source_agent_id or "?",
             )
             if self._try_hard_reset(messages, original_request):
                 return
@@ -1547,12 +1586,14 @@ class Provider(ABC):
         state intact, without repeating exploration. Capped per run; returns
         False when the cap is spent (caller aborts as before).
         """
-        if self._hard_resets_this_run >= _MAX_HARD_RESETS_PER_RUN:
+        pol = _policy_of(self)
+        if self._hard_resets_this_run >= pol.max_hard_resets_per_run:
             return False
         self._hard_resets_this_run += 1
         # The fresh stack may legitimately need compaction again much later.
         self._compactions_this_run = 0
-        digest = _context_reset_digest(messages)
+        digest = _context_reset_digest(
+            messages, cap_chars=pol.reset_digest_cap_chars)
         original = original_request
         if not original and messages:
             first = messages[0].get("content")
@@ -1571,7 +1612,7 @@ class Provider(ABC):
         messages[:] = [{"role": "user", "content": f"{original}\n\n{notice}"}]
         log.warning(
             "Hard context reset %d/%d for agent %s (stack rebuilt, ~%d chars)",
-            self._hard_resets_this_run, _MAX_HARD_RESETS_PER_RUN,
+            self._hard_resets_this_run, pol.max_hard_resets_per_run,
             self.source_agent_id or "?", _estimate_chars("", messages),
         )
         return True
@@ -1624,7 +1665,7 @@ class Provider(ABC):
         if not original_request:
             original_request = messages[0]["content"] if messages else ""
 
-        retained_tail = _compaction_retained_tail(messages)
+        retained_tail = _compaction_retained_tail(messages, policy=_policy_of(self))
         to_summarize = messages[: len(messages) - len(retained_tail)]
 
         # Nothing to fold — the retained tail already IS the whole thing.
@@ -1720,6 +1761,7 @@ class Provider(ABC):
         failure; the caller falls back to hard truncation.
         """
         tools = getattr(self, "_run_tool_defs", None) or None
+        pol = _policy_of(self)
         instruction = {"role": "user",
                        "content": _compaction_instruction(self)}
         history = list(messages)
@@ -1732,14 +1774,15 @@ class Provider(ABC):
                     messages=history + [instruction],
                     system=system,
                     model=model,
-                    max_tokens=_COMPACT_SUMMARY_MAX_TOKENS,
+                    max_tokens=pol.compact_summary_max_tokens,
                     tools=tools,
                 )
             except Exception as exc:
                 if (classify_provider_error(exc) == "overflow"
-                        and attempts <= _COMPACT_OVERFLOW_RETRIES):
+                        and attempts <= pol.compact_overflow_retries):
                     before = len(history)
-                    history = _drop_oldest_history(history)
+                    history = _drop_oldest_history(
+                        history, fraction=pol.compact_drop_fraction)
                     dropped += before - len(history)
                     if not history:
                         raise
@@ -1753,7 +1796,7 @@ class Provider(ABC):
             text = (resp.text or "").strip()
             if text:
                 return text
-            if tools and attempts <= _COMPACT_OVERFLOW_RETRIES:
+            if tools and attempts <= pol.compact_overflow_retries:
                 # The model reached for a tool instead of summarizing.
                 tools = None
                 continue
@@ -1835,10 +1878,13 @@ PARALLEL_SAFE_TOOLS: frozenset[str] = frozenset({
 _MAX_PARALLEL_TOOL_CALLS = 8
 
 
-def parallel_safe_tool_names(tools: list[dict[str, Any]]) -> frozenset[str]:
-    """The run's parallel-safe tool names: the allowlist plus per-tool
-    ``parallel_safe: True`` flags, minus explicit ``parallel_safe: False``."""
-    names = set(PARALLEL_SAFE_TOOLS)
+def parallel_safe_tool_names(tools: list[dict[str, Any]],
+                             policy: Any = None) -> frozenset[str]:
+    """The run's parallel-safe tool names: the allowlist (the distro policy's,
+    else PARALLEL_SAFE_TOOLS) plus per-tool ``parallel_safe: True`` flags,
+    minus explicit ``parallel_safe: False``."""
+    names = set(policy.parallel_safe_tools if policy is not None
+                else PARALLEL_SAFE_TOOLS)
     for t in tools:
         if not isinstance(t, dict):
             continue
@@ -1855,6 +1901,7 @@ async def _execute_tool_batches(
     calls: list[ToolCall],
     run_one: Any,
     parallel_names: frozenset[str],
+    max_parallel: int = 0,
 ) -> list[dict[str, Any]]:
     """Run a turn's tool calls with read/write-lock semantics (§21).
 
@@ -1865,7 +1912,8 @@ async def _execute_tool_batches(
     original call order whatever the completion order.
     """
     results: list[dict[str, Any]] = []
-    sem = asyncio.Semaphore(_MAX_PARALLEL_TOOL_CALLS)
+    sem = asyncio.Semaphore(max_parallel if max_parallel > 0
+                            else _MAX_PARALLEL_TOOL_CALLS)
 
     async def _bounded(tc: ToolCall) -> dict[str, Any]:
         async with sem:
@@ -2022,14 +2070,15 @@ def _is_plain_user(msg: dict[str, Any]) -> bool:
     return True
 
 
-def _drop_oldest_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _drop_oldest_history(history: list[dict[str, Any]],
+                         fraction: float = 0.0) -> list[dict[str, Any]]:
     """Drop the oldest ~20% of ``history`` (at least one item) in valid units.
 
     A leading tool_result message whose tool_use was dropped goes too (it
     would be an orphan), and if the remainder then starts on an assistant
     turn a short user marker is put in front so roles still start on user.
     """
-    n = max(1, int(len(history) * _COMPACT_DROP_FRACTION))
+    n = max(1, int(len(history) * (fraction or _COMPACT_DROP_FRACTION)))
     if history and history[0].get("content") == _HISTORY_OMITTED_MARKER:
         n += 1  # never count our own marker as history
     rest = history[n:]
@@ -2044,8 +2093,10 @@ _HISTORY_OMITTED_MARKER = "[Earlier history omitted to fit the context window]"
 
 
 def _compaction_instruction(provider: Any) -> str:
-    """The final user message of an in-loop compaction request (§20)."""
-    return COMPACTION_INLINE_PROMPT
+    """The final user message of an in-loop compaction request (§20): the
+    distro policy's instruction, the reference COMPACTION_INLINE_PROMPT by
+    default."""
+    return _policy_of(provider).compaction_inline_prompt
 
 
 # Hard reset (tier 3): stack rebuilds per run, and the size cap on the
@@ -2054,7 +2105,8 @@ _MAX_HARD_RESETS_PER_RUN = 2
 _RESET_DIGEST_CAP_CHARS = 6_000
 
 
-def _context_reset_digest(messages: list[dict[str, Any]]) -> str:
+def _context_reset_digest(messages: list[dict[str, Any]],
+                          cap_chars: int = 0) -> str:
     """Non-LLM digest of a message stack for a tier-3 hard reset.
 
     One line per tool call (name + truncated input), newest kept when over
@@ -2085,8 +2137,9 @@ def _context_reset_digest(messages: list[dict[str, Any]]) -> str:
                     arg = "{}"
                 entries.append(f"- {block.get('name', '?')} {arg[:160]}")
     digest = "\n".join(entries)
-    if len(digest) > _RESET_DIGEST_CAP_CHARS:
-        digest = "…(older calls elided)…\n" + digest[-_RESET_DIGEST_CAP_CHARS:]
+    cap = cap_chars or _RESET_DIGEST_CAP_CHARS
+    if len(digest) > cap:
+        digest = "…(older calls elided)…\n" + digest[-cap:]
     if last_text:
         digest += "\n\nYour last note before the reset: " + last_text[:500]
     return digest or "(no tool calls recorded)"
@@ -2126,28 +2179,35 @@ def _next_input_estimate(
 _HEADROOM_LEVELS: tuple[float, ...] = (0.70, 0.80, 0.90)
 
 
-def _headroom_level(est_tokens: int, trigger_tokens: int) -> int:
+def _headroom_level(est_tokens: int, trigger_tokens: int,
+                    levels: "tuple[float, ...] | None" = None) -> int:
     """1-based index of the highest headroom level reached, 0 if none."""
     if trigger_tokens <= 0:
         return 0
     frac = est_tokens / trigger_tokens
     level = 0
-    for i, threshold in enumerate(_HEADROOM_LEVELS, 1):
+    for i, threshold in enumerate(
+            _HEADROOM_LEVELS if levels is None else levels, 1):
         if frac >= threshold:
             level = i
     return level
 
 
-def _headroom_note(est_tokens: int, trigger_tokens: int) -> str:
+HEADROOM_NOTE_TEMPLATE = (
+    "\n\n[Context: about {pct}% of the usable context is in use; roughly "
+    "{remaining} tokens remain before older history is summarized. Keep "
+    "tool output small and prefer finishing or delegating over broad "
+    "new exploration.]"
+)
+
+
+def _headroom_note(est_tokens: int, trigger_tokens: int,
+                   template: str = "") -> str:
     """Short context-headroom note appended to a tool result (§23)."""
     remaining = max(0, trigger_tokens - est_tokens)
     pct = min(100, round(100 * est_tokens / trigger_tokens)) if trigger_tokens else 0
-    return (
-        f"\n\n[Context: about {pct}% of the usable context is in use; roughly "
-        f"{remaining} tokens remain before older history is summarized. Keep "
-        f"tool output small and prefer finishing or delegating over broad "
-        f"new exploration.]"
-    )
+    return (template or HEADROOM_NOTE_TEMPLATE).format(
+        pct=pct, remaining=remaining)
 
 
 def _trim_tail_tool_results(messages: list[dict[str, Any]], budget_chars: int) -> bool:
@@ -2244,7 +2304,7 @@ def history_char_budget(model: str) -> int:
                            trigger * _CHARS_PER_TOKEN // 2))
 
 
-def _prune_tool_results(messages: list[dict[str, Any]]) -> int:
+def _prune_tool_results(messages: list[dict[str, Any]], policy: Any = None) -> int:
     """Replace old tool_result bodies with a stub, in place (§2 tier 1).
 
     Protects the most recent ``_PRUNE_PROTECT_RECENT_CHARS`` of tool output
@@ -2253,11 +2313,14 @@ def _prune_tool_results(messages: list[dict[str, Any]]) -> int:
     """
     # Index of the second-to-last assistant turn: results after it are recent
     # and must not be pruned.
+    retain_turns = (policy.compact_retain_turns if policy is not None
+                    else _COMPACT_RETAIN_TURNS)
     assistant_idxs = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
-    protect_from = assistant_idxs[-_COMPACT_RETAIN_TURNS] if len(assistant_idxs) >= _COMPACT_RETAIN_TURNS else 0
+    protect_from = assistant_idxs[-retain_turns] if len(assistant_idxs) >= retain_turns else 0
 
     saved = 0
-    recent_budget = _PRUNE_PROTECT_RECENT_CHARS
+    recent_budget = (policy.prune_protect_recent_chars if policy is not None
+                     else _PRUNE_PROTECT_RECENT_CHARS)
     # Walk newest→oldest so the char budget protects the freshest output.
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -2286,7 +2349,8 @@ def _prune_tool_results(messages: list[dict[str, Any]]) -> int:
     return saved
 
 
-def _compaction_retained_tail(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _compaction_retained_tail(messages: list[dict[str, Any]],
+                              policy: Any = None) -> list[dict[str, Any]]:
     """The suffix of ``messages`` that compaction must keep verbatim (§2).
 
     Keeps the last ``_COMPACT_RETAIN_TURNS`` messages, extended backward to
@@ -2297,7 +2361,11 @@ def _compaction_retained_tail(messages: list[dict[str, Any]]) -> list[dict[str, 
     if len(messages) <= 1:
         return []
     n = len(messages)
-    keep_from = max(1, n - _COMPACT_RETAIN_TURNS)
+    retain_turns = (policy.compact_retain_turns if policy is not None
+                    else _COMPACT_RETAIN_TURNS)
+    retain_chars = (policy.compact_retain_user_chars if policy is not None
+                    else _COMPACT_RETAIN_USER_CHARS)
+    keep_from = max(1, n - retain_turns)
     # Walk further back while we're still within the user-char budget.
     user_chars = 0
     i = keep_from
@@ -2306,7 +2374,7 @@ def _compaction_retained_tail(messages: list[dict[str, Any]]) -> list[dict[str, 
         if m.get("role") == "user":
             c = m.get("content")
             clen = len(c) if isinstance(c, str) else len(json.dumps(c, default=str))
-            if user_chars + clen > _COMPACT_RETAIN_USER_CHARS:
+            if user_chars + clen > retain_chars:
                 break
             user_chars += clen
         i -= 1
@@ -2467,11 +2535,12 @@ def _results_first(msg: dict[str, Any]) -> None:
 _OSCILLATION_WINDOW = 6
 
 
-def _is_oscillating(fingerprints: list[str]) -> bool:
+def _is_oscillating(fingerprints: list[str], window: int = 0) -> bool:
     """True if the recent fingerprints show a low-diversity oscillation (§4)."""
-    if len(fingerprints) < _OSCILLATION_WINDOW:
+    size = window or _OSCILLATION_WINDOW
+    if len(fingerprints) < size:
         return False
-    window = fingerprints[-_OSCILLATION_WINDOW:]
+    window = fingerprints[-size:]
     counts: dict[str, int] = {}
     for fp in window:
         counts[fp] = counts.get(fp, 0) + 1

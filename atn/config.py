@@ -538,6 +538,11 @@ def _parse_registry_data(data: dict[str, Any], jurisdiction_id: str) -> dict[str
         seed["registry_address"] = contracts["service_registry"]
     if contracts.get("payment_channel"):
         seed["payment_channel_address"] = contracts["payment_channel"]
+    if contracts.get("tool_bond"):
+        # ToolBond (core-replacement bond gate, Decision 2026-10-12). Read by
+        # atn/runtime/tool_bond.py; no RPBConfig field, so the join merge
+        # skips it.
+        seed["tool_bond_address"] = contracts["tool_bond"]
     return seed
 
 

@@ -290,11 +290,15 @@ def breakdown_reconstructed(runtime: Any, agent_id: str) -> dict[str, Any]:
             system = getattr(defn, "system_prompt", "") or ""
             if not system:
                 from .delegate_prompts import build_delegate_prompt
+                from .harness_policy import policy_for_agent
+                _pol = policy_for_agent(runtime, defn)
                 system = build_delegate_prompt(
                     getattr(defn, "agent_type", "") or "generic",
                     defn.id,
                     getattr(defn, "parent_id", None),
-                    tool_categories=getattr(defn, "tools", None) or [],
+                    tool_categories=_pol.select_tools(
+                        getattr(defn, "tools", None) or []),
+                    policy=_pol,
                 )
         except Exception:
             log.debug("system prompt reconstruction failed for %s", agent_id, exc_info=True)

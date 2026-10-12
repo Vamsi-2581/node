@@ -19,9 +19,12 @@ Design notes:
     ``input_schema = {"type": "object"}``. Their ``code`` blob is the
     concatenated source text of the bundle's executors (what the module
     actually is), hash-locking the module's identity to its behavior.
-  - The distro manifest's ``code`` is CONFIG, not executable: the daemon
-    identity line plus the sorted module digest list. Its deps carry the
-    composition DAG the mint fan-out walks.
+  - The distro manifest's ``code`` is CONFIG, not executable: a JSON
+    document (``kind: atn_harness_distro``) with the daemon identity, the
+    sorted module digest list and the declarative loop policy
+    (atn/harness_policy.py, Decision 2026-10-12). Its deps carry the
+    composition DAG the mint fan-out walks, and, for an owner-bound fork,
+    which pinned providers may replace core built-ins for that agent.
   - Idempotent by construction: every blob is content-addressed, and
     ``ToolStore.register`` keys ``_records`` by digest, so a second
     bootstrap over identical source overwrites same-digest records
@@ -198,9 +201,15 @@ def bootstrap_reference_distro(runtime: "Runtime") -> str | None:
             version = getattr(atn, "__version__", "dev")
         except Exception:
             version = "dev"
-        distro_code = "\n".join(
-            [f"atn reference harness\n{version}", *module_digests]
-        )
+        # Since 2026-10-12 the blob is the distro CONFIG as JSON: identity,
+        # module list, and the full declarative loop policy (prompts,
+        # compaction ladder, guards, headroom, parallel-safe list). The
+        # reference values come from the live module constants, so a fork
+        # copies this blob, edits the policy, and registers it with the same
+        # (or swapped) dependencies. atn/harness_policy.py reads it back.
+        from .harness_policy import distro_config, encode_distro_config
+        distro_code = encode_distro_config(
+            distro_config(DISTRO_NAME, str(version), module_digests))
 
         try:
             distro = store.register(

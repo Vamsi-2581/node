@@ -221,6 +221,7 @@ INTEGRATION_DENIED_MESSAGES = frozenset({
     *OWNER_ONLY_TOOLS,
     # Owner decisions on the adoption / tool-grant rails.
     "approve_adoption", "reject_adoption", "list_adoption_proposals",
+    "list_distros", "core_replacement_evidence",
     "grant_tool", "revoke_tool", "set_tool_enabled", "set_tool_published",
     "vet_tool",
     # Tool AUTHORING is allowed (register_tool, above) only because guest
@@ -1709,6 +1710,8 @@ class WebSocketBridge:
                         "params": props}
 
             tool_index = {t.name: t for t in _TOOLS}
+            from .runtime.shell_provider import swap_enabled as _swap_on
+            _swap_live = _swap_on()
             # Which bundles are DAEMON-COUPLED vs genuinely externalizable.
             # Every atn_* bundle's executors take the live Runtime (registry,
             # providers, supervisor), so their manifests are IDENTITY records
@@ -1719,9 +1722,10 @@ class WebSocketBridge:
             #
             # The frontend must not present these as the same kind of thing.
             # 'kind' says what a bundle IS; 'swappable' says whether a
-            # substrate tool could ever replace it. swappable=True does NOT
-            # mean swapping is live — resolution is built and gated off
-            # (atn/runtime/shell_provider.py explains why).
+            # substrate tool could replace it. swap_enabled=True (2026-10-12)
+            # means the swap path is live, but each swap still needs the
+            # core-replacement approval, a ToolBond bond and a per-agent
+            # loadout binding (atn/runtime/shell_provider.py).
             bundles = []
             for cat in sorted(_TOOL_CATEGORIES):
                 if cat == "shell":
@@ -1740,7 +1744,7 @@ class WebSocketBridge:
                     "tools": tools,
                     "kind": "external" if cat == "shell" else "daemon",
                     "swappable": cat == "shell",
-                    "swap_enabled": False,
+                    "swap_enabled": cat == "shell" and _swap_live,
                 })
             # Bridge-native (Claude SDK) built-ins — granted via "sdk_builtin".
             # Schemas live in the SDK; names are the stable contract.
@@ -1958,7 +1962,8 @@ class WebSocketBridge:
         # act on this surface: it installs code that then runs on this
         # host, so it gets the same owner-only treatment.
         if msg_type in ("list_adoption_proposals", "approve_adoption",
-                        "reject_adoption"):
+                        "reject_adoption", "list_distros",
+                        "core_replacement_evidence"):
             if session.scope_ids is not None:
                 return {"msg_id": msg_id, "ok": False,
                         "error": "adoption approval is owner-only and not "
@@ -1974,10 +1979,34 @@ class WebSocketBridge:
             digest = msg.get("digest", "")
             if not digest:
                 return {"msg_id": msg_id, "ok": False, "error": "Missing 'digest' field"}
-            result = await self.runtime.tool_store.approve_adoption(digest)
+            # core_replacement_ack: the owner's distinct, explicit approval of
+            # a tool that replaces core built-ins (Decision 2026-10-12). The
+            # store rejects such a tool without it.
+            _ack = ({"core_replacement_ack": True}
+                    if msg.get("core_replacement_ack") is True else {})
+            result = await self.runtime.tool_store.approve_adoption(
+                digest, **_ack)
             if "error" in result:
-                return {"msg_id": msg_id, "ok": False, "error": result["error"]}
+                return {"msg_id": msg_id, "ok": False, "error": result["error"],
+                        **({"core_replacement": result["core_replacement"]}
+                           if result.get("core_replacement") else {})}
             return {"msg_id": msg_id, "ok": True, "result": result}
+
+        if msg_type == "list_distros":
+            # Harness distro picker (agent settings). Owner-only: binding is
+            # an owner action (update_agent {loadout}).
+            return {"msg_id": msg_id, "ok": True,
+                    "result": {"distros": self.runtime.tool_store.list_distros()}}
+
+        if msg_type == "core_replacement_evidence":
+            # Signed evidence traces of core-replacing tool calls; the
+            # evidence_digest is the evidenceCid for ToolBond.accuse.
+            from .runtime.shell_provider import list_evidence
+            rows = list_evidence(self.runtime.tool_store,
+                                 str(msg.get("tool_digest") or ""),
+                                 int(msg.get("limit") or 50))
+            return {"msg_id": msg_id, "ok": True,
+                    "result": {"evidence": rows}}
 
         if msg_type == "reject_adoption":
             digest = msg.get("digest", "")
