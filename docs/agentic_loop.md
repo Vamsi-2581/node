@@ -350,6 +350,24 @@ steps headings). The result still becomes summary + retained tail (§2).
 - Spiral guards (§2) are unchanged. The idle-path `compact_agent` (§15)
   still uses `COMPACTION_SUMMARIZER_SYSTEM`; it has no live cache prefix.
 
+## §21 Parallel read-only tools
+
+When one turn carries several tool calls, the loop
+(`_execute_tool_batches`) walks them in order: a maximal run of
+consecutive parallel-safe calls executes concurrently (`asyncio.gather`,
+at most 8 at once); any other call waits for the batch before it and
+runs alone. That is read/write-lock semantics with fair, in-order
+acquisition. Results are appended in the original call order.
+- Parallel-safe = `PARALLEL_SAFE_TOOLS` (read_file, list_directory,
+  search_files, web_fetch, web_search, probe_tools and the list/get
+  framework tools that only read registries) plus any tool dict flagged
+  `parallel_safe: True`; a tool dict may opt out with
+  `parallel_safe: False`. bash, write/edit, use_tool, delegation and
+  every mutating framework tool stay exclusive.
+- Loop guard (§4) and malformed-args guard (§8) run as before; a call
+  with malformed args is never part of a parallel batch and is not
+  executed. An executor exception now also marks its result `is_error`.
+
 ## Testing (targeted only, never the full suite)
 
 New/updated files: `tests/atn/test_loop_hardening.py` (§1-§6, §8:

@@ -511,6 +511,8 @@ class Provider(ABC):
         # §20: the in-loop compactor re-sends these so its request shares the
         # loop's prompt-cache prefix.
         self._run_tool_defs = tool_defs
+        # §21: tools that may run concurrently within one turn.
+        parallel_names = parallel_safe_tool_names(tools or [])
 
         # Prior conversation as real messages (NOT baked into the system
         # prompt). Keeping the system prompt byte-stable across executions
@@ -990,8 +992,8 @@ class Provider(ABC):
                         abort_reason="loop_detected",
                     )
 
-            tool_result_content: list[dict[str, Any]] = []
-            for tc in response.tool_calls:
+            async def _run_one(tc: ToolCall) -> dict[str, Any]:
+                """Execute one tool call; always returns its tool_result block."""
                 # §8: malformed tool arguments. When an adapter can't parse the
                 # tool-call args as JSON it degrades them to {"raw": <text>}.
                 # Do NOT execute — synthesize an error tool_result telling the
@@ -1001,7 +1003,7 @@ class Provider(ABC):
                         "Malformed tool args for %s (agent %s) — not executing",
                         tc.name, self.source_agent_id or "?",
                     )
-                    tool_result_content.append({
+                    return {
                         "type": "tool_result",
                         "tool_use_id": tc.id,
                         "content": json.dumps({
@@ -1009,8 +1011,7 @@ class Provider(ABC):
                                      "tool call with well-formed JSON arguments",
                         }),
                         "is_error": True,
-                    })
-                    continue
+                    }
 
                 log.info("Agent loop tool %s (turn %d/%d)", tc.name, turn + 1, max_turns)
 
@@ -1078,11 +1079,21 @@ class Provider(ABC):
                     ) * 4
                     _result_cap = max(4_000, _budget_chars // 3)
                 result_json = _truncate_tool_result(result_json, cap=_result_cap)
-                tool_result_content.append({
+                block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": tc.id,
                     "content": result_json,
-                })
+                }
+                if is_error:
+                    block["is_error"] = True
+                return block
+
+            # §21: consecutive parallel-safe (read-only) calls run concurrently;
+            # anything else runs alone, in order, after the batch before it has
+            # finished (read/write-lock semantics). Results keep call order.
+            tool_result_content = await _execute_tool_batches(
+                response.tool_calls, _run_one, parallel_names,
+            )
             messages.append({"role": "user", "content": tool_result_content})
 
             # §2 note: context reduction runs PRE-SEND at the top of the next
@@ -1583,6 +1594,86 @@ _TOOL_RESULT_CHAR_MAX = 40_000
 # middle. head + tail must stay under _TOOL_RESULT_CHAR_MAX.
 _TOOL_RESULT_HEAD_CHARS = 24_000
 _TOOL_RESULT_TAIL_CHARS = 12_000
+
+
+# §21 Parallel read-only tools. Calls to these tools have no side effects the
+# model could observe through another call in the same turn, so a turn's
+# consecutive run of them executes concurrently. Everything not listed (and
+# not flagged ``parallel_safe: True`` on its tool dict) is exclusive: it runs
+# alone, in call order. A tool dict may also opt OUT with
+# ``parallel_safe: False``.
+PARALLEL_SAFE_TOOLS: frozenset[str] = frozenset({
+    # shell bundle (read side)
+    "read_file", "list_directory", "search_files",
+    # web bundle
+    "web_fetch", "web_search",
+    # framework tools that only read registries / stores
+    "probe_tools", "list_tools", "list_agents", "get_agent", "get_execution",
+    "get_output", "get_snapshot", "list_connectors", "get_history",
+    "get_goals", "get_projects", "get_credit_budget", "get_my_budget_status",
+    "get_usage", "list_tasks", "get_user_profile", "get_latest_thought",
+    "get_children_status", "find_services",
+})
+
+# Upper bound on concurrently running calls inside one parallel batch.
+_MAX_PARALLEL_TOOL_CALLS = 8
+
+
+def parallel_safe_tool_names(tools: list[dict[str, Any]]) -> frozenset[str]:
+    """The run's parallel-safe tool names: the allowlist plus per-tool
+    ``parallel_safe: True`` flags, minus explicit ``parallel_safe: False``."""
+    names = set(PARALLEL_SAFE_TOOLS)
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        flag = t.get("parallel_safe")
+        if flag is True:
+            names.add(t.get("name", ""))
+        elif flag is False:
+            names.discard(t.get("name", ""))
+    names.discard("")
+    return frozenset(names)
+
+
+async def _execute_tool_batches(
+    calls: list[ToolCall],
+    run_one: Any,
+    parallel_names: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Run a turn's tool calls with read/write-lock semantics (§21).
+
+    Walks the calls in order. A maximal run of consecutive parallel-safe calls
+    (readers) executes concurrently; any other call (a writer) waits for the
+    batch before it and runs alone. Equivalent to every call taking a fair
+    RW lock in call order. ``run_one`` never raises; results come back in the
+    original call order whatever the completion order.
+    """
+    results: list[dict[str, Any]] = []
+    sem = asyncio.Semaphore(_MAX_PARALLEL_TOOL_CALLS)
+
+    async def _bounded(tc: ToolCall) -> dict[str, Any]:
+        async with sem:
+            return await run_one(tc)
+
+    i = 0
+    n = len(calls)
+    while i < n:
+        tc = calls[i]
+        if tc.name in parallel_names and not _is_malformed_args(tc.input):
+            j = i
+            while (j < n and calls[j].name in parallel_names
+                   and not _is_malformed_args(calls[j].input)):
+                j += 1
+            if j - i == 1:
+                results.append(await run_one(tc))
+            else:
+                results.extend(await asyncio.gather(
+                    *(_bounded(c) for c in calls[i:j])))
+            i = j
+        else:
+            results.append(await run_one(tc))
+            i += 1
+    return results
 
 
 def _drain_queue(queue: "asyncio.Queue | None") -> list[str]:

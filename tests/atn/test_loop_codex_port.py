@@ -348,3 +348,107 @@ class TestCacheFriendlyCompaction:
         rest = _drop_oldest_history(msgs)
         assert len(rest) < len(msgs)
         assert rest == [] or rest[0]["role"] == "user"
+
+
+# ---------------------------------------------------------------------------
+# §21 Parallel read-only tools
+# ---------------------------------------------------------------------------
+
+from atn.providers.base import (  # noqa: E402
+    PARALLEL_SAFE_TOOLS,
+    parallel_safe_tool_names,
+)
+
+
+class _Recorder:
+    """Tool executor that records start/end order and peak concurrency."""
+
+    def __init__(self, delay: float = 0.05) -> None:
+        self.delay = delay
+        self.active = 0
+        self.peak = 0
+        self.log: list[str] = []
+
+    async def __call__(self, name, inp):
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        self.log.append(f"start:{inp['k']}")
+        # Later calls finish first, to prove results keep call order.
+        await asyncio.sleep(self.delay * (10 - int(inp["k"][-1])) / 10)
+        self.log.append(f"end:{inp['k']}")
+        self.active -= 1
+        return f"result-{inp['k']}"
+
+
+def _calls(*specs):
+    return [ToolCall(id=f"c{i}", name=n, input={"k": f"{n}{i}"})
+            for i, n in enumerate(specs)]
+
+
+class TestParallelTools:
+    def test_allowlist_and_flags(self):
+        names = parallel_safe_tool_names([
+            {"name": "my_reader", "parallel_safe": True},
+            {"name": "read_file", "parallel_safe": False},
+        ])
+        assert "my_reader" in names
+        assert "read_file" not in names
+        assert "search_files" in names
+        assert "bash" not in PARALLEL_SAFE_TOOLS
+        assert "write_file" not in PARALLEL_SAFE_TOOLS
+
+    async def _run(self, calls, rec):
+        p = ScriptedProvider([
+            _resp(tool_calls=calls, stop_reason="tool_use"),
+            _resp(text="done", stop_reason="end_turn"),
+        ])
+        await p.run_agent_loop(message="go", tools=[{"name": c.name} for c in calls],
+                               tool_executor=rec)
+        return _tool_results(p.seen_messages[1])
+
+    async def test_reads_run_concurrently_in_order(self):
+        rec = _Recorder()
+        calls = _calls("read_file", "search_files", "list_directory")
+        trs = await self._run(calls, rec)
+        assert rec.peak == 3
+        assert [t["tool_use_id"] for t in trs] == ["c0", "c1", "c2"]
+        assert [t["content"] for t in trs] == [
+            "result-read_file0", "result-search_files1", "result-list_directory2"]
+
+    async def test_writer_is_exclusive_and_ordered(self):
+        rec = _Recorder()
+        calls = _calls("read_file", "read_file", "write_file", "read_file")
+        trs = await self._run(calls, rec)
+        # write_file starts only after both earlier reads ended, and the read
+        # after it starts only after it ended.
+        w_start = rec.log.index("start:write_file2")
+        assert rec.log.index("end:read_file0") < w_start
+        assert rec.log.index("end:read_file1") < w_start
+        assert rec.log.index("end:write_file2") < rec.log.index("start:read_file3")
+        assert [t["tool_use_id"] for t in trs] == ["c0", "c1", "c2", "c3"]
+
+    async def test_non_safe_tools_never_overlap(self):
+        rec = _Recorder()
+        await self._run(_calls("bash", "bash", "edit_file"), rec)
+        assert rec.peak == 1
+
+    async def test_malformed_args_in_batch_not_executed(self):
+        rec = _Recorder()
+        calls = _calls("read_file", "read_file")
+        calls.insert(1, ToolCall(id="bad", name="read_file", input={"raw": "{oops"}))
+        trs = await self._run(calls, rec)
+        assert [t["tool_use_id"] for t in trs] == ["c0", "bad", "c1"]
+        assert trs[1].get("is_error") is True
+        assert len([e for e in rec.log if e.startswith("start:")]) == 2
+
+    async def test_loop_guard_still_fires_on_parallel_reads(self):
+        same = [ToolCall(id=f"r{i}", name="read_file", input={"k": "x0"}) for i in range(3)]
+        p = ScriptedProvider([
+            _resp(tool_calls=same[:], stop_reason="tool_use"),
+            _resp(tool_calls=[ToolCall(id=f"s{i}", name="read_file", input={"k": "x0"})
+                              for i in range(3)], stop_reason="tool_use"),
+            _resp(text="never", stop_reason="end_turn"),
+        ])
+        r = await p.run_agent_loop(message="go", tools=[{"name": "read_file"}],
+                                   tool_executor=_Recorder(0))
+        assert r.stop_reason in ("repeat_call_limit", "loop_detected")
