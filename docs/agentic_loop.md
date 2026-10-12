@@ -331,6 +331,25 @@ overflow, manual compaction); without an anchor (first turn, usage of
 and chars/4 as a fixed offset on its char budget, so reduction aims at
 the real size.
 
+## §20 Cache-friendly compaction
+
+The in-loop compactor (`_compact_messages` via `_summarize_for_compaction`)
+no longer sends a separate summarizer system prompt (a guaranteed
+prompt-cache miss on the run's largest request). The summary request is
+the loop's own request: same system prompt, same tool schemas
+(`_run_tool_defs`), the full current history as prefix, plus one final
+user message (`COMPACTION_INLINE_PROMPT`: no tool calls, handoff note
+under the Goal / Progress / Key decisions / Critical context / Next
+steps headings). The result still becomes summary + retained tail (§2).
+- If the summary request itself overflows, the oldest ~20% of history
+  is dropped in valid units (an orphaned leading tool_result goes too; a
+  user marker is prefixed if the rest starts on an assistant turn) and
+  the request retried, up to 4 times, before falling to `_hard_truncate`.
+- If the model answers with a tool call instead of text, retry once
+  without tools.
+- Spiral guards (§2) are unchanged. The idle-path `compact_agent` (§15)
+  still uses `COMPACTION_SUMMARIZER_SYSTEM`; it has no live cache prefix.
+
 ## Testing (targeted only, never the full suite)
 
 New/updated files: `tests/atn/test_loop_hardening.py` (§1-§6, §8:

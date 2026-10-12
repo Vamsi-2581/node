@@ -130,9 +130,24 @@ COMPACTION_SUMMARY_PROMPT = (
     "## Goal\n## Progress\n## Key decisions\n## Critical context\n## Next steps"
 )
 
-# System prompt for the summarizer send() call.
+# System prompt for the IDLE-path summarizer (agent_tools.compact_agent),
+# which runs outside any loop and has no cache prefix to preserve. The running
+# loop does not use it: see COMPACTION_INLINE_PROMPT (§20).
 COMPACTION_SUMMARIZER_SYSTEM = (
     "You are a conversation summarizer. Produce a dense, accurate summary."
+)
+
+# In-loop compaction instruction (§20). Appended as the final user message of
+# a request that otherwise matches the loop's own requests byte for byte
+# (system prompt, tools, history prefix), so the prompt cache still hits.
+COMPACTION_INLINE_PROMPT = (
+    "[Context checkpoint] Stop working on the task for this one reply and do "
+    "not call any tools. The history above is about to be replaced by what "
+    "you write now, followed by only the most recent messages. Write a "
+    "handoff note that lets you continue seamlessly from it alone: keep "
+    "exact file paths, commands, identifiers, error messages, results you "
+    "still need, and anything left unfinished. Use exactly these headings:\n\n"
+    "## Goal\n## Progress\n## Key decisions\n## Critical context\n## Next steps"
 )
 
 
@@ -267,6 +282,8 @@ class Provider(ABC):
     _live_tools: Any = None
     _live_messages: Any = None
     _live_max_tokens: int = 0
+    # Tool definitions of the current run (§20: reused by the compactor).
+    _run_tool_defs: Any = None
 
     @property
     def session_stats(self) -> dict[str, Any]:
@@ -491,6 +508,9 @@ class Provider(ABC):
                 )
                 for t in tools
             ]
+        # §20: the in-loop compactor re-sends these so its request shares the
+        # loop's prompt-cache prefix.
+        self._run_tool_defs = tool_defs
 
         # Prior conversation as real messages (NOT baked into the system
         # prompt). Keeping the system prompt byte-stable across executions
@@ -1390,23 +1410,14 @@ class Provider(ABC):
         if not to_summarize:
             return messages
 
-        # Structured summary template (Goal / Progress / Key decisions /
-        # Critical context / Next steps) — factored out (§15) so the idle-path
-        # manual compactor reuses the exact same prompt.
-        summary_messages = to_summarize + [
-            {"role": "user", "content": COMPACTION_SUMMARY_PROMPT}
-        ]
-
+        # §20 cache-friendly summary: same system prompt, same tools, same
+        # history prefix as the loop's own requests, with the summarization
+        # instruction appended as the final user message. A separate
+        # summarizer system prompt guaranteed a full prompt-cache miss on the
+        # most expensive request of the run.
         try:
-            summary_resp = await self.send(
-                messages=summary_messages,
-                system=COMPACTION_SUMMARIZER_SYSTEM,
-                model=model,
-                max_tokens=4096,
-            )
-            summary_text = summary_resp.text
-            if not summary_text.strip():
-                raise ValueError("summarizer returned empty text")
+            summary_text = await self._summarize_for_compaction(
+                messages, system, model)
         except Exception as exc:
             # Fallback hard truncation (§2): NEVER no-op into a guaranteed
             # overflow. Drop the oldest turns, keeping the retained tail.
@@ -1461,6 +1472,65 @@ class Provider(ABC):
             ))
 
         return compacted
+
+    async def _summarize_for_compaction(
+        self,
+        messages: list[dict[str, Any]],
+        system: str,
+        model: str,
+    ) -> str:
+        """Ask the agent's own model for a handoff summary of ``messages`` (§20).
+
+        The request is the loop's own request (same system prompt, same tool
+        schemas, same message prefix) plus one appended user instruction, so
+        the provider's prompt cache covers everything but the instruction.
+
+        If the request itself overflows the window, the oldest history items
+        are dropped (in valid units: the remainder always starts on a plain
+        user message) and the request retried, up to
+        ``_COMPACT_OVERFLOW_RETRIES`` times. If the model answers with a tool
+        call instead of text, retry once without tools. Raises on final
+        failure; the caller falls back to hard truncation.
+        """
+        tools = getattr(self, "_run_tool_defs", None) or None
+        instruction = {"role": "user",
+                       "content": _compaction_instruction(self)}
+        history = list(messages)
+        dropped = 0
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                resp = await self.send(
+                    messages=history + [instruction],
+                    system=system,
+                    model=model,
+                    max_tokens=_COMPACT_SUMMARY_MAX_TOKENS,
+                    tools=tools,
+                )
+            except Exception as exc:
+                if (classify_provider_error(exc) == "overflow"
+                        and attempts <= _COMPACT_OVERFLOW_RETRIES):
+                    before = len(history)
+                    history = _drop_oldest_history(history)
+                    dropped += before - len(history)
+                    if not history:
+                        raise
+                    log.info(
+                        "Compaction request overflowed; dropped %d oldest "
+                        "item(s) and retrying for agent %s", dropped,
+                        self.source_agent_id or "?",
+                    )
+                    continue
+                raise
+            text = (resp.text or "").strip()
+            if text:
+                return text
+            if tools and attempts <= _COMPACT_OVERFLOW_RETRIES:
+                # The model reached for a tool instead of summarizing.
+                tools = None
+                continue
+            raise ValueError("summarizer returned empty text")
 
     async def send_stream(
         self,
@@ -1624,6 +1694,52 @@ _COMPACT_RETAIN_USER_CHARS = 20_000
 _COMPACT_RETAIN_TURNS = 2
 _MAX_COMPACTIONS_PER_RUN = 2
 _COMPACTION_MIN_REDUCTION = 0.20
+
+# §20: output cap for the compaction summary, and how many times a summary
+# request that itself overflows is retried with older history dropped.
+_COMPACT_SUMMARY_MAX_TOKENS = 4096
+_COMPACT_OVERFLOW_RETRIES = 4
+# Fraction of the history dropped (from the front) per overflow retry.
+_COMPACT_DROP_FRACTION = 0.2
+
+
+def _is_plain_user(msg: dict[str, Any]) -> bool:
+    """A user message that does not answer an earlier tool call."""
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if isinstance(content, list):
+        return not any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        )
+    return True
+
+
+def _drop_oldest_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop the oldest ~20% of ``history`` (at least one item) in valid units.
+
+    A leading tool_result message whose tool_use was dropped goes too (it
+    would be an orphan), and if the remainder then starts on an assistant
+    turn a short user marker is put in front so roles still start on user.
+    """
+    n = max(1, int(len(history) * _COMPACT_DROP_FRACTION))
+    if history and history[0].get("content") == _HISTORY_OMITTED_MARKER:
+        n += 1  # never count our own marker as history
+    rest = history[n:]
+    while rest and rest[0].get("role") == "user" and not _is_plain_user(rest[0]):
+        rest = rest[1:]
+    if rest and rest[0].get("role") != "user":
+        rest = [{"role": "user", "content": _HISTORY_OMITTED_MARKER}, *rest]
+    return rest
+
+
+_HISTORY_OMITTED_MARKER = "[Earlier history omitted to fit the context window]"
+
+
+def _compaction_instruction(provider: Any) -> str:
+    """The final user message of an in-loop compaction request (§20)."""
+    return COMPACTION_INLINE_PROMPT
+
 
 # Hard reset (tier 3): stack rebuilds per run, and the size cap on the
 # tool-call digest carried into the fresh stack.

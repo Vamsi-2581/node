@@ -267,3 +267,84 @@ class TestUsageBasedEstimate:
         r = await p.run_agent_loop(message="go", tools=[{"name": "t"}],
                                    tool_executor=ex, per_turn_input_max=10_000)
         assert r.stop_reason == "end_turn"
+
+
+# ---------------------------------------------------------------------------
+# §20 Cache-friendly compaction
+# ---------------------------------------------------------------------------
+
+from atn.providers.base import (  # noqa: E402
+    COMPACTION_INLINE_PROMPT,
+    ContextOverflowError,
+    ToolDefinition,
+    _drop_oldest_history,
+)
+
+
+def _long_history(n_pairs: int = 8, size: int = 2000) -> list[dict]:
+    msgs: list[dict] = [{"role": "user", "content": "ORIGINAL TASK"}]
+    for i in range(n_pairs):
+        msgs.append({"role": "assistant", "content": [
+            {"type": "tool_use", "id": f"u{i}", "name": "t", "input": {"i": i}}]})
+        msgs.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"u{i}", "content": "r" * size}]})
+    return msgs
+
+
+class TestCacheFriendlyCompaction:
+    async def test_same_system_tools_and_prefix(self):
+        p = ScriptedProvider([])
+        tools = [ToolDefinition(name="t", description="d", input_schema={})]
+        p._run_tool_defs = tools
+        msgs = _long_history()
+        out = await p._compact_messages(list(msgs), system="SYS", model="m")
+        (req,) = p.summary_requests
+        assert req["system"] == "SYS"
+        assert req["tools"] is tools
+        # Whole history is the prefix, instruction appended last.
+        assert req["messages"][:-1] == msgs
+        assert req["messages"][-1] == {"role": "user", "content": COMPACTION_INLINE_PROMPT}
+        assert "SUMMARY" in out[0]["content"]
+
+    async def test_overflow_drops_oldest_and_retries(self):
+        p = ScriptedProvider([], summary_responses=[
+            ContextOverflowError("prompt is too long"),
+            ContextOverflowError("prompt is too long"),
+            ProviderResponse(text="S2", stop_reason="end_turn"),
+        ])
+        msgs = _long_history()
+        out = await p._compact_messages(list(msgs), system="SYS", model="m")
+        assert p.summary_calls == 3
+        sizes = [len(r["messages"]) for r in p.summary_requests]
+        assert sizes[0] > sizes[1] > sizes[2]
+        # Each retried request starts on a plain user message (no orphan results).
+        for r in p.summary_requests[1:]:
+            first = r["messages"][0]
+            assert first["role"] == "user"
+            assert not (isinstance(first["content"], list) and any(
+                b.get("type") == "tool_result" for b in first["content"]))
+        assert "S2" in out[0]["content"]
+
+    async def test_overflow_exhausted_falls_back_to_hard_truncate(self):
+        p = ScriptedProvider([], summary_responses=[
+            ContextOverflowError("prompt is too long")] * 10)
+        msgs = _long_history()
+        out = await p._compact_messages(list(msgs), system="SYS", model="m")
+        assert "Context truncated" in out[0]["content"]
+
+    async def test_tool_call_instead_of_text_retries_without_tools(self):
+        p = ScriptedProvider([], summary_responses=[
+            ProviderResponse(text="", tool_calls=[ToolCall(id="x", name="t", input={})],
+                             stop_reason="tool_use"),
+            ProviderResponse(text="S", stop_reason="end_turn"),
+        ])
+        p._run_tool_defs = [ToolDefinition(name="t", description="d", input_schema={})]
+        out = await p._compact_messages(_long_history(), system="SYS", model="m")
+        assert p.summary_requests[1]["tools"] is None
+        assert out[0]["content"].count("S") >= 1
+
+    def test_drop_oldest_keeps_valid_start(self):
+        msgs = _long_history(n_pairs=10)
+        rest = _drop_oldest_history(msgs)
+        assert len(rest) < len(msgs)
+        assert rest == [] or rest[0]["role"] == "user"
