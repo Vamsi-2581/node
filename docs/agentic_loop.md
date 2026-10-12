@@ -394,7 +394,31 @@ result of that turn. Never in the system prompt, which must stay
 byte-stable for the prompt cache. Each level is announced once per
 run; falling back under 70% (after a reduction) re-arms them.
 
-## §24 AGENTS.md (skipped)
+## §24 History hygiene
+
+- **Whole-stack pairing before every send** (`_repair_history`, run at
+  the top of each `_send_stream_with_retry` attempt, so also after a
+  reactive reduction). A tool_use with no result in the next message
+  gets a synthetic `is_error` "no result was recorded" result (merged
+  into the next tool-result message, results first, or a new user
+  message inserted). A tool_result whose id is not a tool_use of the
+  immediately preceding assistant turn (e.g. a compaction tail that
+  starts on results whose call was summarized away) becomes a short
+  text block. Valid stacks are never touched (cache prefix intact). The
+  trailing assistant turn is left to the loop / §3 exit repair.
+- **Output cap mid tool call.** `stop_reason == "max_tokens"` with tool
+  calls means the last call is cut off. The turn is discarded (any text
+  kept as an assistant message, the partial calls never enter history)
+  and one user message (`TRUNCATED_TOOL_CALL_PROMPT`) asks for a
+  smaller re-issue. Once per incident: a second consecutive truncation
+  finalizes as before; a normal tool turn re-arms it.
+- **Backoff.** Connection-level failures (refused / reset / dropped
+  stream, also when wrapped as `__cause__` of a ProviderError without a
+  status) route as transient on their own schedule, 1/2/4/8/16s +
+  jitter, separate from the 2/8/30s 429/5xx schedule. `Retry-After` is
+  honored up to 300s.
+
+## Not ported: AGENTS.md
 
 Codex loads AGENTS.md from repo root down to the working directory.
 Not ported: cognitive agents on the generic loop have no working
@@ -411,6 +435,7 @@ orphan repair; oscillation; steering queue), extend
 from spec), `tests/atn/test_ollama_translation.py` (§9 round-trip,
 num_ctx presence), `tests/atn/test_provider_routing.py` (§10 fail-loud
 + eviction), `tests/atn/test_input_arbiter.py` (§12 ghost recovery).
+Codex-port items §17-§24: `tests/atn/test_loop_codex_port.py`.
 Run alongside existing `test_provider_base.py`,
 `test_long_horizon_safeguards.py`, `test_budget_inner_loop.py`.
 

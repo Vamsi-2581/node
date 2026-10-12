@@ -3,6 +3,12 @@
 Each section maps to one item of the port:
   §17 non-blocking shell tools (async subprocess, tree kill, head+tail)
   §18 plain-text tool results
+  §19 context fullness from provider-reported usage
+  §20 cache-friendly compaction
+  §21 parallel read-only tools
+  §22 update_plan
+  §23 context headroom signal
+  §24 history hygiene (whole-stack repair, max_tokens tool call, backoff)
 """
 from __future__ import annotations
 
@@ -578,3 +584,154 @@ class TestHeadroomSignal:
         # The system prompt is never touched.
         assert all("[Context:" not in str(m.get("content")) for m in final
                    if m.get("role") == "assistant")
+
+
+# ---------------------------------------------------------------------------
+# §24 History hygiene
+# ---------------------------------------------------------------------------
+
+from atn.providers.base import (  # noqa: E402
+    ProviderError,
+    TRUNCATED_TOOL_CALL_PROMPT,
+    _repair_history,
+    classify_provider_error,
+)
+
+
+def _au(*ids):
+    return {"role": "assistant", "content": [
+        {"type": "tool_use", "id": i, "name": "t", "input": {}} for i in ids]}
+
+
+def _ur(*ids):
+    return {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": i, "content": "r"} for i in ids]}
+
+
+class TestRepairHistory:
+    def test_valid_history_untouched(self):
+        msgs = [{"role": "user", "content": "go"}, _au("a", "b"), _ur("a", "b"), _au("c")]
+        before = [dict(m) for m in msgs]
+        assert _repair_history(msgs) == 0
+        assert msgs == before
+
+    def test_missing_result_in_middle(self):
+        msgs = [{"role": "user", "content": "go"}, _au("a", "b"), _ur("a"),
+                {"role": "assistant", "content": "ok"}]
+        assert _repair_history(msgs) == 1
+        ids = [b["tool_use_id"] for b in msgs[2]["content"]]
+        assert ids == ["a", "b"]
+        assert msgs[2]["content"][1]["is_error"] is True
+
+    def test_missing_result_message_inserted(self):
+        msgs = [{"role": "user", "content": "go"}, _au("a"),
+                {"role": "user", "content": "steer"}]
+        assert _repair_history(msgs) == 1
+        assert msgs[2]["content"][0]["tool_use_id"] == "a"
+        assert msgs[3]["content"] == "steer"
+
+    def test_orphan_result_becomes_text(self):
+        # Compaction summary followed by a tail that starts on tool results.
+        msgs = [{"role": "user", "content": "summary"}, _ur("gone"), _au("x"), _ur("x")]
+        assert _repair_history(msgs) == 1
+        assert msgs[1]["content"][0]["type"] == "text"
+        assert msgs[3]["content"][0]["tool_use_id"] == "x"
+
+    def test_trailing_assistant_left_alone(self):
+        msgs = [{"role": "user", "content": "go"}, _au("a")]
+        assert _repair_history(msgs) == 0
+
+    async def test_repair_runs_before_send(self):
+        p = ScriptedProvider([_resp(text="done", stop_reason="end_turn")])
+        msgs = [{"role": "user", "content": "summary"}, _ur("gone"),
+                {"role": "user", "content": "go on"}]
+
+        async def _reduce():
+            raise AssertionError("no reduction expected")
+
+        await p._send_stream_with_retry(
+            messages=msgs, system="", model="", max_tokens=100,
+            tool_defs=None, on_chunk=None, reduce_context=_reduce)
+        sent = p.seen_messages[0]
+        assert sent[1]["content"][0]["type"] == "text"
+
+
+class TestMaxTokensToolCall:
+    async def test_truncated_tool_call_retried_once(self):
+        executed = []
+
+        async def ex(name, inp):
+            executed.append(inp)
+            return "ok"
+
+        p = ScriptedProvider([
+            _resp(text="writing", stop_reason="max_tokens",
+                  tool_calls=[ToolCall(id="w1", name="write_file", input={"raw": '{"path": "a'})]),
+            _resp(tool_calls=[ToolCall(id="w2", name="write_file", input={"path": "a", "content": "x"})],
+                  stop_reason="tool_use"),
+            _resp(text="done", stop_reason="end_turn"),
+        ])
+        r = await p.run_agent_loop(message="go", tools=[{"name": "write_file"}], tool_executor=ex)
+        assert r.stop_reason == "end_turn" and r.text == "done"
+        assert executed == [{"path": "a", "content": "x"}]
+        second = p.seen_messages[1]
+        assert second[-1]["content"] == TRUNCATED_TOOL_CALL_PROMPT
+        # The cut-off tool call never enters history (no orphan tool_use).
+        assert not any(isinstance(m["content"], list) and any(
+            b.get("id") == "w1" for b in m["content"]) for m in second)
+
+    async def test_second_truncation_finishes(self):
+        trunc = lambda i: _resp(stop_reason="max_tokens", tool_calls=[  # noqa: E731
+            ToolCall(id=f"w{i}", name="write_file", input={"raw": "{"})])
+        p = ScriptedProvider([trunc(1), trunc(2)])
+        r = await p.run_agent_loop(message="go", tools=[{"name": "write_file"}],
+                                   tool_executor=_noop)
+        assert p.stream_calls == 2
+        assert r.stop_reason == "max_tokens"
+
+
+class TestConnectionBackoff:
+    def test_connection_errors_are_transient(self):
+        assert classify_provider_error(ConnectionResetError("reset")) == "transient"
+        wrapped = ProviderError("send failed")
+        wrapped.__cause__ = ConnectionRefusedError("refused")
+        assert classify_provider_error(wrapped) == "transient"
+        # A real HTTP status keeps its own route.
+        assert classify_provider_error(ProviderError("x", status_code=401)) == "fatal"
+
+    async def test_separate_schedule(self, monkeypatch):
+        import atn.providers.base as base
+        sleeps: list[float] = []
+
+        async def _fast_sleep(s):
+            sleeps.append(s)
+
+        monkeypatch.setattr(base.asyncio, "sleep", _fast_sleep)
+        monkeypatch.setattr(base.random, "uniform", lambda a, b: 0.0)
+
+        class ConnectError(Exception):
+            pass
+
+        p = ScriptedProvider(
+            [ConnectError("down")] * 4
+            + [ProviderError("busy", status_code=503)]
+            + [_resp(text="ok", stop_reason="end_turn")]
+        )
+        r = await p.run_agent_loop(message="go", tools=[])
+        assert r.text == "ok"
+        assert sleeps == [1.0, 2.0, 4.0, 8.0, 2.0]
+
+    async def test_retry_after_capped(self, monkeypatch):
+        import atn.providers.base as base
+        sleeps: list[float] = []
+
+        async def _fast_sleep(s):
+            sleeps.append(s)
+
+        monkeypatch.setattr(base.asyncio, "sleep", _fast_sleep)
+        monkeypatch.setattr(base.random, "uniform", lambda a, b: 0.0)
+        e = ProviderError("rate", status_code=429)
+        e.retry_after = 99999
+        p = ScriptedProvider([e, _resp(text="ok", stop_reason="end_turn")])
+        await p.run_agent_loop(message="go", tools=[])
+        assert sleeps == [base._RETRY_AFTER_CAP_S]

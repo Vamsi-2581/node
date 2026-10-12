@@ -205,6 +205,15 @@ def format_plan(plan: list[dict[str, str]] | None, explanation: str = "") -> str
     return "\n".join(lines)
 
 
+# §24: sent when a reply hit the output token cap in the middle of a tool call.
+TRUNCATED_TOOL_CALL_PROMPT = (
+    "Your last reply reached the output token limit before its tool call was "
+    "complete, so it was discarded and nothing was run. Issue the call again "
+    "with smaller arguments (for example, split a large file write into "
+    "several smaller writes or edits)."
+)
+
+
 # ---------------------------------------------------------------------------
 # Canonical data types
 # ---------------------------------------------------------------------------
@@ -645,6 +654,8 @@ class Provider(ABC):
         usage_anchor: tuple[int, int] | None = None
         # §23: highest context-headroom level already announced this run.
         headroom_noted = 0
+        # §24: one re-issue request per output-cap-truncated tool turn.
+        truncated_retry_used = False
 
         for turn in range(max_turns):
             if self._interrupted:
@@ -894,6 +905,27 @@ class Provider(ABC):
                         },
                     },
                 ))
+
+            # §24: the reply hit the output cap while emitting tool calls. The
+            # last call is cut off (its args are partial or degraded to
+            # {"raw": ...}), so the turn is discarded rather than finalized as
+            # if the agent had finished: ask once for a shorter re-issue.
+            if (response.stop_reason == "max_tokens" and response.tool_calls
+                    and tool_executor is not None):
+                if not truncated_retry_used:
+                    truncated_retry_used = True
+                    log.info(
+                        "Output cap hit mid tool call for agent %s; asking "
+                        "for a shorter re-issue", self.source_agent_id or "?",
+                    )
+                    if response.text:
+                        messages.append(
+                            {"role": "assistant", "content": response.text})
+                    messages.append({"role": "user",
+                                     "content": TRUNCATED_TOOL_CALL_PROMPT})
+                    continue
+            elif response.tool_calls and response.stop_reason == "tool_use":
+                truncated_retry_used = False
 
             # No tool calls or not a tool_use stop — we're done
             if not response.tool_calls or response.stop_reason != "tool_use":
@@ -1299,7 +1331,15 @@ class Provider(ABC):
         backoff_schedule = (2.0, 8.0, 30.0)
         overflow_reduced = False
         transient_attempts = 0
+        connection_attempts = 0
         while True:
+            # §24: whole-stack tool_use/tool_result pairing before every send
+            # attempt (a reactive reduction may have just rewritten the stack).
+            _fixed = _repair_history(messages)
+            if _fixed:
+                log.warning("Repaired %d unpaired tool call/result block(s) in "
+                            "history for agent %s", _fixed,
+                            self.source_agent_id or "?")
             try:
                 return await self.send_stream(
                     messages=messages,
@@ -1331,6 +1371,29 @@ class Provider(ABC):
                     await reduce_context()
                     overflow_reduced = True
                     continue
+                if route == "transient" and _is_connection_error(exc):
+                    # §24: a dropped/refused connection is usually a short
+                    # network blip, unlike a 429/5xx that needs the server to
+                    # cool off. Separate, quicker and longer schedule so it
+                    # neither waits 30s for a blip nor eats the 429 budget.
+                    if connection_attempts >= len(_CONNECTION_BACKOFF):
+                        log.warning(
+                            "Connection error exhausted %d loop-level retries "
+                            "for agent %s: %s", len(_CONNECTION_BACKOFF),
+                            self.source_agent_id or "?", exc,
+                        )
+                        raise
+                    wait = _CONNECTION_BACKOFF[connection_attempts]
+                    wait += random.uniform(0, wait * 0.25)
+                    connection_attempts += 1
+                    log.warning(
+                        "Connection error (retry %d/%d, sleeping %.1fs) for "
+                        "agent %s: %s", connection_attempts,
+                        len(_CONNECTION_BACKOFF), wait,
+                        self.source_agent_id or "?", exc,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
                 if route == "transient":
                     if transient_attempts >= len(backoff_schedule):
                         log.warning(
@@ -1343,7 +1406,10 @@ class Provider(ABC):
                     retry_after = getattr(exc, "retry_after", None)
                     if retry_after:
                         try:
-                            wait = max(wait, float(retry_after))
+                            # Capped: a huge Retry-After would otherwise park
+                            # the run silently for hours.
+                            wait = max(wait, min(float(retry_after),
+                                                 _RETRY_AFTER_CAP_S))
                         except (TypeError, ValueError):
                             pass
                     wait += random.uniform(0, wait * 0.25)  # jitter
@@ -2304,6 +2370,94 @@ def _repair_orphan_tool_uses(messages: list[dict[str, Any]], reason: str) -> Non
     messages.append({"role": "user", "content": results})
 
 
+def _tool_use_ids(msg: dict[str, Any]) -> list[str]:
+    content = msg.get("content")
+    if msg.get("role") != "assistant" or not isinstance(content, list):
+        return []
+    return [
+        b["id"] for b in content
+        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+    ]
+
+
+def _repair_history(messages: list[dict[str, Any]]) -> int:
+    """Pair every tool_use with a tool_result across the WHOLE stack (§24).
+
+    Run before each send. The tail-only §3 repair covers exit paths; this
+    covers anything a reduction, steering or history splice left behind in
+    the middle of the stack (e.g. a compaction tail that starts on a
+    tool_result whose tool_use was summarized away):
+      - a tool_use with no result in the next message gets a synthetic
+        ``missing`` error result (added to the next tool-result message, or
+        a new user message inserted right after the assistant turn);
+      - a tool_result whose id is not a tool_use of the immediately
+        preceding assistant turn is turned into a short text block.
+    The trailing assistant turn is left alone: its results are what the loop
+    is about to append. In place; returns the number of repairs (0 = the
+    stack was already valid, nothing touched).
+    """
+    repairs = 0
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") == "assistant":
+            ids = _tool_use_ids(msg)
+            if ids and i + 1 < len(messages):
+                nxt = messages[i + 1]
+                nxt_content = nxt.get("content")
+                have: set[str] = set()
+                if nxt.get("role") == "user" and isinstance(nxt_content, list):
+                    have = {
+                        b.get("tool_use_id") for b in nxt_content
+                        if isinstance(b, dict) and b.get("type") == "tool_result"
+                    }
+                missing = [tid for tid in ids if tid not in have]
+                if missing:
+                    synthetic = [
+                        {"type": "tool_result", "tool_use_id": tid,
+                         "content": "Error: no result was recorded for this call.",
+                         "is_error": True}
+                        for tid in missing
+                    ]
+                    if have:
+                        # Results must lead the message, before any text.
+                        nxt["content"] = [*nxt_content, *synthetic]
+                        _results_first(nxt)
+                    else:
+                        messages.insert(i + 1, {"role": "user", "content": synthetic})
+                    repairs += len(missing)
+        elif msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            valid = set(_tool_use_ids(messages[i - 1])) if i > 0 else set()
+            new_blocks = []
+            changed = False
+            for b in msg["content"]:
+                if (isinstance(b, dict) and b.get("type") == "tool_result"
+                        and b.get("tool_use_id") not in valid):
+                    new_blocks.append({
+                        "type": "text",
+                        "text": "[result of an earlier tool call whose request "
+                                "is no longer in context]",
+                    })
+                    changed = True
+                    repairs += 1
+                else:
+                    new_blocks.append(b)
+            if changed:
+                msg["content"] = new_blocks
+        i += 1
+    return repairs
+
+
+def _results_first(msg: dict[str, Any]) -> None:
+    """Order a user message's blocks tool_results first (API requirement)."""
+    content = msg.get("content")
+    if isinstance(content, list):
+        msg["content"] = sorted(
+            content,
+            key=lambda b: 0 if isinstance(b, dict) and b.get("type") == "tool_result" else 1,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Loop detection (§4) + malformed args (§8)
 # ---------------------------------------------------------------------------
@@ -2417,6 +2571,30 @@ def is_overflow_message(message: str) -> bool:
 _TRANSIENT_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
 
 
+# §24: loop-level backoff for connection-level failures (refused / reset /
+# dropped stream), separate from the 429/5xx schedule.
+_CONNECTION_BACKOFF: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 16.0)
+_CONNECTION_ERROR_NAMES: frozenset[str] = frozenset({
+    "ConnectError", "ConnectTimeout", "ReadError", "WriteError",
+    "RemoteProtocolError", "StreamError",
+})
+# Longest Retry-After the loop will honor before retrying anyway.
+_RETRY_AFTER_CAP_S = 300.0
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """True for connection-level failures (also when wrapped as the cause)."""
+    seen = 0
+    cur: BaseException | None = exc
+    while cur is not None and seen < 4:
+        if (type(cur).__name__ in _CONNECTION_ERROR_NAMES
+                or isinstance(cur, ConnectionError)):
+            return True
+        cur = cur.__cause__
+        seen += 1
+    return False
+
+
 def classify_provider_error(exc: Exception) -> str:
     """Bucket a raised provider exception into a loop route (§1).
 
@@ -2434,6 +2612,8 @@ def classify_provider_error(exc: Exception) -> str:
     if exc_name in ("TimeoutException", "ReadTimeout", "ConnectTimeout",
                     "ConnectError", "ReadError", "RemoteProtocolError",
                     "StreamError", "PoolTimeout"):
+        return "transient"
+    if _is_connection_error(exc) and getattr(exc, "status_code", None) is None:
         return "transient"
     if isinstance(exc, ProviderError):
         status = exc.status_code
