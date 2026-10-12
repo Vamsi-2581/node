@@ -1495,11 +1495,9 @@ class WebSocketBridge:
 
         if msg_type == "provider_rate_limits":
             # Serve the SDK-event-fed rate-limit cache (what /usage shows),
-            # merged across active bridges. NO network call and NO
-            # refresh_usage fallback: the header-probe numbers have been
-            # observed reading ~0% while the subscription window was
-            # exhausted, so a caller pacing itself against this surface must
-            # never receive them. Empty result = no events seen yet.
+            # merged across active bridges. NO network call: this is the
+            # cache that stream events and throttled bridge get_usage reads
+            # (the SDK's /usage data) fill. Empty result = nothing seen yet.
             try:
                 # The daemon-global shared cache, NOT the active-provider
                 # aggregate: between tasks there are often zero active bridge
@@ -1527,7 +1525,7 @@ class WebSocketBridge:
             if prov is None:
                 # Rootless fleet / no run yet: no per-agent instance exists.
                 # Fall back to the boot-time executor registry (refresh_usage
-                # reads the OAuth credentials itself, no live session needed).
+                # asks the bridge's get_usage; the CLI reads its own login).
                 registered = self.runtime.providers.get_registered_provider(provider_id)
                 if registered is not None and hasattr(registered, "refresh_usage"):
                     prov = registered

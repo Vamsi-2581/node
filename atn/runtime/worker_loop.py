@@ -420,9 +420,9 @@ async def run_cognitive_loop(
     # Post-loop reconciliation (P5, bridge subscription providers). The
     # in-process path runs this at ExecutionEngine finalize (execution_engine.py
     # ~:1136); worker_loop omitted it in P4 because API providers don't
-    # implement it. For bridge it MUST run WORKER-SIDE: refresh_usage() reads
-    # ~/.claude/.credentials.json off disk and makes the API call from the
-    # provider, so it can only happen where the provider lives. It also freshens
+    # implement it. For bridge it MUST run WORKER-SIDE: refresh_usage() asks the
+    # provider's own bridge process (get_usage, throttled), so it can only
+    # happen where the provider lives. It also freshens
     # ``_rate_limits`` for the subscription snapshot below. Best-effort — a
     # reconcile failure never affects the user-visible result.
     if hasattr(provider, "reconcile_after_agent_loop"):

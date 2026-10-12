@@ -40,6 +40,11 @@ from .base import (
 from ..events import Event, EventBus, EventType
 from ..model_specs import context_window, max_output_tokens
 
+# Live usage reads (bridge get_usage) are throttled to one per this many
+# seconds; between reads the cached reading answers.
+_USAGE_MIN_INTERVAL = float(os.environ.get("ATN_USAGE_MIN_INTERVAL", "60"))
+_USAGE_TIMEOUT = 45.0
+
 log = logging.getLogger(__name__)
 
 # Locate the bridge directory. Same resolution as the Claude bridge: a dev
@@ -114,6 +119,7 @@ class CodexBridgeProvider(Provider):
         # shape as the claude bridge's _rate_limits so the provider card
         # renders both providers identically.
         self._rate_limits: dict[str, Any] = {}
+        self._usage_fetched_at: float = 0.0
 
     @property
     def name(self) -> str:
@@ -665,77 +671,35 @@ class CodexBridgeProvider(Provider):
     # ------------------------------------------------------------------
 
     async def refresh_usage(self) -> dict[str, Any]:
-        """Fetch ChatGPT-account subscription utilization for Codex.
+        """Return ChatGPT-account subscription utilization for Codex.
 
-        The Codex CLI reads its usage meter from the ChatGPT backend
-        (``.../backend-api/wham/usage``, see codex-rs backend-client) using
-        the OAuth token in ``~/.codex/auth.json``. We hit the same endpoint
-        and map the windows onto the claude-bridge ``_rate_limits`` shape
-        (five_hour / seven_day / ...) so the provider card renders both
-        providers the same way.
+        Source: the bridge's ``get_usage`` request, which asks the Codex
+        CLI's own app-server (``account/rateLimits/read``; the CLI reads its
+        own login). Windows arrive already mapped onto the claude-bridge
+        ``_rate_limits`` shape (five_hour / seven_day / Nd, utilization
+        0-1, resetsAt epoch seconds). Throttled to one live read per
+        ``_USAGE_MIN_INTERVAL``; skipped while the bridge is busy; any
+        failure keeps the cached reading.
         """
+        now = time.monotonic()
+        if self._usage_fetched_at and now - self._usage_fetched_at < _USAGE_MIN_INTERVAL:
+            return dict(self._rate_limits)
+        if self._lock.locked():
+            return dict(self._rate_limits)
+        self._usage_fetched_at = now
         try:
-            import httpx
-        except ImportError:
-            log.warning("httpx not installed — cannot refresh codex usage")
+            resp = await asyncio.wait_for(
+                self._send_request({"type": "get_usage"}), timeout=_USAGE_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("codex refresh_usage: bridge get_usage failed: %s", exc)
             return dict(self._rate_limits)
-
-        auth_path = Path.home() / ".codex" / "auth.json"
-        try:
-            tokens = json.loads(auth_path.read_text(encoding="utf-8")).get("tokens", {})
-        except Exception as exc:
-            log.warning("Failed to read Codex auth from %s: %s", auth_path, exc)
+        if not resp.get("ok") or not resp.get("available"):
+            log.info("codex refresh_usage: usage unavailable (%s)",
+                     resp.get("reason") or resp.get("error") or "unknown")
             return dict(self._rate_limits)
-        access_token = tokens.get("access_token", "")
-        if not access_token:
-            log.warning("No Codex access token in %s", auth_path)
-            return dict(self._rate_limits)
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "User-Agent": "codex-cli",
-        }
-        if tokens.get("account_id"):
-            headers["ChatGPT-Account-Id"] = tokens["account_id"]
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(
-                    "https://chatgpt.com/backend-api/wham/usage", headers=headers)
-                if resp.status_code != 200:
-                    log.warning("Codex usage probe returned %s", resp.status_code)
-                    return dict(self._rate_limits)
-                data = resp.json()
-        except Exception as exc:
-            log.warning("Codex usage probe failed: %s", exc)
-            return dict(self._rate_limits)
-
-        def _window_key(seconds: int | None) -> str:
-            # Paid plans meter a 5h + weekly pair like Claude; free meters a
-            # 30-day window. Bucket by duration so the frontend's named slots
-            # light up when they apply.
-            if not seconds:
-                return "primary"
-            if seconds <= 6 * 3600:
-                return "five_hour"
-            if seconds <= 8 * 86_400:
-                return "seven_day"
-            return f"{round(seconds / 86_400)}d"
-
-        rl = data.get("rate_limit") or {}
-        now_ms = int(time.time() * 1000)
-        for win in ("primary_window", "secondary_window"):
-            w = rl.get(win)
-            if not w:
-                continue
-            key = _window_key(w.get("limit_window_seconds"))
-            self._rate_limits[key] = {
-                "status": "limit_reached" if rl.get("limit_reached") else "allowed",
-                "rateLimitType": key,
-                "utilization": (w.get("used_percent") or 0) / 100.0,
-                "resetsAt": w.get("reset_at"),
-                "windowSeconds": w.get("limit_window_seconds"),
-                "updatedAt": now_ms,
-            }
+        for key, entry in (resp.get("rate_limits") or {}).items():
+            if isinstance(entry, dict):
+                self._rate_limits[key] = entry
         log.info("codex refresh_usage: %s", {
             k: v.get("utilization") for k, v in self._rate_limits.items()})
         return dict(self._rate_limits)

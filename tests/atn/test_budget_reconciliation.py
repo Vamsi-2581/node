@@ -34,11 +34,11 @@ async def test_reconcile_no_op_when_no_prior_reading(monkeypatch):
     s = _make_stub()
     s.record_turn_tokens(50_000, "claude-sonnet-4-6")
 
-    # Stub refresh_usage so reconcile doesn't try to hit the network.
+    # Stub the live usage read so reconcile doesn't try to hit the network.
     async def _fake_refresh():
         s._rate_limits["five_hour"] = {"utilization": 0.05}
-        return dict(s._rate_limits)
-    monkeypatch.setattr(s, "refresh_usage", _fake_refresh)
+        return True
+    monkeypatch.setattr(s, "_refresh_usage_live", _fake_refresh)
 
     report = await s.reconcile_after_agent_loop()
     # No prior reading, so actual_pct is None; no adjustment.
@@ -56,8 +56,8 @@ async def test_reconcile_no_adjustment_when_within_tolerance(monkeypatch):
 
     async def _fake_refresh():
         s._rate_limits["five_hour"] = {"utilization": 0.1095}  # +0.95pp actual
-        return dict(s._rate_limits)
-    monkeypatch.setattr(s, "refresh_usage", _fake_refresh)
+        return True
+    monkeypatch.setattr(s, "_refresh_usage_live", _fake_refresh)
 
     report = await s.reconcile_after_agent_loop()
     assert report["predicted_pct"] == pytest.approx(1.0)
@@ -76,8 +76,8 @@ async def test_reconcile_adjusts_dominant_class_on_mismatch(monkeypatch):
     async def _fake_refresh():
         # Actual burn was 2pp — twice what we predicted. Rate was too high.
         s._rate_limits["five_hour"] = {"utilization": 0.12}
-        return dict(s._rate_limits)
-    monkeypatch.setattr(s, "refresh_usage", _fake_refresh)
+        return True
+    monkeypatch.setattr(s, "_refresh_usage_live", _fake_refresh)
 
     report = await s.reconcile_after_agent_loop()
     assert report["adjusted_class"] == "sonnet"
@@ -96,8 +96,8 @@ async def test_reconcile_picks_dominant_class(monkeypatch):
 
     async def _fake_refresh():
         s._rate_limits["five_hour"] = {"utilization": 0.30}  # big mismatch
-        return dict(s._rate_limits)
-    monkeypatch.setattr(s, "refresh_usage", _fake_refresh)
+        return True
+    monkeypatch.setattr(s, "_refresh_usage_live", _fake_refresh)
 
     report = await s.reconcile_after_agent_loop()
     assert report["adjusted_class"] == "opus"
@@ -111,8 +111,8 @@ async def test_reconcile_skips_when_actual_pct_negligible(monkeypatch):
 
     async def _fake_refresh():
         s._rate_limits["five_hour"] = {"utilization": 0.1001}  # 0.01pp — noise
-        return dict(s._rate_limits)
-    monkeypatch.setattr(s, "refresh_usage", _fake_refresh)
+        return True
+    monkeypatch.setattr(s, "_refresh_usage_live", _fake_refresh)
 
     report = await s.reconcile_after_agent_loop()
     # actual_pct < 0.5 threshold → no adjustment.
@@ -127,8 +127,8 @@ async def test_reconcile_resets_counters_after(monkeypatch):
 
     async def _fake_refresh():
         s._rate_limits["five_hour"] = {"utilization": 0.11}
-        return dict(s._rate_limits)
-    monkeypatch.setattr(s, "refresh_usage", _fake_refresh)
+        return True
+    monkeypatch.setattr(s, "_refresh_usage_live", _fake_refresh)
 
     await s.reconcile_after_agent_loop()
     assert s._predicted_pct_since_refresh == 0

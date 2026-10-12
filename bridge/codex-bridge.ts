@@ -30,6 +30,9 @@ import { createInterface } from "readline"
 import { createServer, type Server as NetServer, type Socket } from "net"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
+import { spawn } from "child_process"
+import { createRequire } from "module"
+import { existsSync } from "fs"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -357,7 +360,12 @@ interface PingRequest {
   type: "ping"
 }
 
-type BridgeRequest = CreateRequest | AgentLoopRequest | DeleteRequest | ShutdownRequest | PingRequest
+interface GetUsageRequest {
+  id: string
+  type: "get_usage"
+}
+
+type BridgeRequest = CreateRequest | AgentLoopRequest | DeleteRequest | ShutdownRequest | PingRequest | GetUsageRequest
 
 interface BridgeResponse {
   id: string
@@ -382,12 +390,139 @@ interface BridgeResponse {
   model?: string
   error?: string
   items?: ThreadItem[]
+  // get_usage response
+  available?: boolean
+  reason?: string
+  plan_type?: string | null
+  rate_limits?: Record<string, Record<string, unknown>>
 }
 
 // -- Response writer --
 
 function respond(resp: BridgeResponse): void {
   process.stdout.write(JSON.stringify(resp) + "\n")
+}
+
+// -- Subscription usage (get_usage) --
+// The sanctioned source is the Codex CLI's own app-server: spawn
+// `codex app-server` (stdio JSON-RPC), handshake, then read
+// account/rateLimits/read. The CLI reads its own login; this bridge never
+// touches ~/.codex/auth.json. Short-lived per request; callers cache.
+
+const USAGE_TIMEOUT_MS = 30_000
+
+function resolveCodexBinary(): string | null {
+  if (process.env.CODEX_PATH_OVERRIDE && existsSync(process.env.CODEX_PATH_OVERRIDE)) {
+    return process.env.CODEX_PATH_OVERRIDE
+  }
+  const triples: Record<string, [string, string]> = {
+    "win32-x64": ["x86_64-pc-windows-msvc", "@openai/codex-win32-x64"],
+    "win32-arm64": ["aarch64-pc-windows-msvc", "@openai/codex-win32-arm64"],
+    "linux-x64": ["x86_64-unknown-linux-musl", "@openai/codex-linux-x64"],
+    "linux-arm64": ["aarch64-unknown-linux-musl", "@openai/codex-linux-arm64"],
+    "darwin-x64": ["x86_64-apple-darwin", "@openai/codex-darwin-x64"],
+    "darwin-arm64": ["aarch64-apple-darwin", "@openai/codex-darwin-arm64"],
+  }
+  const t = triples[`${process.platform}-${process.arch}`]
+  if (!t) return null
+  const [triple, pkg] = t
+  const bin = process.platform === "win32" ? "codex.exe" : "codex"
+  try {
+    const sdkReq = createRequire(import.meta.url)
+    const codexPkg = sdkReq.resolve("@openai/codex/package.json")
+    const platPkg = createRequire(codexPkg).resolve(`${pkg}/package.json`)
+    const root = join(dirname(platPkg), "vendor", triple)
+    for (const cand of [join(root, "bin", bin), join(root, "codex", bin)]) {
+      if (existsSync(cand)) return cand
+    }
+  } catch {}
+  return null
+}
+
+function windowKey(mins: number | null | undefined): string {
+  // Bucket by duration so the provider card's named slots line up with
+  // the claude bridge (paid plans: 5h + weekly; free: a longer window).
+  if (!mins) return "primary"
+  if (mins <= 6 * 60) return "five_hour"
+  if (mins <= 8 * 24 * 60) return "seven_day"
+  return `${Math.round(mins / 1440)}d`
+}
+
+// Map a RateLimitSnapshot onto the rate_limit entry shape the claude
+// bridge uses (utilization 0-1, resetsAt epoch seconds).
+function mapCodexSnapshot(snap: any): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {}
+  if (!snap || typeof snap !== "object") return out
+  const now = Date.now()
+  const reached = snap.rateLimitReachedType != null
+  for (const w of [snap.primary, snap.secondary]) {
+    if (!w || typeof w.usedPercent !== "number") continue
+    const key = windowKey(w.windowDurationMins)
+    out[key] = {
+      status: reached || w.usedPercent >= 100 ? "limit_reached" : "allowed",
+      rateLimitType: key,
+      utilization: w.usedPercent / 100,
+      resetsAt: w.resetsAt ?? undefined,
+      windowSeconds: w.windowDurationMins ? w.windowDurationMins * 60 : undefined,
+      updatedAt: now,
+    }
+  }
+  return out
+}
+
+function readCodexRateLimits(): Promise<any> {
+  const bin = resolveCodexBinary()
+  if (!bin) return Promise.reject(new Error("codex binary not found"))
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, ["app-server"], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true })
+    let done = false
+    const finish = (err: Error | null, val?: any) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      try { child.stdin.end() } catch {}
+      try { child.kill() } catch {}
+      err ? reject(err) : resolve(val)
+    }
+    const timer = setTimeout(() => finish(new Error("app-server timed out")), USAGE_TIMEOUT_MS)
+    const send = (msg: Record<string, unknown>) => child.stdin.write(JSON.stringify(msg) + "\n")
+    child.on("error", (e) => finish(e))
+    child.on("exit", (code) => finish(new Error(`app-server exited (${code})`)))
+    createInterface({ input: child.stdout }).on("line", (line) => {
+      let msg: any
+      try { msg = JSON.parse(line) } catch { return }
+      if (msg.id === 1) {
+        if (msg.error) return finish(new Error(`initialize: ${msg.error.message || "error"}`))
+        send({ method: "initialized" })
+        send({ id: 2, method: "account/rateLimits/read" })
+      } else if (msg.id === 2) {
+        if (msg.error) return finish(new Error(`rateLimits/read: ${msg.error.message || "error"}`))
+        finish(null, msg.result)
+      }
+    })
+    send({ id: 1, method: "initialize",
+           params: { clientInfo: { name: "atn-codex-bridge", title: null, version: "1.0.0" } } })
+  })
+}
+
+async function handleGetUsage(req: GetUsageRequest): Promise<void> {
+  try {
+    const result = await readCodexRateLimits()
+    const byId = result?.rateLimitsByLimitId || {}
+    const snap = byId.codex || result?.rateLimits
+    const windows = mapCodexSnapshot(snap)
+    if (Object.keys(windows).length === 0) {
+      respond({ id: req.id, ok: true, available: false, reason: "no rate-limit windows reported",
+                plan_type: snap?.planType ?? null })
+      return
+    }
+    respond({ id: req.id, ok: true, available: true, plan_type: snap?.planType ?? null,
+              rate_limits: windows })
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e)
+    log("get_usage failed", { error: reason })
+    respond({ id: req.id, ok: true, available: false, reason })
+  }
 }
 
 // -- Handle create request (single-turn) --
@@ -700,6 +835,10 @@ async function handleRequest(req: BridgeRequest): Promise<void> {
 
     case "ping":
       respond({ id: req.id, ok: true })
+      break
+
+    case "get_usage":
+      await handleGetUsage(req as GetUsageRequest)
       break
 
     case "shutdown": {

@@ -240,6 +240,11 @@ _BRIDGE_SCRIPT = _BRIDGE_DIR / "claude-bridge.ts"
 
 _EVENT_PREFIX = "@@EVENT@@"
 
+# Live subscription-usage reads (bridge get_usage) are throttled to one per
+# this many seconds; between reads the stream-event cache answers.
+_USAGE_MIN_INTERVAL = float(os.environ.get("ATN_USAGE_MIN_INTERVAL", "60"))
+_USAGE_TIMEOUT = 45.0
+
 # Wedge guard for the agent loop stdout loop. The SDK can legitimately go
 # a long time without stdout traffic (its built-in tools run inside the
 # subprocess), but stderr events keep flowing while it works. "Wedged" is
@@ -294,6 +299,8 @@ class BridgeProvider(Provider):
 
     # One subscription, one cache: shared by every instance (see __init__).
     _shared_rate_limits: dict[str, dict[str, Any]] = {}
+    # Monotonic time of the last live get_usage read (shared throttle).
+    _shared_usage_fetched_at: float = 0.0
 
     # The SDK owns the agentic loop — this provider cannot inject the v3
     # closing review turn mid-loop. The caller (execution engine / worker
@@ -1172,99 +1179,55 @@ class BridgeProvider(Provider):
             log.warning("Failed to send interrupt (bridge stdin broken)")
 
     async def refresh_usage(self) -> dict[str, Any]:
-        """Fetch subscription-window utilization for Claude Max.
+        """Return subscription-window utilization for Claude Max.
 
-        Anthropic's `/v1/messages` endpoint returns `anthropic-ratelimit-unified-*`
-        response headers on every successful call. These headers carry the same
-        five-hour / seven-day utilization that Claude Code's `/usage` slash
-        command displays. The SDK's stream-event API does NOT emit these
-        consistently, so we make a minimal API call ourselves and read the
-        headers directly.
-
-        Stores the parsed result on ``self._rate_limits`` and returns it.
-        Reads the OAuth token from ``~/.claude/.credentials.json``.
+        Source: the bridge's ``get_usage`` request, which asks the Claude
+        Agent SDK for the data behind Claude Code's ``/usage`` (a control
+        request; no model call, the CLI reads its own login). Throttled to
+        one live read per ``_USAGE_MIN_INTERVAL`` across all instances, and
+        skipped while this bridge is busy (an agent loop holds the stdout
+        reader; its rate_limit stream events keep the cache warm). Any
+        failure falls back to the cached stream-event data.
         """
-        import time
-        from pathlib import Path
+        await self._refresh_usage_live()
+        return dict(self._rate_limits)
+
+    async def _refresh_usage_live(self) -> bool:
+        """One throttled live read. True when a fresh reading landed."""
+        cls = BridgeProvider
+        now = time.monotonic()
+        if cls._shared_usage_fetched_at and now - cls._shared_usage_fetched_at < _USAGE_MIN_INTERVAL:
+            return False
+        if self._lock.locked():
+            return False
+        cls._shared_usage_fetched_at = now
         try:
-            import httpx
-        except ImportError:
-            log.warning("httpx not installed — cannot refresh usage")
-            return dict(self._rate_limits)
-
-        creds_path = Path.home() / ".claude" / ".credentials.json"
-        if not creds_path.exists():
-            log.warning("Claude credentials file not found at %s", creds_path)
-            return dict(self._rate_limits)
-        try:
-            creds = json.loads(creds_path.read_text(encoding="utf-8"))
-            token = creds.get("claudeAiOauth", {}).get("accessToken", "")
-        except Exception as exc:
-            log.warning("Failed to read Claude credentials: %s", exc)
-            return dict(self._rate_limits)
-        if not token:
-            log.warning("No OAuth token found in credentials")
-            return dict(self._rate_limits)
-
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "anthropic-version": "2023-06-01",
-                        "anthropic-beta": "oauth-2025-04-20",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": "claude-haiku-4-5",
-                        "max_tokens": 1,
-                        "messages": [{"role": "user", "content": "hi"}],
-                    },
-                )
-        except Exception as exc:
-            log.warning("Usage probe request failed: %s", exc)
-            return dict(self._rate_limits)
-
-        h = resp.headers
-        # Parse the anthropic-ratelimit-unified-* headers into our existing
-        # _rate_limits shape (keyed by rateLimitType).
-        def _parse_window(prefix: str, key: str) -> dict[str, Any] | None:
-            status = h.get(f"anthropic-ratelimit-unified-{prefix}-status")
-            util = h.get(f"anthropic-ratelimit-unified-{prefix}-utilization")
-            reset = h.get(f"anthropic-ratelimit-unified-{prefix}-reset")
-            if status is None and util is None and reset is None:
-                return None
-            return {
-                "status": status or "unknown",
-                "rateLimitType": key,
-                "utilization": float(util) if util is not None else None,
-                "resetsAt": int(reset) if reset is not None else None,
-                "updatedAt": int(time.time() * 1000),
-            }
-
-        windows = {
-            "five_hour": _parse_window("5h", "five_hour"),
-            "seven_day": _parse_window("7d", "seven_day"),
-            "overage": _parse_window("overage", "overage"),
-        }
-        for key, entry in windows.items():
-            if entry is not None:
-                self._rate_limits[key] = entry
+            resp = await asyncio.wait_for(
+                self._send_request({"type": "get_usage"}), timeout=_USAGE_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("refresh_usage: bridge get_usage failed: %s", exc)
+            return False
+        if not resp.get("ok") or not resp.get("available"):
+            log.info("refresh_usage: usage unavailable (%s)",
+                     resp.get("reason") or resp.get("error") or "unknown")
+            return False
+        for key, entry in (resp.get("rate_limits") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            prev = self._rate_limits.get(key) or {}
+            self._rate_limits[key] = {**prev, **entry}
+        five_h = self._rate_limits.get("five_hour")
         log.info(
-            "refresh_usage: 5h=%s, 7d=%s, overage=%s",
-            windows.get("five_hour", {}).get("utilization") if windows.get("five_hour") else "?",
-            windows.get("seven_day", {}).get("utilization") if windows.get("seven_day") else "?",
-            windows.get("overage", {}).get("utilization") if windows.get("overage") else "?",
+            "refresh_usage: 5h=%s, 7d=%s",
+            (five_h or {}).get("utilization"),
+            (self._rate_limits.get("seven_day") or {}).get("utilization"),
         )
-
         # Estimator snapshot: pair the 5h utilization with the cumulative-tokens
         # counter. Two consecutive non-reset snapshots give us a rolling
         # tokens-per-percent factor.
-        five_h = self._rate_limits.get("five_hour")
         if five_h and five_h.get("utilization") is not None:
             self._record_usage_snapshot(float(five_h["utilization"]))
-        return dict(self._rate_limits)
+        return True
 
     def _record_usage_snapshot(self, utilization: float) -> None:
         """Pair the 5h utilization reading with the per-class cumulative-tokens
@@ -1388,7 +1351,11 @@ class BridgeProvider(Provider):
         EMA so a single odd reading can't whipsaw the estimator.
         """
         prev_5h = (self._rate_limits.get("five_hour") or {}).get("utilization")
-        await self.refresh_usage()  # populates self._rate_limits and runs snapshot
+        if not await self._refresh_usage_live():
+            # Throttled or unavailable: keep accumulating the prediction
+            # until a real reading arrives to compare against.
+            return {"skipped": True,
+                    "predicted_pct": self._predicted_pct_since_refresh}
         new_5h = (self._rate_limits.get("five_hour") or {}).get("utilization")
 
         actual_pct_delta = None

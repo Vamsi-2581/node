@@ -114,6 +114,101 @@ function handleRateLimitEvent(msg: any): void {
   log("rate_limit", { type: key, utilization: info.utilization, status: info.status })
 }
 
+
+// -- Subscription usage (get_usage) --
+// The sanctioned source for plan utilization is the SDK's get_usage control
+// request (the data behind Claude Code's /usage). It is sent on a throwaway
+// query whose prompt iterable never yields, so no model call is made; the
+// CLI reads its own credentials. The method is experimental and its name
+// will change, so it is feature-detected: a missing method yields
+// available:false, never a crash and never a fallback to a direct API call.
+
+const USAGE_TIMEOUT_MS = 30_000
+
+function findUsageMethod(q: any): ((opts: any) => Promise<any>) | null {
+  const known = "usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET"
+  if (typeof q?.[known] === "function") return q[known].bind(q)
+  for (const name of ["usage", "getUsage"]) {
+    if (typeof q?.[name] === "function") return q[name].bind(q)
+  }
+  // Renamed experimental method: anything shaped usage_EXPERIMENTAL*.
+  let proto = q
+  while (proto && proto !== Object.prototype) {
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      if (/^usage_?experimental/i.test(name) && typeof q[name] === "function") return q[name].bind(q)
+    }
+    proto = Object.getPrototypeOf(proto)
+  }
+  return null
+}
+
+function isoToEpochSeconds(iso: unknown): number | undefined {
+  if (typeof iso !== "string" || !iso) return undefined
+  const ms = Date.parse(iso)
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined
+}
+
+// Map the get_usage reply onto the RateLimitEntry shape the rate_limit
+// stream events already use (utilization 0-1, resetsAt epoch seconds).
+function mapUsageWindows(rateLimits: Record<string, any> | null | undefined): Record<string, RateLimitEntry> {
+  const out: Record<string, RateLimitEntry> = {}
+  if (!rateLimits || typeof rateLimits !== "object") return out
+  const now = Date.now()
+  for (const [key, win] of Object.entries(rateLimits)) {
+    // Only the documented plan windows with a real reading; unnamed or
+    // codenamed entries (and extra_usage, which is spend, not a window)
+    // would render as stray tiles on the provider card.
+    if (!/^(five_hour|seven_day)/.test(key)) continue
+    if (!win || typeof win !== "object" || typeof win.utilization !== "number") continue
+    const util = win.utilization / 100
+    out[key] = {
+      status: util >= 1 ? "rejected" : "allowed",
+      rateLimitType: key,
+      utilization: util,
+      resetsAt: isoToEpochSeconds(win.resets_at),
+      updatedAt: now,
+    }
+  }
+  return out
+}
+
+async function fetchUsage(): Promise<BridgeResponse & { id: string }> {
+  const idle: AsyncIterable<SDKUserMessage> = {
+    [Symbol.asyncIterator]: () => ({ next: () => new Promise<IteratorResult<SDKUserMessage>>(() => {}) }),
+  }
+  const q = query({
+    prompt: idle,
+    options: {
+      pathToClaudeCodeExecutable: claudeExecutable,
+      tools: [],
+      settingSources: [],
+      strictMcpConfig: true,
+      persistSession: false,
+    } as Options,
+  })
+  try {
+    const fn = findUsageMethod(q)
+    if (!fn) return { id: "", ok: true, available: false, reason: "sdk has no usage method" }
+    const resp: any = await Promise.race([
+      fn({ skipBehaviors: true }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("get_usage timed out")), USAGE_TIMEOUT_MS)),
+    ])
+    if (!resp?.rate_limits_available || !resp?.rate_limits) {
+      return { id: "", ok: true, available: false, reason: "plan rate limits unavailable",
+               subscription_type: resp?.subscription_type ?? null }
+    }
+    const windows = mapUsageWindows(resp.rate_limits)
+    for (const [key, entry] of Object.entries(windows)) {
+      const prev = rateLimitSnapshot[key]
+      rateLimitSnapshot[key] = { ...(prev || {}), ...entry }
+    }
+    return { id: "", ok: true, available: true, subscription_type: resp.subscription_type ?? null,
+             rate_limits: windows }
+  } finally {
+    try { q.close() } catch {}
+  }
+}
+
 // -- Global error handlers --
 //
 // A swallowed error is the root of the haiku hot-spin: the SDK's query()
@@ -693,6 +788,11 @@ interface PingRequest {
   type: "ping"
 }
 
+interface GetUsageRequest {
+  id: string
+  type: "get_usage"
+}
+
 interface ToolResultMessage {
   type: "tool_result"
   call_id: string
@@ -714,7 +814,7 @@ interface SessionContextRequest {
   session_id: string
 }
 
-type BridgeRequest = CreateRequest | AgentLoopRequest | DeleteRequest | ShutdownRequest | PingRequest | SessionContextRequest
+type BridgeRequest = CreateRequest | AgentLoopRequest | DeleteRequest | ShutdownRequest | PingRequest | SessionContextRequest | GetUsageRequest
 
 interface BridgeResponse {
   id: string
@@ -741,6 +841,11 @@ interface BridgeResponse {
   // session_context response
   messages?: Array<{ role: string; content: string }>
   stats?: Record<string, unknown>
+  // get_usage response
+  available?: boolean
+  reason?: string
+  subscription_type?: string | null
+  rate_limits?: Record<string, RateLimitEntry>
 }
 
 // -- Response writer --
@@ -1286,6 +1391,18 @@ async function handleRequest(req: BridgeRequest): Promise<void> {
 
     case "ping": {
       respond({ id: req.id, ok: true, type: "pong" })
+      break
+    }
+
+    case "get_usage": {
+      try {
+        const r = await fetchUsage()
+        respond({ ...r, id: req.id })
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e)
+        log("get_usage failed", { error: reason })
+        respond({ id: req.id, ok: true, available: false, reason })
+      }
       break
     }
 
