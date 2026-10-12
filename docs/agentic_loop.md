@@ -285,6 +285,24 @@ live "Compacting…" indicator while in_progress, updated compaction chip
 on completed, visually distinct warning on hard_truncated; a "Compact"
 action (owner UI) sends `{"type": "compact_agent", "agent_id": ...}`.
 
+## §17 Non-blocking shell tools (2026-10-12)
+
+Ideas below §17 are ported from OpenAI Codex CLI (reimplemented, not
+copied). Shell executors (`atn/shell_tools.py`) are coroutines awaited
+on the daemon/worker event loop, so none may block it:
+- `bash` and `search_files` run through `asyncio.create_subprocess_*`
+  with stdout+stderr merged (interleaved in write order) and stdin
+  closed (a prompting command fails fast instead of hanging).
+- On timeout the whole process tree is killed (`taskkill /F /T` on
+  Windows, `killpg` on POSIX, where the child gets its own session) and
+  the partial output is returned with the error. Cancellation of the
+  run also kills the tree.
+- Output keeps head (30k) + tail (20k) chars, middle elided, instead
+  of a head-only chop, so the final status and last traceback survive.
+  Capture is bounded in memory (128 KiB head + 96 KiB rolling tail).
+- `read_file` / `write_file` / `edit_file` / `list_directory` do their
+  disk I/O in a worker thread (`asyncio.to_thread`).
+
 ## Testing (targeted only, never the full suite)
 
 New/updated files: `tests/atn/test_loop_hardening.py` (§1-§6, §8:

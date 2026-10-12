@@ -126,95 +126,263 @@ SHELL_TOOLS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 # Tool executors
 # ---------------------------------------------------------------------------
+#
+# Every executor is a coroutine awaited on the daemon's (or worker's) event
+# loop, so none of them may block it: subprocesses go through asyncio's
+# subprocess API and plain file I/O is pushed to a thread. A blocking
+# subprocess.run here used to freeze every other agent, the WS server and the
+# heartbeat for the full duration of a command.
+
+# Output kept from a command: head + tail, middle elided. The head carries the
+# command's own echo / first errors, the tail carries the final status and the
+# last traceback, which is where the signal usually is.
+_OUTPUT_HEAD_CHARS = 30_000
+_OUTPUT_TAIL_CHARS = 20_000
+# Bytes buffered per stream end while the command runs (memory bound for
+# commands that print megabytes).
+_CAPTURE_HEAD_BYTES = 128 * 1024
+_CAPTURE_TAIL_BYTES = 96 * 1024
+# Seconds to wait for a killed process tree to be reaped.
+_KILL_GRACE_S = 5.0
+
+
+def _head_tail(text: str, head: int = _OUTPUT_HEAD_CHARS,
+               tail: int = _OUTPUT_TAIL_CHARS) -> str:
+    """Keep the first ``head`` and last ``tail`` chars, eliding the middle."""
+    if len(text) <= head + tail:
+        return text
+    elided = len(text) - head - tail
+    return f"{text[:head]}\n...[{elided} chars elided]...\n{text[-tail:]}"
+
+
+class _Capture:
+    """Bounded byte capture: first N bytes + rolling last M bytes."""
+
+    def __init__(self) -> None:
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.dropped = 0
+
+    def feed(self, chunk: bytes) -> None:
+        room = _CAPTURE_HEAD_BYTES - len(self.head)
+        if room > 0:
+            self.head += chunk[:room]
+            chunk = chunk[room:]
+        if not chunk:
+            return
+        self.tail += chunk
+        over = len(self.tail) - _CAPTURE_TAIL_BYTES
+        if over > 0:
+            del self.tail[:over]
+            self.dropped += over
+
+    def text(self) -> str:
+        def _dec(b: bytes) -> str:
+            try:
+                return b.decode("utf-8")
+            except UnicodeDecodeError:
+                import locale
+                return b.decode(locale.getpreferredencoding(False) or "utf-8",
+                                errors="replace")
+        body = _dec(bytes(self.head))
+        if self.dropped:
+            body += f"\n...[{self.dropped} bytes elided]...\n"
+        return body + _dec(bytes(self.tail))
+
+
+async def _drain(stream: Any, cap: _Capture) -> None:
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return
+        cap.feed(chunk)
+
+
+def _kill_tree(proc: Any) -> None:
+    """Kill a subprocess and everything it spawned (best effort)."""
+    import os
+    import sys
+    if proc.returncode is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            # taskkill /T walks the child tree; proc.kill() alone would leave
+            # grandchildren (the real command under cmd.exe) running.
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        else:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)  # own session, see _run_process
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+async def _run_process(argv: list[str] | None, shell_cmd: str | None,
+                       timeout: float, cwd: str | None = None,
+                       ) -> tuple[int | None, str, bool]:
+    """Run a command without blocking the event loop.
+
+    Returns ``(exit_code, merged_output, timed_out)``. stdout and stderr are
+    merged so they interleave in the order the command wrote them; stdin is
+    closed so a command that prompts fails fast instead of hanging. On timeout
+    the whole process tree is killed and the partial output is returned.
+    """
+    import asyncio
+    import sys
+    kwargs: dict[str, Any] = {
+        "stdin": asyncio.subprocess.DEVNULL,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.STDOUT,
+        "cwd": cwd,
+    }
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True  # killpg target on timeout
+    if shell_cmd is not None:
+        proc = await asyncio.create_subprocess_shell(shell_cmd, **kwargs)
+    else:
+        proc = await asyncio.create_subprocess_exec(*(argv or []), **kwargs)
+    cap = _Capture()
+    reader = asyncio.ensure_future(_drain(proc.stdout, cap))
+    timed_out = False
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        timed_out = True
+        await asyncio.to_thread(_kill_tree, proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_KILL_GRACE_S)
+        except asyncio.TimeoutError:
+            pass
+    except asyncio.CancelledError:
+        # Interrupted run: never leave the command running behind us.
+        _kill_tree(proc)
+        reader.cancel()
+        raise
+    try:
+        await asyncio.wait_for(reader, timeout=_KILL_GRACE_S)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # A detached grandchild can hold the pipe open after the shell exits.
+        reader.cancel()
+    return proc.returncode, cap.text(), timed_out
+
 
 async def exec_bash(inp: dict) -> dict:
-    """Execute a shell command."""
+    """Execute a shell command (non-blocking; head+tail of merged output)."""
     cmd = inp.get("command", "")
-    timeout = inp.get("timeout", 120)
     try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            timeout=timeout, cwd=str(Path.cwd()),
-        )
-        output = result.stdout
-        if result.stderr:
-            output += ("\n" if output else "") + result.stderr
-        return {"output": output[:50000], "exit_code": result.returncode}
-    except subprocess.TimeoutExpired:
-        return {"error": f"Command timed out after {timeout}s"}
+        timeout = float(inp.get("timeout", 120) or 120)
+    except (TypeError, ValueError):
+        timeout = 120.0
+    try:
+        code, output, timed_out = await _run_process(
+            None, cmd, timeout, cwd=str(Path.cwd()))
     except Exception as e:
         return {"error": str(e)}
+    output = _head_tail(output)
+    if timed_out:
+        return {
+            "error": f"Command timed out after {timeout:g}s (process tree killed)",
+            "output": output,
+        }
+    return {"output": output, "exit_code": code}
+
+
+def _read_file_sync(inp: dict) -> dict:
+    p = Path(inp["path"])
+    if not p.exists():
+        return {"error": f"File not found: {p}"}
+    text = p.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    offset = max(0, inp.get("offset", 1) - 1)
+    limit = inp.get("limit", len(lines))
+    selected = lines[offset:offset + limit]
+    numbered = [f"{i + offset + 1}\t{line}" for i, line in enumerate(selected)]
+    return {"content": "".join(numbered)[:100000]}
 
 
 async def exec_read_file(inp: dict) -> dict:
-    """Read a file."""
+    """Read a file (disk I/O off the event loop)."""
+    import asyncio
     try:
-        p = Path(inp["path"])
-        if not p.exists():
-            return {"error": f"File not found: {p}"}
-        text = p.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines(keepends=True)
-        offset = max(0, inp.get("offset", 1) - 1)
-        limit = inp.get("limit", len(lines))
-        selected = lines[offset:offset + limit]
-        numbered = [f"{i + offset + 1}\t{line}" for i, line in enumerate(selected)]
-        return {"content": "".join(numbered)[:100000]}
+        return await asyncio.to_thread(_read_file_sync, inp)
     except Exception as e:
         return {"error": str(e)}
+
+
+def _write_file_sync(inp: dict) -> dict:
+    p = Path(inp["path"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(inp["content"], encoding="utf-8")
+    return {"status": "ok", "path": str(p), "bytes": len(inp["content"])}
 
 
 async def exec_write_file(inp: dict) -> dict:
     """Write a file."""
+    import asyncio
     try:
-        p = Path(inp["path"])
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(inp["content"], encoding="utf-8")
-        return {"status": "ok", "path": str(p), "bytes": len(inp["content"])}
+        return await asyncio.to_thread(_write_file_sync, inp)
     except Exception as e:
         return {"error": str(e)}
+
+
+def _edit_file_sync(inp: dict) -> dict:
+    p = Path(inp["path"])
+    if not p.exists():
+        return {"error": f"File not found: {p}"}
+    old = inp["old_string"]
+    new = inp["new_string"]
+    if old == new:
+        return {"error": "old_string and new_string are identical"}
+    text = p.read_text(encoding="utf-8")
+    count = text.count(old)
+    if count == 0:
+        return {"error": "old_string not found in file — read the file and match it exactly"}
+    if count > 1 and not inp.get("replace_all"):
+        return {"error": f"old_string occurs {count} times — add surrounding context to make it unique, or set replace_all"}
+    replaced = text.replace(old, new) if inp.get("replace_all") else text.replace(old, new, 1)
+    p.write_text(replaced, encoding="utf-8")
+    return {"status": "ok", "path": str(p), "replacements": count if inp.get("replace_all") else 1}
 
 
 async def exec_edit_file(inp: dict) -> dict:
     """Exact-string replacement in a file."""
+    import asyncio
     try:
-        p = Path(inp["path"])
-        if not p.exists():
-            return {"error": f"File not found: {p}"}
-        old = inp["old_string"]
-        new = inp["new_string"]
-        if old == new:
-            return {"error": "old_string and new_string are identical"}
-        text = p.read_text(encoding="utf-8")
-        count = text.count(old)
-        if count == 0:
-            return {"error": "old_string not found in file — read the file and match it exactly"}
-        if count > 1 and not inp.get("replace_all"):
-            return {"error": f"old_string occurs {count} times — add surrounding context to make it unique, or set replace_all"}
-        replaced = text.replace(old, new) if inp.get("replace_all") else text.replace(old, new, 1)
-        p.write_text(replaced, encoding="utf-8")
-        return {"status": "ok", "path": str(p), "replacements": count if inp.get("replace_all") else 1}
+        return await asyncio.to_thread(_edit_file_sync, inp)
     except Exception as e:
         return {"error": str(e)}
 
 
+def _list_dir_sync(inp: dict) -> dict:
+    p = Path(inp["path"])
+    if not p.is_dir():
+        return {"error": f"Not a directory: {p}"}
+    entries = []
+    for item in sorted(p.iterdir()):
+        kind = "dir" if item.is_dir() else "file"
+        size = item.stat().st_size if item.is_file() else 0
+        entries.append({"name": item.name, "type": kind, "size": size})
+    return {"entries": entries[:500]}
+
+
 async def exec_list_dir(inp: dict) -> dict:
     """List directory."""
+    import asyncio
     try:
-        p = Path(inp["path"])
-        if not p.is_dir():
-            return {"error": f"Not a directory: {p}"}
-        entries = []
-        for item in sorted(p.iterdir()):
-            kind = "dir" if item.is_dir() else "file"
-            size = item.stat().st_size if item.is_file() else 0
-            entries.append({"name": item.name, "type": kind, "size": size})
-        return {"entries": entries[:500]}
+        return await asyncio.to_thread(_list_dir_sync, inp)
     except Exception as e:
         return {"error": str(e)}
 
 
 async def exec_search_files(inp: dict) -> dict:
-    """Search files with grep."""
+    """Search files with ripgrep (grep fallback), without blocking the loop."""
     pattern = inp.get("pattern", "")
     path = inp.get("path", str(Path.cwd()))
     glob_pat = inp.get("glob", "")
@@ -222,18 +390,18 @@ async def exec_search_files(inp: dict) -> dict:
     if glob_pat:
         cmd.extend(["--glob", glob_pat])
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        return {"matches": result.stdout[:50000]}
-    except FileNotFoundError:
-        # rg not available, fall back to grep
-        cmd = ["grep", "-rn", pattern, path]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            return {"matches": result.stdout[:50000]}
-        except Exception as e:
-            return {"error": str(e)}
+            _code, out, timed_out = await _run_process(cmd, None, 30)
+        except FileNotFoundError:
+            # rg not available, fall back to grep
+            _code, out, timed_out = await _run_process(
+                ["grep", "-rn", pattern, path], None, 30)
     except Exception as e:
         return {"error": str(e)}
+    result: dict[str, Any] = {"matches": _head_tail(out, 35_000, 15_000)}
+    if timed_out:
+        result["error"] = "search timed out after 30s (partial matches shown)"
+    return result
 
 
 SHELL_TOOL_EXECUTORS: dict[str, Any] = {
