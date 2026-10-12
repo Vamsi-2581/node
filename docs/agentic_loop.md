@@ -368,6 +368,21 @@ acquisition. Results are appended in the original call order.
   with malformed args is never part of a parallel batch and is not
   executed. An executor exception now also marks its result `is_error`.
 
+## §22 Per-run plan tool (`update_plan`)
+
+Every generic-loop run that has a tool surface and an executor gets
+`update_plan` (`UPDATE_PLAN_TOOL`): `{plan: [{step, status}],
+explanation?}`, status one of pending / in_progress / completed, at most
+one in_progress, max 50 steps. Each call replaces the whole plan.
+- Handled by the loop, never by `tool_executor`: validated, stored in
+  run state (`_run_plan`, `_run_plan_explanation`, reset per run),
+  answered `Plan updated.` or an `is_error` result. A `STEP_OUTPUT`
+  event with `channel: "plan"` carries the plan to the UI.
+- Survives context reduction: `format_plan` text is inserted verbatim
+  into the compaction summary message, the `_hard_truncate` head and the
+  tier-3 hard-reset notice (not left to the summarizer).
+- Bridge providers keep their own SDK todo tooling; unaffected.
+
 ## Testing (targeted only, never the full suite)
 
 New/updated files: `tests/atn/test_loop_hardening.py` (§1-§6, §8:

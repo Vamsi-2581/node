@@ -452,3 +452,90 @@ class TestParallelTools:
         r = await p.run_agent_loop(message="go", tools=[{"name": "read_file"}],
                                    tool_executor=_Recorder(0))
         assert r.stop_reason in ("repeat_call_limit", "loop_detected")
+
+
+# ---------------------------------------------------------------------------
+# §22 update_plan
+# ---------------------------------------------------------------------------
+
+from atn.providers.base import UPDATE_PLAN_TOOL, format_plan  # noqa: E402
+
+
+class _ToolsSpy(ScriptedProvider):
+    async def send_stream(self, *, tools=None, **kw):
+        self.last_tools = tools
+        return await super().send_stream(tools=tools, **kw)
+
+
+_PLAN = {"explanation": "start", "plan": [
+    {"step": "read code", "status": "completed"},
+    {"step": "write fix", "status": "in_progress"},
+    {"step": "run tests", "status": "pending"},
+]}
+
+
+class TestUpdatePlan:
+    async def test_tool_exposed_and_handled_without_executor(self):
+        executed = []
+
+        async def ex(name, inp):
+            executed.append(name)
+            return "ok"
+
+        p = _ToolsSpy([
+            _resp(tool_calls=[ToolCall(id="p1", name="update_plan", input=_PLAN)],
+                  stop_reason="tool_use"),
+            _resp(text="done", stop_reason="end_turn"),
+        ])
+        await p.run_agent_loop(message="go", tools=[{"name": "bash"}], tool_executor=ex)
+        assert "update_plan" in [t.name for t in p.last_tools]
+        assert executed == []
+        (tr,) = _tool_results(p.seen_messages[1])
+        assert tr["content"] == "Plan updated."
+        assert [s["status"] for s in p._run_plan] == ["completed", "in_progress", "pending"]
+
+    async def test_not_added_without_tools(self):
+        p = _ToolsSpy([_resp(text="hi", stop_reason="end_turn")])
+        await p.run_agent_loop(message="go", tools=[], tool_executor=_noop)
+        assert not p.last_tools
+
+    async def test_invalid_plan_is_error(self):
+        bad = {"plan": [{"step": "a", "status": "in_progress"},
+                        {"step": "b", "status": "in_progress"}]}
+        p = ScriptedProvider([
+            _resp(tool_calls=[ToolCall(id="p1", name="update_plan", input=bad)],
+                  stop_reason="tool_use"),
+            _resp(text="done", stop_reason="end_turn"),
+        ])
+        await p.run_agent_loop(message="go", tools=[{"name": "bash"}], tool_executor=_noop)
+        (tr,) = _tool_results(p.seen_messages[1])
+        assert tr.get("is_error") and "in_progress" in tr["content"]
+        assert p._run_plan == []
+
+    async def test_plan_survives_compaction_and_hard_truncate(self):
+        p = ScriptedProvider([])
+        p._apply_plan_update(_PLAN)
+        out = await p._compact_messages(_long_history(), system="S", model="m")
+        assert "[Current plan]" in out[0]["content"]
+        assert "[in_progress] write fix" in out[0]["content"]
+        p2 = ScriptedProvider([], summary_responses=[RuntimeError("down")])
+        p2._apply_plan_update(_PLAN)
+        out2 = await p2._compact_messages(_long_history(), system="S", model="m")
+        assert "Context truncated" in out2[0]["content"]
+        assert "[pending] run tests" in out2[0]["content"]
+
+    def test_plan_in_hard_reset_digest(self):
+        p = ScriptedProvider([])
+        p._apply_plan_update(_PLAN)
+        msgs = _long_history()
+        assert p._try_hard_reset(msgs, "TASK")
+        assert "[Current plan]" in msgs[0]["content"]
+        assert "Note: start" in msgs[0]["content"]
+
+    def test_format_plan_empty(self):
+        assert format_plan([]) == ""
+        assert UPDATE_PLAN_TOOL["input_schema"]["required"] == ["plan"]
+
+
+async def _noop(name, inp):
+    return "ok"

@@ -151,6 +151,60 @@ COMPACTION_INLINE_PROMPT = (
 )
 
 
+# §22 Per-run plan tool. Handled by the generic loop itself: the plan is stored
+# in run state (never executed by tool_executor) and carried through
+# compaction and hard resets so it survives context reduction.
+_PLAN_STATUSES: tuple[str, ...] = ("pending", "in_progress", "completed")
+_PLAN_MAX_STEPS = 50
+
+UPDATE_PLAN_TOOL: dict[str, Any] = {
+    "name": "update_plan",
+    "description": (
+        "Record or revise your step-by-step plan for the current task. Send "
+        "the complete list every time (it replaces the previous one). Each "
+        "step has a short description and a status: pending, in_progress or "
+        "completed; keep at most one step in_progress. Use it for multi-step "
+        "work so progress stays visible and survives context compaction; "
+        "skip it for trivial one-step tasks. It does not run anything."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "explanation": {
+                "type": "string",
+                "description": "Optional note on why the plan changed.",
+            },
+            "plan": {
+                "type": "array",
+                "description": "The full ordered list of steps.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step": {"type": "string"},
+                        "status": {"type": "string", "enum": list(_PLAN_STATUSES)},
+                    },
+                    "required": ["step", "status"],
+                },
+            },
+        },
+        "required": ["plan"],
+    },
+}
+
+
+def format_plan(plan: list[dict[str, str]] | None, explanation: str = "") -> str:
+    """Render the run plan as text for compaction / reset messages (§22).
+    Empty string when there is no plan."""
+    if not plan:
+        return ""
+    lines = ["[Current plan]"]
+    if explanation:
+        lines.append(f"Note: {explanation}")
+    for i, item in enumerate(plan, 1):
+        lines.append(f"{i}. [{item.get('status', '')}] {item.get('step', '')}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Canonical data types
 # ---------------------------------------------------------------------------
@@ -284,6 +338,9 @@ class Provider(ABC):
     _live_max_tokens: int = 0
     # Tool definitions of the current run (§20: reused by the compactor).
     _run_tool_defs: Any = None
+    # Per-run plan (§22), set by the update_plan tool. Reset each run.
+    _run_plan: list = []
+    _run_plan_explanation: str = ""
 
     @property
     def session_stats(self) -> dict[str, Any]:
@@ -496,6 +553,16 @@ class Provider(ABC):
         # Track active model for session stats
         if model:
             self._active_model = model
+
+        # §22: the per-run plan tool rides on every generic-loop tool surface.
+        # It is handled by the loop itself (never reaches tool_executor).
+        self._run_plan = []
+        self._run_plan_explanation = ""
+        if tools and tool_executor is not None and not any(
+            isinstance(t, dict) and t.get("name") == UPDATE_PLAN_TOOL["name"]
+            for t in tools
+        ):
+            tools = [*tools, UPDATE_PLAN_TOOL]
 
         # Convert tool dicts to ToolDefinition objects for send_stream()
         tool_defs: list[ToolDefinition] | None = None
@@ -994,6 +1061,29 @@ class Provider(ABC):
 
             async def _run_one(tc: ToolCall) -> dict[str, Any]:
                 """Execute one tool call; always returns its tool_result block."""
+                if tc.name == UPDATE_PLAN_TOOL["name"] and not _is_malformed_args(tc.input):
+                    # §22: plan lives in run state; nothing is executed.
+                    err = Provider._apply_plan_update(self, tc.input or {})
+                    if not err and self.event_bus and self.source_agent_id:
+                        from ..events import Event, EventType
+                        await self.event_bus.emit(Event(
+                            type=EventType.STEP_OUTPUT,
+                            source=self.source_agent_id,
+                            data={
+                                "agent_id": self.source_agent_id,
+                                "channel": "plan",
+                                "plan": list(self._run_plan),
+                                "explanation": self._run_plan_explanation,
+                            },
+                        ))
+                    block = {
+                        "type": "tool_result",
+                        "tool_use_id": tc.id,
+                        "content": f"Error: {err}" if err else "Plan updated.",
+                    }
+                    if err:
+                        block["is_error"] = True
+                    return block
                 # §8: malformed tool arguments. When an adapter can't parse the
                 # tool-call args as JSON it degrades them to {"raw": <text>}.
                 # Do NOT execute — synthesize an error tool_result telling the
@@ -1102,6 +1192,36 @@ class Provider(ABC):
 
         # Exhausted max_turns — return last response with accumulated usage
         return Provider._finalize_agent_loop(self, response, messages, cumulative_usage)
+
+    def _apply_plan_update(self, args: dict[str, Any]) -> str:
+        """Validate and store an ``update_plan`` call (§22). Returns an error
+        string, or "" on success."""
+        plan = args.get("plan")
+        if not isinstance(plan, list):
+            return "'plan' must be a list of {step, status} objects"
+        clean: list[dict[str, str]] = []
+        in_progress = 0
+        for item in plan:
+            if not isinstance(item, dict):
+                return "each plan item must be an object with 'step' and 'status'"
+            step = str(item.get("step") or "").strip()
+            status = str(item.get("status") or "").strip()
+            if not step:
+                return "each plan item needs a non-empty 'step'"
+            if status not in _PLAN_STATUSES:
+                return (f"invalid status {status!r}; use one of "
+                        + ", ".join(_PLAN_STATUSES))
+            in_progress += status == "in_progress"
+            clean.append({"step": step[:500], "status": status})
+        if in_progress > 1:
+            return "at most one step may be in_progress"
+        if len(clean) > _PLAN_MAX_STEPS:
+            return f"plan too long (max {_PLAN_MAX_STEPS} steps)"
+        self._run_plan = clean
+        expl = args.get("explanation")
+        if isinstance(expl, str):
+            self._run_plan_explanation = expl.strip()[:1000]
+        return ""
 
     def _finalize_agent_loop(
         self,
@@ -1354,7 +1474,9 @@ class Provider(ABC):
             "was cleared. Everything you already did is preserved ON DISK — "
             "do not repeat prior exploration. Record of your actions so far:\n"
             f"{digest}\n\n"
-            "Resume from that state and finish the task. Re-read only what "
+            + (f"{_plan}\n\n" if (_plan := format_plan(
+                self._run_plan, self._run_plan_explanation)) else "")
+            + "Resume from that state and finish the task. Re-read only what "
             "you need, keep tool output small, and delegate any remaining "
             "broad exploration to child agents."
         )
@@ -1436,7 +1558,10 @@ class Provider(ABC):
                 "Compaction summary failed (%s) — falling back to hard "
                 "truncation for agent %s", exc, self.source_agent_id or "?",
             )
-            compacted = _hard_truncate(messages, original_request, retained_tail)
+            compacted = _hard_truncate(
+                messages, original_request, retained_tail,
+                plan_text=format_plan(self._run_plan, self._run_plan_explanation),
+            )
             if self.event_bus and self.source_agent_id:
                 from ..events import Event, EventType
                 await self.event_bus.emit(Event(
@@ -1454,12 +1579,15 @@ class Provider(ABC):
 
         # Rebuild: summary message + retained tail (original task rides in the
         # summary header so it survives even if it fell outside the tail).
+        # §22: the run plan is carried verbatim, not left to the summarizer.
+        _plan_text = format_plan(self._run_plan, self._run_plan_explanation)
         compacted: list[dict[str, Any]] = [
             {"role": "user", "content": (
                 f"[Context compaction — conversation summary follows]\n\n"
                 f"{summary_text}\n\n"
                 f"---\n\n"
-                f"[Original request]\n{original_request}\n\n"
+                + (f"{_plan_text}\n\n" if _plan_text else "")
+                + f"[Original request]\n{original_request}\n\n"
                 f"Continue from where you left off. Do not repeat completed work."
             )},
         ]
@@ -2072,15 +2200,18 @@ def _hard_truncate(
     messages: list[dict[str, Any]],
     original_request: str,
     retained_tail: list[dict[str, Any]],
+    plan_text: str = "",
 ) -> list[dict[str, Any]]:
     """Fallback when the summarizer fails (§2): drop oldest, keep the tail.
 
     Never a no-op — always returns a strictly smaller list than the input when
     there is anything to drop, so an overflow can't recur unchanged.
+    ``plan_text`` (§22) carries the run plan across the truncation.
     """
     head = {"role": "user", "content": (
         f"[Context truncated — older history dropped after a summarizer failure]\n\n"
-        f"[Original request]\n{original_request}\n\n"
+        + (f"{plan_text}\n\n" if plan_text else "")
+        + f"[Original request]\n{original_request}\n\n"
         f"Continue from where you left off. Do not repeat completed work."
     )}
     return [head, *retained_tail]
