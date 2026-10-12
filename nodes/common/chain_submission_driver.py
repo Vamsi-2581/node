@@ -16,6 +16,18 @@ responsibilities:
     submits ``recordTrainingForEpoch``. Per-agent submission is
     inherently parallel — every agent does it independently.
 
+  - **Anchor signing round** (2026-10-12): Substrate only accepts an
+    anchor carrying EIP-712 AnchorApproval signatures from registered
+    agents whose delegated REP votes (at the previous anchor's
+    timestamp) strictly exceed the quorum share of REP supply (genesis:
+    a deployer-fixed signer set). Every daemon prepares the identical
+    anchor from the bit-identical close, signs the digest with each
+    local agent key, and gossips the signatures on
+    ``<event topic>/anchor-sig/1``. The rotating winner collects until
+    ``Substrate.anchorQuorum`` reports the quorum reached (or
+    ``signature_timeout`` elapses), then relays the anchor. A single
+    daemon whose own agents carry the quorum submits immediately.
+
 The anchor blob (off-chain) is written to a ``BlobResolver`` that
 the per-agent submitters read from. For single-process testing an
 ``InMemoryBlobResolver`` is fine; cross-daemon needs a libp2p-backed
@@ -24,8 +36,11 @@ resolver (Phase 10.3d).
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -34,6 +49,7 @@ from .authoritative_submitter import (
     AuthoritativeSubmissionResult,
     AuthoritativeSubmitterConfig,
 )
+from .anchor_auth import order_signatures, recover_signer, sign_digest
 from .blob_resolver import BlobResolver, InMemoryBlobResolver
 from .epoch_anchorer import (
     AnchorResult,
@@ -44,6 +60,11 @@ from .federated_close_driver import FederatedCloseResult
 
 
 logger = logging.getLogger(__name__)
+
+ANCHOR_SIG_TOPIC_SUFFIX = "/anchor-sig/1"
+# Bounded signature cache: digests kept, signers per digest.
+_MAX_DIGESTS = 16
+_MAX_SIGNERS_PER_DIGEST = 512
 
 
 @dataclass
@@ -84,6 +105,9 @@ class ChainSubmissionDriver:
         agent_chain_resolver: AgentChainResolver,
         blob_resolver: Optional[BlobResolver] = None,
         anchorer: Optional[EpochAnchorer] = None,
+        gossip: Optional[Any] = None,
+        signature_timeout: float = 60.0,
+        poll_interval: float = 1.0,
     ):
         self.config = config
         self._agent_resolver = agent_chain_resolver
@@ -98,6 +122,77 @@ class ChainSubmissionDriver:
         # Anchor side. Configurable so tests can pass an in-process
         # anchorer with eth_tester.
         self._anchorer = anchorer or self._build_anchorer()
+        # Anchor signing round: digest hex -> {signer address: signature}.
+        self.signature_timeout = float(signature_timeout)
+        self.poll_interval = float(poll_interval)
+        self._sig_cond = threading.Condition()
+        self._sig_pool: "OrderedDict[str, Dict[str, bytes]]" = OrderedDict()
+        self._sig_transport: Optional[Any] = None
+        self._sig_topic: str = ""
+        if gossip is not None:
+            self.attach_gossip(gossip)
+
+    # ------------------------------------------------------------------
+    # Signature gossip
+    # ------------------------------------------------------------------
+
+    def attach_gossip(self, gossip: Any) -> None:
+        """Subscribe to the anchor-signature topic next to the gossip's
+        event topic (same transport, same peer set)."""
+        transport = getattr(gossip, "transport", None)
+        topic = getattr(gossip, "topic", "")
+        if transport is None or not topic:
+            return
+        self._sig_transport = transport
+        self._sig_topic = topic + ANCHOR_SIG_TOPIC_SUFFIX
+        transport.subscribe(self._sig_topic, self._on_sig_message)
+
+    def _store_sig(self, digest_hex: str, sig: bytes) -> Optional[str]:
+        """Recover + store one signature. Returns the signer or None."""
+        try:
+            signer = recover_signer(bytes.fromhex(digest_hex), sig)
+        except Exception:
+            return None
+        with self._sig_cond:
+            bucket = self._sig_pool.get(digest_hex)
+            if bucket is None:
+                bucket = {}
+                self._sig_pool[digest_hex] = bucket
+                while len(self._sig_pool) > _MAX_DIGESTS:
+                    self._sig_pool.popitem(last=False)
+            if signer not in bucket and len(bucket) < _MAX_SIGNERS_PER_DIGEST:
+                bucket[signer] = bytes(sig)
+            self._sig_cond.notify_all()
+        return signer
+
+    def _on_sig_message(self, topic: str, data: bytes) -> None:
+        if topic != self._sig_topic:
+            return
+        try:
+            msg = json.loads(bytes(data).decode("utf-8"))
+            digest_hex = str(msg["digest"]).lower().removeprefix("0x")
+            sig = bytes.fromhex(str(msg["sig"]).removeprefix("0x"))
+            if len(bytes.fromhex(digest_hex)) != 32 or len(sig) != 65:
+                return
+        except Exception:
+            return
+        self._store_sig(digest_hex, sig)
+
+    def _publish_sig(self, epoch_id: str, digest_hex: str, sig: bytes) -> None:
+        if self._sig_transport is None:
+            return
+        msg = json.dumps({
+            "v": 1, "epoch_id": epoch_id, "digest": digest_hex,
+            "sig": sig.hex(),
+        }, sort_keys=True).encode("utf-8")
+        try:
+            self._sig_transport.publish(self._sig_topic, msg)
+        except Exception as e:
+            logger.warning("anchor signature publish failed: %s", e)
+
+    def signatures_for(self, digest_hex: str) -> List[bytes]:
+        with self._sig_cond:
+            return list((self._sig_pool.get(digest_hex) or {}).values())
 
     def _build_anchorer(self) -> Optional[EpochAnchorer]:
         if not self.config.substrate_address:
@@ -167,8 +262,10 @@ class ChainSubmissionDriver:
             except Exception as e:
                 logger.warning("carry-over bundle blob put failed: %s", e)
 
-        if fed.is_winner:
-            anchor_result = self._anchor(fed)
+        # Anchor signing round (every daemon), then the winner relays.
+        prepared = self._sign_round(fed, out)
+        if fed.is_winner and prepared is not None:
+            anchor_result = self._anchor(fed, prepared)
             out["anchored"] = anchor_result.success
             out["anchor_tx"] = anchor_result.tx_hash
             if not anchor_result.success:
@@ -182,9 +279,125 @@ class ChainSubmissionDriver:
         out["agent_submissions"] = agent_results
         return out
 
-    def _anchor(self, fed: FederatedCloseResult) -> AnchorResult:
+    def _sign_round(self, fed: FederatedCloseResult,
+                    out: Dict[str, Any]) -> Optional[Any]:
+        """Prepare the anchor, sign its digest with every local agent key,
+        gossip the signatures. Returns the PreparedAnchor, or None when
+        this daemon must not sign (stale snapshot, already anchored,
+        malformed close)."""
+        anchorer = self._anchorer
         try:
-            result = self._anchorer.anchor_close_result(fed.close_result)
+            if anchorer.is_anchored(fed.epoch_id):
+                out["sign_skipped"] = "already anchored"
+                return None
+            snap = getattr(fed, "snapshot_anchor_count", None)
+            if snap is not None:
+                count_fn = getattr(anchorer, "anchor_count", None)
+                if callable(count_fn):
+                    now = int(count_fn())
+                    if now != int(snap):
+                        # The close priced its pool at anchor #snap; the
+                        # chain moved, so the on-chain mintPool for this
+                        # anchor would differ. Never sign a stale close.
+                        out["sign_skipped"] = (
+                            f"stale snapshot (closed at anchorCount={snap}, "
+                            f"chain has {now})")
+                        logger.warning(
+                            "anchor signing skipped for epoch %s: %s",
+                            fed.epoch_id, out["sign_skipped"])
+                        return None
+            prepared = anchorer.prepare_anchor(fed.close_result)
+        except Exception as e:
+            logger.warning("anchor prepare failed for epoch %s: %s",
+                           fed.epoch_id, e)
+            out["sign_skipped"] = f"prepare failed: {e}"
+            return None
+
+        digest_hex = prepared.digest.hex()
+        out["anchor_digest"] = digest_hex
+        signed = 0
+        try:
+            agents = self._agent_resolver()
+        except Exception as e:
+            logger.warning("agent_chain_resolver failed: %s", e)
+            agents = []
+        for ident in agents:
+            if not ident.address or not ident.private_key:
+                continue
+            try:
+                sig = sign_digest(ident.private_key, prepared.digest)
+            except Exception as e:
+                logger.warning("anchor signing failed for %s: %s",
+                               ident.address, e)
+                continue
+            self._store_sig(digest_hex, sig)
+            self._publish_sig(fed.epoch_id, digest_hex, sig)
+            signed += 1
+        out["signatures_published"] = signed
+        return prepared
+
+    def _collect_quorum(self, prepared: Any) -> Dict[str, Any]:
+        """Wait (bounded) until the collected signatures meet the anchor
+        quorum per Substrate.anchorQuorum. Returns the last status plus
+        ``signatures``."""
+        digest_hex = prepared.digest.hex()
+        deadline = time.monotonic() + max(self.signature_timeout, 0.0)
+        status: Dict[str, Any] = {"reached": False}
+        seen = -1
+        while True:
+            sigs = self.signatures_for(digest_hex)
+            if len(sigs) != seen:
+                seen = len(sigs)
+                signers, ordered = order_signatures(prepared.digest, sigs)
+                try:
+                    # Only registered agents can carry weight; drop the
+                    # rest so junk signers cannot crowd the 64-signer cap.
+                    reg = self._anchorer.are_registered(signers) \
+                        if hasattr(self._anchorer, "are_registered") else None
+                    if reg is not None:
+                        keep = [i for i, ok in enumerate(reg) if ok]
+                        signers = [signers[i] for i in keep]
+                        ordered = [ordered[i] for i in keep]
+                    status = dict(self._anchorer.anchor_quorum(signers))
+                except Exception as e:
+                    status = {"reached": False, "error": str(e)}
+                status["signatures"] = ordered
+                status["signers"] = signers
+                if status.get("reached"):
+                    return status
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return status
+            with self._sig_cond:
+                self._sig_cond.wait(timeout=min(self.poll_interval, remaining))
+            # Re-query quorum at least once per poll even without new sigs
+            # (AnchorSnapshotNotFinal clears as blocks advance).
+            if "error" in status:
+                seen = -1
+
+    def _anchor(self, fed: FederatedCloseResult,
+                prepared: Optional[Any] = None) -> AnchorResult:
+        if prepared is None:
+            prepared = self._sign_round(fed, {})
+            if prepared is None:
+                return AnchorResult(success=False,
+                                    error="anchor not prepared/signed")
+        try:
+            status = self._collect_quorum(prepared)
+            if not status.get("reached"):
+                err = (
+                    f"anchor quorum not reached within "
+                    f"{self.signature_timeout:.0f}s (weight="
+                    f"{status.get('weight')}, total={status.get('total')}, "
+                    f"genesis={status.get('genesis')}, signers="
+                    f"{len(status.get('signers') or [])}"
+                    + (f", error={status['error']}" if status.get("error") else "")
+                    + ")")
+                logger.warning("epoch %s: %s", fed.epoch_id, err)
+                return AnchorResult(success=False, error=err,
+                                    epoch_id=fed.epoch_id)
+            result = self._anchorer.submit_prepared(
+                prepared, status["signatures"])
         except Exception as e:
             logger.error("anchor failed: %s", e, exc_info=True)
             return AnchorResult(success=False, error=str(e))

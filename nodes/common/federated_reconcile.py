@@ -1037,6 +1037,13 @@ def federated_reconcile_epoch(
     if emission_pool is not None:
         from .world_model_substrate.reconcile import apply_emission_pool
         result = apply_emission_pool(result, emission_pool)
+        # On-chain conservation (2026-10-12): Substrate caps each epoch's
+        # cumulative recordTrainingForEpoch at the integer fee pool, so the
+        # ratified mints are FLOORED to integer base units whose sum never
+        # exceeds it (float rounding could otherwise over-allocate by an
+        # ulp and the last claimer would revert).
+        result["agent_mint"] = floor_mint_to_pool(
+            result.get("agent_mint", {}) or {}, emission_pool)
         result["agent_mint"] = dict(sorted(
             _round_dict(result.get("agent_mint", {}), output_decimals).items()
         ))
@@ -1400,6 +1407,44 @@ def _author_for_batch(batch) -> str:
                 return str(author)
     # Fall back: derive a stable identity from the signer.
     return f"pk:{batch.sender_pubkey.hex()[:16]}"
+
+
+def floor_mint_to_pool(
+    agent_mint: Dict[str, float],
+    emission_pool: float,
+    mint_scale: int = 1_000_000,
+) -> Dict[str, float]:
+    """Floor pool-normalized mints to integer base units (x mint_scale)
+    whose sum is <= the integer pool, then return them as floats k/scale.
+
+    ``emission_pool`` is the ATN-denominated pool (chain base units /
+    mint_scale, exact for pools below ~9e9 ATN), so the integer pool is
+    recovered by rounding. Any float excess left after flooring is taken
+    one unit at a time from the largest allocations (ties by key), which
+    is deterministic. The dust (pool - sum) stays unminted. ``scale_mint``
+    rounds, so each leaf scales back to exactly k.
+    """
+    import math
+
+    pool_raw = int(round(float(emission_pool) * mint_scale))
+    keys = sorted(agent_mint)
+    ks: Dict[str, int] = {}
+    for a in keys:
+        v = float(agent_mint[a])
+        ks[a] = max(0, int(math.floor(v * mint_scale))) if v > 0 else 0
+    excess = sum(ks[a] for a in keys) - max(pool_raw, 0)
+    if excess > 0:
+        order = sorted(keys, key=lambda a: (-ks[a], a))
+        i = 0
+        while excess > 0 and order:
+            a = order[i % len(order)]
+            if ks[a] > 0:
+                ks[a] -= 1
+                excess -= 1
+            i += 1
+            if i > 10 * len(order) + excess * len(order):  # pragma: no cover
+                break
+    return {a: ks[a] / mint_scale for a in keys}
 
 
 def _round_dict(d: Dict[str, float], decimals: int) -> Dict[str, float]:

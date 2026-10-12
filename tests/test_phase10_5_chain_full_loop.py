@@ -50,6 +50,13 @@ from nodes.common.epoch_anchorer import EpochAnchorer, EpochAnchorerConfig
 from nodes.common.event_gossip import EventBatch, Keypair
 from nodes.common.federated_close_driver import FederatedCloseResult
 from nodes.common.federated_reconcile import federated_epoch_close
+from nodes.common.mint_merkle import scale_mint
+from tests.substrate_chain_helpers import (
+    account_key,
+    deploy_substrate,
+    genesis_address,
+    seed_pool,
+)
 
 
 SUBSTRATE_JSON = Path("C:/code/autonet/artifacts/contracts/core/Substrate.sol/Substrate.json")
@@ -63,11 +70,19 @@ def _load_substrate() -> Tuple[list, str]:
 
 
 def _deploy(w3: Web3, deployer: str, abi: list, bytecode: str) -> str:
-    contract = w3.eth.contract(abi=abi, bytecode=bytecode)
-    tx = contract.constructor(deployer, "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000").transact({"from": deployer, "gas": 8_000_000})
-    receipt = w3.eth.wait_for_transaction_receipt(tx)
-    assert receipt.status == 1
-    return receipt.contractAddress
+    # Genesis anchor authority: the three test agents (accounts 1..3,
+    # registered by the fixture) plus the helper's seed signer (account
+    # 9), quorum 1. The driver's signing round signs with the agents'
+    # real keys; seed_pool signs with account 9.
+    accts = w3.eth.accounts
+    addr = deploy_substrate(
+        w3, abi, bytecode, deployer,
+        genesis=list(accts[1:4]) + [genesis_address(w3)],
+        genesis_quorum=1, register_genesis=False,
+    )
+    c = w3.eth.contract(address=addr, abi=abi)
+    _register_agent(w3, c, genesis_address(w3), "genesis-seed-signer")
+    return addr
 
 
 def _register_agent(w3: Web3, contract, agent_addr: str, lineage_seed: str) -> None:
@@ -93,6 +108,8 @@ def chain():
     agent_addrs = accounts[1:4]
     for i, a in enumerate(agent_addrs):
         _register_agent(w3, contract, a, f"agent-lineage-{i}")
+    # Fees-only pool covering the test anchor's mints.
+    seed_pool(w3, contract)
     return {
         "w3": w3,
         "abi": abi,
@@ -253,7 +270,8 @@ def test_winner_drives_anchor_and_each_agent_mint_lands(chain):
             daemon_private_key="dummy",  # only needed for non-test path
         ),
         agent_chain_resolver=lambda: [
-            AgentChainIdentity(address=a, private_key="dummy") for a in agent_addrs
+            AgentChainIdentity(address=a, private_key=account_key(w3, a))
+            for a in agent_addrs
         ],
         blob_resolver=resolver,
         anchorer=anchorer,
@@ -289,7 +307,7 @@ def test_winner_drives_anchor_and_each_agent_mint_lands(chain):
     eid_hash = epoch_id_hash(fed.epoch_id)
     for a in minting_addrs:
         on_chain = contract.functions.mintForEpoch(a, eid_hash).call()
-        scaled = int(payload_mint[a] * 1_000_000)
+        scaled = scale_mint(payload_mint[a])
         assert on_chain == scaled, (
             f"agent {a}: on_chain={on_chain} expected={scaled}"
         )

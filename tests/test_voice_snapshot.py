@@ -40,6 +40,11 @@ from nodes.common.federated_reconcile import (
     federated_epoch_close,
 )
 from nodes.common.voice_state import read_voice_state
+from tests.substrate_chain_helpers import (
+    deploy_substrate,
+    genesis_keys,
+    seed_pool,
+)
 
 SUBSTRATE_JSON = Path(
     "C:/code/autonet/artifacts/contracts/core/Substrate.sol/Substrate.json")
@@ -64,14 +69,13 @@ def _load_rep() -> Tuple[list, str]:
 
 
 def _deploy(w3: Web3, deployer: str, abi: list, bytecode: str,
-            vault_minter: str = _ZERO) -> str:
-    contract = w3.eth.contract(abi=abi, bytecode=bytecode)
-    # Substrate(treasury, vaultMinter, governor). governor=zero => frozen.
-    tx = contract.constructor(deployer, vault_minter, _ZERO).transact(
-        {"from": deployer, "gas": 8_000_000})
-    receipt = w3.eth.wait_for_transaction_receipt(tx)
-    assert receipt.status == 1
-    return receipt.contractAddress
+            vault_minter=None) -> str:
+    # governor=zero => frozen. Substrate's repToken stays zero (genesis
+    # anchor authority: account 9, registered); the RepToken mock below is
+    # passed only to read_voice_state. vault_minter None => the helper's
+    # faucet (account 8), which seed_pool uses to buy ATN.
+    return deploy_substrate(
+        w3, abi, bytecode, deployer, vault_minter=vault_minter)
 
 
 def _deploy_rep(w3: Web3, deployer: str) -> Tuple[str, list]:
@@ -157,7 +161,8 @@ def _anchor_epoch(fx, agent_ids, epoch_id: str, rpb: str):
         web3=fx["w3"], contract_abi=fx["abi"],
     )
     anchor_result = anchorer.anchor_close_result(
-        result, from_address=fx["deployer"])
+        result, from_address=fx["deployer"],
+        signer_keys=genesis_keys(fx["w3"]))
     assert anchor_result.success
     resolver = InMemoryBlobResolver()
     resolver.put(anchor_result.agent_mint_blob)
@@ -192,6 +197,8 @@ def fx():
         _register_agent(w3, contract, ad, f"voice-agent-{i}")
     rep_addr, rep_abi = _deploy_rep(w3, deployer)
     rep_contract = w3.eth.contract(address=rep_addr, abi=rep_abi)
+    # No seed anchor here: some tests pin the no-anchor (genesis) state.
+    # Tests that mint call _seed(fx) first.
     return {
         "w3": w3, "abi": abi, "addr": addr, "contract": contract,
         "deployer": deployer, "agent_addrs": list(agent_addrs),
@@ -199,11 +206,20 @@ def fx():
     }
 
 
+def _seed(fx) -> int:
+    """Fees-only pool for the NEXT anchor (burn real fees, anchor a seed
+    epoch). Returns that pool (raw base units)."""
+    return seed_pool(fx["w3"], fx["contract"])
+
+
 class TestCheckpointedATN:
     def test_balance_of_at_tracks_history(self, fx):
         """Mint, then transfer: the pre-transfer block still reads the
         pre-transfer balance; latest reads the post-transfer one."""
         w3, contract = fx["w3"], fx["contract"]
+        _seed(fx)
+        # Baseline supply = the seed epoch's purchased (vault) ATN.
+        supply0 = contract.functions.atnTotalSupply().call()
         result, resolver = _anchor_epoch(
             fx, fx["agent_addrs"], "e_ckpt", "rpb_ckpt")
         minter, amount = _mint_for(fx, result, resolver, "e_ckpt")
@@ -224,11 +240,14 @@ class TestCheckpointedATN:
         assert contract.functions.balanceOf(other).call() == amount // 2
         # Before anything existed: zero (no checkpoint <= block).
         assert contract.functions.balanceOfAt(minter, 0).call() == 0
-        # Supply history: zero before the mint, `amount` after.
+        # Supply history: zero before anything, the seed baseline just
+        # before the mint, baseline + `amount` after.
         assert contract.functions.atnTotalSupplyAt(0).call() == 0
         assert contract.functions.atnTotalSupplyAt(
-            mint_block).call() == amount
-        assert contract.functions.atnTotalSupply().call() == amount
+            mint_block - 1).call() == supply0
+        assert contract.functions.atnTotalSupplyAt(
+            mint_block).call() == supply0 + amount
+        assert contract.functions.atnTotalSupply().call() == supply0 + amount
 
 
 class TestVoiceStateSnapshot:
@@ -308,8 +327,17 @@ class TestFeeRecycledEmission:
         for the FIRST close whose snapshot window contains it, then leaves.
         No base floor — the pool is exactly the recycled burn."""
         w3, contract = fx["w3"], fx["contract"]
-        # Epoch 1: anchor + mint so a payer has ATN.
+        # Seed epoch: its window burns real fees, so e_f1 carries a pool.
+        seed = _seed(fx)
+        assert seed > 0
+        # Epoch 1: anchor + mint so a payer has ATN. e_f1's own window is
+        # empty (nothing burned since the seed anchor) => pool reads 0.
         r1, res1 = _anchor_epoch(fx, fx["agent_addrs"], "e_f1", "rpb_f1")
+        a1 = contract.functions.getAnchorByEpochId("e_f1").call()
+        assert a1[11] == seed            # mintPool = seed window (lag-1)
+        state_1 = read_voice_state(
+            fx["addr"], web3=fx["w3"], rep_token_address=fx["rep_addr"])
+        assert state_1["emission_pool_raw"] == 0
         payer, amount = _mint_for(fx, r1, res1, "e_f1")
 
         # Pay for a service — the fee burns + treasury share moves.
@@ -326,20 +354,30 @@ class TestFeeRecycledEmission:
         assert (contract.functions.atnTotalSupply().call()
                 == supply_before - burned)
 
-        # Anchor epoch 2 — its window contains the payment. Pool == burn.
+        # Anchor epoch 2 — its window (e_f1 -> e_f2) contains the payment.
+        # Pool == the snapshot anchor's windowBurned == burn.
         _anchor_epoch(fx, fx["agent_addrs"], "e_f2", "rpb_f2")
+        a2 = contract.functions.getAnchorByEpochId("e_f2").call()
+        assert a2[10] == burned          # windowBurned
         state = read_voice_state(
             fx["addr"], web3=fx["w3"], rep_token_address=fx["rep_addr"])
+        assert state["emission_pool_raw"] == burned
+        assert state["snapshot_anchor_count"] == (
+            contract.functions.anchorCount().call())
         assert state["recycled"] == pytest.approx(burned / 1_000_000.0)
         assert state["emission_pool"] == pytest.approx(burned / 1_000_000.0)
 
         # Anchor epoch 3 with no payments — the fee has left the window;
         # fees-only pool falls to zero (no base floor).
+        # On chain, e_f3 carries e_f2's window as its mint pool.
         _anchor_epoch(fx, fx["agent_addrs"], "e_f3", "rpb_f3")
+        a3 = contract.functions.getAnchorByEpochId("e_f3").call()
+        assert a3[11] == burned          # mintPool = previous window
         state_3 = read_voice_state(
             fx["addr"], web3=fx["w3"], rep_token_address=fx["rep_addr"])
         assert state_3["recycled"] == 0.0
         assert state_3["emission_pool"] == 0.0
+        assert state_3["emission_pool_raw"] == 0
 
 
 class TestVaultMint:

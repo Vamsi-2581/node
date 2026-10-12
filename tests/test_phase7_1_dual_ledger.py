@@ -17,6 +17,7 @@ cumulative tool-pool earnings counter (money). This file validates:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -38,6 +39,11 @@ from nodes.common.canonical_ordering import canonical_order
 from nodes.common.epoch_anchorer import EpochAnchorer, EpochAnchorerConfig
 from nodes.common.event_gossip import EventBatch, Keypair
 from nodes.common.federated_reconcile import federated_epoch_close
+from tests.substrate_chain_helpers import (
+    deploy_substrate,
+    genesis_keys,
+    seed_pool,
+)
 
 
 SUBSTRATE_JSON = Path("C:/code/autonet/artifacts/contracts/core/Substrate.sol/Substrate.json")
@@ -51,12 +57,8 @@ def _load_substrate() -> Tuple[list, str]:
 
 
 def _deploy(w3: Web3, deployer: str, abi: list, bytecode: str) -> str:
-    contract = w3.eth.contract(abi=abi, bytecode=bytecode)
-    zero = "0x0000000000000000000000000000000000000000"
-    tx = contract.constructor(deployer, zero, zero).transact({"from": deployer, "gas": 8_000_000})
-    receipt = w3.eth.wait_for_transaction_receipt(tx)
-    assert receipt.status == 1
-    return receipt.contractAddress
+    # Genesis-mode anchor authority (account 9, registered).
+    return deploy_substrate(w3, abi, bytecode, deployer)
 
 
 def _register_agent(w3: Web3, contract, agent_addr: str, lineage_seed: str) -> None:
@@ -81,6 +83,10 @@ def chain():
     agent_addrs = accounts[1:5]
     for i, ad in enumerate(agent_addrs):
         _register_agent(w3, contract, ad, f"agent-lineage-{i}")
+    # Fees-only pool covering the test anchor's mints. The seed buys ATN
+    # through the vault (accounts 6/7 hold it), so supply starts nonzero:
+    # supply assertions below compare against this baseline.
+    seed_pool(w3, contract)
 
     return {
         "w3": w3,
@@ -99,27 +105,55 @@ def _coord(charter, embed_idx, mag):
 
 
 def _make_chain(rpb: str, kp: Keypair, agent_id: str, n: int = 2) -> List[EventBatch]:
-    chain: List[EventBatch] = []
-    prev = b""
-    for i in range(1, n + 1):
-        coords = [0.0] * (4 + 1024)
-        coords[2] = 0.5
-        coords[4 + (10 * (i + 1))] = 0.5
-        ev = {
-            "kind": "observation_added",
-            "seq": 1,
-            "author_agent": agent_id,
-            "obs_id": f"obs_{agent_id}_{i}",
-            "coords": coords,
-            "label": f"{agent_id}_{i}",
+    """v3 mint fixture (mint = tool usage only): each agent authors a
+    pinned tool (digest derived from the agent id so agents don't
+    collide), vetted by a distinct fleet and used by third-party
+    attesting callers. Observation events alone no longer mint."""
+    digest = hashlib.sha256(f"tool-{agent_id}".encode()).hexdigest()
+    coords = [0.0] * (6 + 1024)
+    coords[4] = 0.8
+    coords[6 + 3] = 0.5
+    reg = {
+        "kind": "sub_claim_sprouted", "seq": 1,
+        "author_agent": agent_id, "tendency_id": "correctness",
+        "parent_id": "solver_root", "node_id": f"tm_{digest[:12]}",
+        "position": "pro", "coords": list(coords),
+        "polarity_axis": list(coords),
+        "content": f"tool {digest[:8]}", "author_post": True,
+        "artifact_digest": digest,
+        "manifest_meta": {"trust_class": "pinned", "author": agent_id},
+    }
+
+    def _vet(vetter, seq):
+        return {
+            "kind": "tool_used", "seq": seq, "author_agent": vetter,
+            "manifest_digest": digest, "tool_author": agent_id,
+            "receipt_digest": hashlib.sha256(
+                f"vet-{agent_id}-{vetter}".encode()).hexdigest(),
+            "ok": True, "fee_atn": 0.0, "vet": True,
         }
-        b = EventBatch(
-            rpb_address=rpb, sender_pubkey=kp.public_key,
-            batch_seq=i, events=[ev], prev_batch_hash=prev,
-            timestamp=1_700_000_000.0 + i,
+
+    def _receipt(caller, seq):
+        return {
+            "kind": "tool_used", "seq": seq, "author_agent": caller,
+            "manifest_digest": digest, "tool_author": agent_id,
+            "receipt_digest": hashlib.sha256(
+                f"use-{agent_id}-{caller}".encode()).hexdigest(),
+            "ok": True, "fee_atn": 0.0, "attested": True, "score": 0.8,
+        }
+
+    def _one(ev):
+        return EventBatch(
+            rpb_address=rpb, sender_pubkey=Keypair.generate().public_key,
+            batch_seq=1, events=[ev], prev_batch_hash=b"",
+            timestamp=1_700_000_000.0,
         )
-        chain.append(b); prev = b.content_hash()
-    return chain
+
+    return [
+        _one(reg),
+        _one(_vet("vetter-1", 1)), _one(_vet("vetter-2", 1)),
+        _one(_receipt("caller-1", 1)), _one(_receipt("caller-2", 2)),
+    ]
 
 
 def _build_close_and_anchor(chain_fixture, agent_ids, *, epoch_id: str = "e_71",
@@ -137,7 +171,8 @@ def _build_close_and_anchor(chain_fixture, agent_ids, *, epoch_id: str = "e_71",
         config=EpochAnchorerConfig(epoch_anchor_address=chain_fixture["addr"]),
         web3=w3, contract_abi=chain_fixture["abi"],
     )
-    anchor_result = anchorer.anchor_close_result(result, from_address=deployer)
+    anchor_result = anchorer.anchor_close_result(
+        result, from_address=deployer, signer_keys=genesis_keys(w3))
     assert anchor_result.success
     resolver = InMemoryBlobResolver()
     cid = resolver.put(anchor_result.agent_mint_blob)
@@ -175,7 +210,9 @@ def test_training_mints_atn_and_bumps_earnings(chain):
     earn_before = contract.functions.agentMintTotal(addr).call()
     bal_before = contract.functions.balanceOf(addr).call()
     supply_before = contract.functions.atnTotalSupply().call()
-    assert earn_before == 0 and bal_before == 0 and supply_before == 0
+    # supply_before is the seed epoch's purchased ATN (nonzero); the
+    # mint is asserted as a delta on top of it.
+    assert earn_before == 0 and bal_before == 0
 
     result, epoch_id, resolver = _build_close_and_anchor(
         chain, agent_ids, epoch_id="e_71_money",
@@ -204,7 +241,7 @@ def test_training_mints_atn_and_bumps_earnings(chain):
 
     assert earn_after == expected
     assert bal_after == expected
-    assert supply_after == expected
+    assert supply_after == supply_before + expected
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +477,8 @@ def test_atn_total_supply_tracks_minted(chain):
     w3 = chain["w3"]
     contract = chain["contract"]
 
-    assert contract.functions.atnTotalSupply().call() == 0
+    # Baseline: the seed epoch's purchased (vault-minted) ATN.
+    supply0 = contract.functions.atnTotalSupply().call()
 
     # Agent ids ARE addresses: merkle mint proofs are keyed by
     # msg.sender, so claimable mint-map entries must be address-keyed.
@@ -461,7 +499,7 @@ def test_atn_total_supply_tracks_minted(chain):
         if s.success and s.contribution_scaled > 0:
             expected_total += s.contribution_scaled
 
-    assert contract.functions.atnTotalSupply().call() == expected_total
+    assert contract.functions.atnTotalSupply().call() == supply0 + expected_total
 
     # Now do a transfer; supply unchanged.
     if expected_total > 0:
@@ -475,4 +513,4 @@ def test_atn_total_supply_tracks_minted(chain):
         contract.functions.transfer(dst, bal // 2).transact({
             "from": src, "gas": 200_000,
         })
-        assert contract.functions.atnTotalSupply().call() == expected_total
+        assert contract.functions.atnTotalSupply().call() == supply0 + expected_total

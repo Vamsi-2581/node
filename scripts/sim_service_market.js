@@ -73,39 +73,12 @@ async function signVoucher(channel, signer, channelId, cumulativeAmount) {
   return signer.signTypedData(domain, types, { channelId, cumulativeAmount });
 }
 
-// ATN is minted only via Substrate.recordTrainingForEpoch over an anchored
-// epoch (money-only leaf commits agent/amount). Mint to a faucet agent,
-// then transfer.
-function mintLeaf(agentAddr, amount) {
-  const inner = ethers.keccak256(
-    ethers.AbiCoder.defaultAbiCoder().encode(
-      ["address", "uint256"],
-      [agentAddr, amount]
-    )
-  );
-  return ethers.keccak256(ethers.solidityPacked(["bytes32"], [inner]));
-}
-
-let _epochCounter = 0;
+// Test money: the purchased-money rail. The sim deploy wires vaultMinter to
+// the deployer (2026-10-12: a training mint needs a quorum-signed anchor and
+// a fee-backed pool, which a fresh sim chain does not have).
+let _vaultMinter = null;
 async function mintATN(substrate, faucet, amount) {
-  _epochCounter += 1;
-  const epochId = "epoch-" + _epochCounter;
-  const prevEpochRoot = await substrate.latestEpochRoot();
-  const prevAnchorHash = await substrate.latestAnchorHash();
-  await substrate
-    .connect(faucet)
-    .submitAnchor(
-      epochId,
-      DIGEST("root-" + epochId),
-      prevEpochRoot,
-      prevAnchorHash,
-      "cid-" + epochId,
-      DIGEST("payload-" + epochId),
-      mintLeaf(faucet.address, amount)
-    );
-  await substrate
-    .connect(faucet)
-    .recordTrainingForEpoch(amount, DIGEST(epochId), []);
+  await substrate.connect(_vaultMinter).mintFromVault(faucet.address, amount);
 }
 
 async function main() {
@@ -113,11 +86,11 @@ async function main() {
 
   // --- deploy stack (deployer is the treasury for the fee split) ---
   const Substrate = await ethers.getContractFactory("Substrate");
+  const ZERO = "0x0000000000000000000000000000000000000000";
   const substrate = await Substrate.deploy(
-    deployer.address,
-    "0x0000000000000000000000000000000000000000",
-    "0x0000000000000000000000000000000000000000"
+    deployer.address, deployer.address, ZERO, ZERO, 5000, [deployer.address], 1
   );
+  _vaultMinter = deployer;
   await substrate.waitForDeployment();
 
   const Reg = await ethers.getContractFactory("ServiceRegistry");

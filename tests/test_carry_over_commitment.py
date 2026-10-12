@@ -274,18 +274,15 @@ def chain():
     data = json.loads(ARTIFACT.read_text(encoding="utf-8"))
     w3 = Web3(EthereumTesterProvider())
     deployer = w3.eth.accounts[0]
-    contract = w3.eth.contract(abi=data["abi"], bytecode=data["bytecode"])
-    tx = contract.constructor(
-        deployer, "0x0000000000000000000000000000000000000000",
-        "0x0000000000000000000000000000000000000000",
-    ).transact({"from": deployer, "gas": 8_000_000})
-    receipt = w3.eth.wait_for_transaction_receipt(tx)
-    assert receipt.status == 1
+    from tests.substrate_chain_helpers import deploy_substrate
+    # Genesis-mode anchor authority (account 9, registered). No seed
+    # pool: these closes anchor but never mint on chain.
+    addr = deploy_substrate(w3, data["abi"], data["bytecode"], deployer)
     return {
         "w3": w3,
         "abi": data["abi"],
-        "addr": receipt.contractAddress,
-        "contract": w3.eth.contract(address=receipt.contractAddress, abi=data["abi"]),
+        "addr": addr,
+        "contract": w3.eth.contract(address=addr, abi=data["abi"]),
         "deployer": deployer,
     }
 
@@ -295,11 +292,17 @@ def network(chain, tmp_path):
     """An always-on daemon that closed epochs 1..3, anchoring each close
     through ChainSubmissionDriver (which publishes payload + carry blobs)."""
     from nodes.common.blob_resolver import InMemoryBlobResolver
+    from nodes.common.authoritative_submitter import (
+        AuthoritativeChainSubmitter,
+        AuthoritativeSubmitterConfig,
+    )
     from nodes.common.chain_submission_driver import (
+        AgentChainIdentity,
         ChainSubmissionConfig,
         ChainSubmissionDriver,
     )
     from nodes.common.epoch_anchorer import EpochAnchorer, EpochAnchorerConfig
+    from tests.substrate_chain_helpers import genesis_address, genesis_keys
 
     anchorer = EpochAnchorer(
         config=EpochAnchorerConfig(epoch_anchor_address=chain["addr"]),
@@ -307,11 +310,25 @@ def network(chain, tmp_path):
     )
     anchorer._set_submitter_address(chain["deployer"])
     resolver = InMemoryBlobResolver()
+    # The daemon hosts the genesis signer, so its signing round alone
+    # meets the (genesis-mode) anchor quorum.
+    signer = AgentChainIdentity(
+        address=genesis_address(chain["w3"]),
+        private_key=genesis_keys(chain["w3"])[0])
     csd = ChainSubmissionDriver(
         config=ChainSubmissionConfig(substrate_address=chain["addr"]),
-        agent_chain_resolver=lambda: [],
+        agent_chain_resolver=lambda: [signer],
         blob_resolver=resolver,
         anchorer=anchorer,
+    )
+    # eth_tester-wired submitter (empty private_key = unlocked-account
+    # path); the signer has no mint, so it never sends a record tx.
+    csd._submitter_cache[signer.address] = AuthoritativeChainSubmitter(
+        agent_id=signer.address, agent_address=signer.address,
+        resolver=resolver,
+        config=AuthoritativeSubmitterConfig(
+            substrate_address=chain["addr"], private_key=""),
+        web3=chain["w3"], substrate_abi=chain["abi"],
     )
 
     def voice():
@@ -484,7 +501,9 @@ def test_pre_schema_anchor_keeps_refusing(chain, tmp_path, caplog):
     anchorer._set_submitter_address(chain["deployer"])
     close = federated_epoch_close(canonical_order(EPOCHS[1]), embedding_dim=EMBED_DIM)
     close["epoch_id"] = "e_old"
-    anchor = anchorer.anchor_close_result(close)
+    from tests.substrate_chain_helpers import genesis_keys
+    anchor = anchorer.anchor_close_result(
+        close, signer_keys=genesis_keys(chain["w3"]))
     assert anchor.success, anchor.error
     resolver = InMemoryBlobResolver()
     resolver.put(anchor.payload_bytes)

@@ -71,6 +71,12 @@ class FederatedCloseResult:
     # and verify it against the anchor instead of trusting a peer.
     carry_cid: str = ""
     carry_bundle_blob: bytes = b""
+    # Anchor authority + conservation (2026-10-12): the chain anchorCount
+    # the voice/pool snapshot was read at. The close's pool equals the
+    # on-chain mintPool only if it is anchored as anchor number
+    # snapshot_anchor_count; signers refuse to sign otherwise. None = no
+    # chain source (local/test).
+    snapshot_anchor_count: Optional[int] = None
 
 
 def pick_submitter(
@@ -202,6 +208,8 @@ class FederatedCloseDriver:
         # normalization — raw mint units, the legacy/local behavior; a zero
         # pool yields zero mint.
         self.emission_pool: Optional[float] = None
+        # anchorCount at the last successful voice/pool refresh.
+        self.snapshot_anchor_count: Optional[int] = None
         # Optional zero-arg refresh hook returning
         # {"owner_map": {...}, "voice_weights": {...}} — wired by the
         # host when chain access exists (see AutonetService.
@@ -408,6 +416,9 @@ class FederatedCloseDriver:
             pool = state.get("emission_pool")
             if pool is not None:
                 self.emission_pool = float(pool)
+            if state.get("snapshot_anchor_count") is not None:
+                self.snapshot_anchor_count = int(
+                    state["snapshot_anchor_count"])
         except Exception as e:
             logger.warning(
                 "voice-state refresh failed (keeping previous maps): %s", e)
@@ -596,6 +607,7 @@ class FederatedCloseDriver:
             world_checkpoint_blob=world_blob,
             carry_cid=carry_cid,
             carry_bundle_blob=carry_blob,
+            snapshot_anchor_count=self.snapshot_anchor_count,
         )
 
     # ---- tool-registration carry-over persistence -------------------

@@ -17,6 +17,26 @@
      "internalType": "address",
      "name": "governor_",
      "type": "address"
+    },
+    {
+     "internalType": "address",
+     "name": "repToken_",
+     "type": "address"
+    },
+    {
+     "internalType": "uint16",
+     "name": "anchorQuorumBps_",
+     "type": "uint16"
+    },
+    {
+     "internalType": "address[]",
+     "name": "genesisSigners_",
+     "type": "address[]"
+    },
+    {
+     "internalType": "uint256",
+     "name": "genesisQuorum_",
+     "type": "uint256"
     }
    ],
    "stateMutability": "nonpayable",
@@ -41,6 +61,76 @@
     }
    ],
    "name": "AlreadySubmittedForEpoch",
+   "type": "error"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "uint256",
+     "name": "weight",
+     "type": "uint256"
+    },
+    {
+     "internalType": "uint256",
+     "name": "total",
+     "type": "uint256"
+    },
+    {
+     "internalType": "bool",
+     "name": "genesis",
+     "type": "bool"
+    }
+   ],
+   "name": "AnchorQuorumNotMet",
+   "type": "error"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "uint256",
+     "name": "snapshot",
+     "type": "uint256"
+    },
+    {
+     "internalType": "uint256",
+     "name": "nowTs",
+     "type": "uint256"
+    }
+   ],
+   "name": "AnchorSnapshotNotFinal",
+   "type": "error"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "uint16",
+     "name": "bps",
+     "type": "uint16"
+    }
+   ],
+   "name": "BadAnchorQuorum",
+   "type": "error"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "uint256",
+     "name": "quorum",
+     "type": "uint256"
+    }
+   ],
+   "name": "BadGenesisQuorum",
+   "type": "error"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "address",
+     "name": "signer",
+     "type": "address"
+    }
+   ],
+   "name": "BadGenesisSigner",
    "type": "error"
   },
   {
@@ -105,6 +195,27 @@
     }
    ],
    "name": "EpochNotAnchored",
+   "type": "error"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "bytes32",
+     "name": "epochIdHash",
+     "type": "bytes32"
+    },
+    {
+     "internalType": "uint256",
+     "name": "pool",
+     "type": "uint256"
+    },
+    {
+     "internalType": "uint256",
+     "name": "mintedAfter",
+     "type": "uint256"
+    }
+   ],
+   "name": "EpochPoolExceeded",
    "type": "error"
   },
   {
@@ -194,6 +305,11 @@
   },
   {
    "inputs": [],
+   "name": "NoAnchorAuthority",
+   "type": "error"
+  },
+  {
+   "inputs": [],
    "name": "NotGovernor",
    "type": "error"
   },
@@ -257,12 +373,39 @@
   {
    "inputs": [
     {
+     "internalType": "address",
+     "name": "prev",
+     "type": "address"
+    },
+    {
+     "internalType": "address",
+     "name": "next",
+     "type": "address"
+    }
+   ],
+   "name": "SignersNotSorted",
+   "type": "error"
+  },
+  {
+   "inputs": [
+    {
      "internalType": "string",
      "name": "str",
      "type": "string"
     }
    ],
    "name": "StringTooLong",
+   "type": "error"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "uint256",
+     "name": "count",
+     "type": "uint256"
+    }
+   ],
+   "name": "TooManySigners",
    "type": "error"
   },
   {
@@ -370,6 +513,55 @@
     }
    ],
    "name": "AgentRegistered",
+   "type": "event"
+  },
+  {
+   "anonymous": false,
+   "inputs": [
+    {
+     "indexed": true,
+     "internalType": "bytes32",
+     "name": "epochIdHash",
+     "type": "bytes32"
+    },
+    {
+     "indexed": false,
+     "internalType": "uint256",
+     "name": "signerCount",
+     "type": "uint256"
+    },
+    {
+     "indexed": false,
+     "internalType": "uint256",
+     "name": "weight",
+     "type": "uint256"
+    },
+    {
+     "indexed": false,
+     "internalType": "uint256",
+     "name": "total",
+     "type": "uint256"
+    },
+    {
+     "indexed": false,
+     "internalType": "bool",
+     "name": "genesis",
+     "type": "bool"
+    },
+    {
+     "indexed": false,
+     "internalType": "uint256",
+     "name": "mintPool",
+     "type": "uint256"
+    },
+    {
+     "indexed": false,
+     "internalType": "uint256",
+     "name": "windowBurned",
+     "type": "uint256"
+    }
+   ],
+   "name": "AnchorAuthorized",
    "type": "event"
   },
   {
@@ -678,6 +870,19 @@
   },
   {
    "inputs": [],
+   "name": "ANCHOR_APPROVAL_TYPEHASH",
+   "outputs": [
+    {
+     "internalType": "bytes32",
+     "name": "",
+     "type": "bytes32"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [],
    "name": "BPS_DENOM",
    "outputs": [
     {
@@ -697,6 +902,19 @@
      "internalType": "uint16",
      "name": "",
      "type": "uint16"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [],
+   "name": "MAX_ANCHOR_SIGNERS",
+   "outputs": [
+    {
+     "internalType": "uint256",
+     "name": "",
+     "type": "uint256"
     }
    ],
    "stateMutability": "view",
@@ -870,6 +1088,115 @@
   {
    "inputs": [],
    "name": "anchorCount",
+   "outputs": [
+    {
+     "internalType": "uint256",
+     "name": "",
+     "type": "uint256"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "string",
+     "name": "epochId",
+     "type": "string"
+    },
+    {
+     "internalType": "bytes32",
+     "name": "epochRoot",
+     "type": "bytes32"
+    },
+    {
+     "internalType": "bytes32",
+     "name": "prevEpochRoot",
+     "type": "bytes32"
+    },
+    {
+     "internalType": "bytes32",
+     "name": "prevAnchorHash",
+     "type": "bytes32"
+    },
+    {
+     "internalType": "string",
+     "name": "agentMintCid",
+     "type": "string"
+    },
+    {
+     "internalType": "bytes32",
+     "name": "payloadHash",
+     "type": "bytes32"
+    },
+    {
+     "internalType": "bytes32",
+     "name": "agentMintRoot",
+     "type": "bytes32"
+    }
+   ],
+   "name": "anchorDigest",
+   "outputs": [
+    {
+     "internalType": "bytes32",
+     "name": "",
+     "type": "bytes32"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "address[]",
+     "name": "signers",
+     "type": "address[]"
+    }
+   ],
+   "name": "anchorQuorum",
+   "outputs": [
+    {
+     "internalType": "uint256",
+     "name": "weight",
+     "type": "uint256"
+    },
+    {
+     "internalType": "uint256",
+     "name": "total",
+     "type": "uint256"
+    },
+    {
+     "internalType": "bool",
+     "name": "genesis",
+     "type": "bool"
+    },
+    {
+     "internalType": "bool",
+     "name": "reached",
+     "type": "bool"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [],
+   "name": "anchorQuorumBps",
+   "outputs": [
+    {
+     "internalType": "uint16",
+     "name": "",
+     "type": "uint16"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [],
+   "name": "anchorSnapshotTime",
    "outputs": [
     {
      "internalType": "uint256",
@@ -1071,6 +1398,32 @@
   },
   {
    "inputs": [],
+   "name": "burnedSinceAnchor",
+   "outputs": [
+    {
+     "internalType": "uint256",
+     "name": "",
+     "type": "uint256"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [],
+   "name": "deployedAt",
+   "outputs": [
+    {
+     "internalType": "uint256",
+     "name": "",
+     "type": "uint256"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [],
    "name": "eip712Domain",
    "outputs": [
     {
@@ -1107,6 +1460,32 @@
      "internalType": "uint256[]",
      "name": "extensions",
      "type": "uint256[]"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [],
+   "name": "genesisQuorum",
+   "outputs": [
+    {
+     "internalType": "uint256",
+     "name": "",
+     "type": "uint256"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [],
+   "name": "genesisSigners",
+   "outputs": [
+    {
+     "internalType": "address[]",
+     "name": "",
+     "type": "address[]"
     }
    ],
    "stateMutability": "view",
@@ -1249,6 +1628,21 @@
        "internalType": "bytes32",
        "name": "agentMintRoot",
        "type": "bytes32"
+      },
+      {
+       "internalType": "uint256",
+       "name": "windowBurned",
+       "type": "uint256"
+      },
+      {
+       "internalType": "uint256",
+       "name": "mintPool",
+       "type": "uint256"
+      },
+      {
+       "internalType": "uint256",
+       "name": "minted",
+       "type": "uint256"
       }
      ],
      "internalType": "struct Substrate.Anchor",
@@ -1320,6 +1714,21 @@
        "internalType": "bytes32",
        "name": "agentMintRoot",
        "type": "bytes32"
+      },
+      {
+       "internalType": "uint256",
+       "name": "windowBurned",
+       "type": "uint256"
+      },
+      {
+       "internalType": "uint256",
+       "name": "mintPool",
+       "type": "uint256"
+      },
+      {
+       "internalType": "uint256",
+       "name": "minted",
+       "type": "uint256"
       }
      ],
      "internalType": "struct Substrate.Anchor",
@@ -1414,6 +1823,25 @@
     }
    ],
    "name": "isAnchoredByHash",
+   "outputs": [
+    {
+     "internalType": "bool",
+     "name": "",
+     "type": "bool"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [
+    {
+     "internalType": "address",
+     "name": "",
+     "type": "address"
+    }
+   ],
+   "name": "isGenesisSigner",
    "outputs": [
     {
      "internalType": "bool",
@@ -1533,6 +1961,19 @@
   {
    "inputs": [],
    "name": "networkMintTotal",
+   "outputs": [
+    {
+     "internalType": "uint256",
+     "name": "",
+     "type": "uint256"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
+   "inputs": [],
+   "name": "nextMintPool",
    "outputs": [
     {
      "internalType": "uint256",
@@ -1673,6 +2114,19 @@
    "type": "function"
   },
   {
+   "inputs": [],
+   "name": "repToken",
+   "outputs": [
+    {
+     "internalType": "contract IRepVotes",
+     "name": "",
+     "type": "address"
+    }
+   ],
+   "stateMutability": "view",
+   "type": "function"
+  },
+  {
    "inputs": [
     {
      "internalType": "address",
@@ -1800,6 +2254,11 @@
      "internalType": "bytes32",
      "name": "agentMintRoot",
      "type": "bytes32"
+    },
+    {
+     "internalType": "bytes[]",
+     "name": "signatures",
+     "type": "bytes[]"
     }
    ],
    "name": "submitAnchor",

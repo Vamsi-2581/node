@@ -1,17 +1,35 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { anyValue } = require("@nomicfoundation/hardhat-chai-matchers/withArgs");
-const { digest, registerAgent, mintLeaf, mintATN } = require("./helpers");
+const {
+  digest,
+  registerAgent,
+  mintLeaf,
+  mintATN,
+  deploySubstrateWith,
+  seedPool,
+  anchorFields,
+  signAnchorSorted,
+  submitAnchorTx,
+} = require("./helpers");
 
 const ZERO = "0x0000000000000000000000000000000000000000";
 
-// Deploy Substrate with an explicit governor (default helper wires governor=0,
-// which freezes the fee knob — these tests need a live governor).
+// Deploy Substrate with an explicit governor (default governor=0 freezes the
+// fee knob; these tests need a live governor). The default test vault faucet
+// (signers[19]) stays wired so mintATN works.
 async function deployWith(treasury, vaultMinter, governor) {
-  const Substrate = await ethers.getContractFactory("Substrate");
-  const s = await Substrate.deploy(treasury, vaultMinter, governor);
-  await s.waitForDeployment();
-  return s;
+  const opts = { treasury, governor };
+  if (vaultMinter !== ZERO) opts.vaultMinter = vaultMinter;
+  return deploySubstrateWith(opts);
+}
+
+// Anchor signed by the default genesis signer.
+async function genesisAnchor(substrate, relayer, epochId, root) {
+  const signers = await ethers.getSigners();
+  const f = await anchorFields(substrate, epochId, root);
+  const sigs = await signAnchorSorted(substrate, [signers[18]], f);
+  return submitAnchorTx(substrate, relayer, f, sigs);
 }
 
 // Sorted-pair keccak of two leaves (OpenZeppelin convention).
@@ -38,23 +56,15 @@ describe("Substrate — fees-only emission + REP-from-earnings (2026-07-10)", fu
       await registerAgent(substrate, submitter, "submitter");
       await registerAgent(substrate, agentA, "agentA");
       await registerAgent(substrate, agentB, "agentB");
+      // Fees-only pool for the next anchor (on-chain conservation).
+      await seedPool(substrate);
     });
 
     it("single-leaf tree: root == leaf, empty proof mints ATN and accrues earnings", async function () {
       const amount = 1_000_000n;
       const epochId = "epoch-single";
       const root = mintLeaf(agentA.address, amount);
-      await substrate
-        .connect(submitter)
-        .submitAnchor(
-          epochId,
-          digest("root-" + epochId),
-          await substrate.latestEpochRoot(),
-          await substrate.latestAnchorHash(),
-          "cid",
-          digest("payload"),
-          root
-        );
+      await genesisAnchor(substrate, submitter, epochId, root);
       await expect(
         substrate
           .connect(agentA)
@@ -78,17 +88,7 @@ describe("Substrate — fees-only emission + REP-from-earnings (2026-07-10)", fu
       const root = hashPair(leafA, leafB);
       const epochId = "epoch-two";
 
-      await substrate
-        .connect(submitter)
-        .submitAnchor(
-          epochId,
-          digest("root-" + epochId),
-          await substrate.latestEpochRoot(),
-          await substrate.latestAnchorHash(),
-          "cid",
-          digest("payload"),
-          root
-        );
+      await genesisAnchor(substrate, submitter, epochId, root);
 
       // agentA proves with leafB as its sibling.
       await substrate
@@ -107,17 +107,7 @@ describe("Substrate — fees-only emission + REP-from-earnings (2026-07-10)", fu
       const amount = 500_000n;
       const epochId = "epoch-bad";
       const root = mintLeaf(agentA.address, amount);
-      await substrate
-        .connect(submitter)
-        .submitAnchor(
-          epochId,
-          digest("root-" + epochId),
-          await substrate.latestEpochRoot(),
-          await substrate.latestAnchorHash(),
-          "cid",
-          digest("payload"),
-          root
-        );
+      await genesisAnchor(substrate, submitter, epochId, root);
       await expect(
         substrate
           .connect(agentA)
@@ -129,17 +119,7 @@ describe("Substrate — fees-only emission + REP-from-earnings (2026-07-10)", fu
       const amount = 123_456n;
       const epochId = "epoch-dup";
       const root = mintLeaf(agentA.address, amount);
-      await substrate
-        .connect(submitter)
-        .submitAnchor(
-          epochId,
-          digest("root-" + epochId),
-          await substrate.latestEpochRoot(),
-          await substrate.latestAnchorHash(),
-          "cid",
-          digest("payload"),
-          root
-        );
+      await genesisAnchor(substrate, submitter, epochId, root);
       await substrate.connect(agentA).recordTrainingForEpoch(amount, digest(epochId), []);
       await expect(
         substrate.connect(agentA).recordTrainingForEpoch(amount, digest(epochId), [])

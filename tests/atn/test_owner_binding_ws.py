@@ -60,6 +60,10 @@ def _deploy(w3: Web3, deployer: str, abi: list, bytecode: str) -> str:
         deployer,  # treasury
         "0x0000000000000000000000000000000000000000",  # vaultMinter (off)
         "0x0000000000000000000000000000000000000000",  # governor (unset)
+        "0x0000000000000000000000000000000000000000",  # repToken (none)
+        5000,                                          # anchorQuorumBps
+        [deployer],                                    # genesisSigners
+        1,                                             # genesisQuorum
     ).transact(
         {"from": deployer, "gas": 8_000_000})
     receipt = w3.eth.wait_for_transaction_receipt(tx)
@@ -325,8 +329,15 @@ class TestVoiceStateOwnerMap:
         anchorer = EpochAnchorer(
             config=EpochAnchorerConfig(epoch_anchor_address=addr),
             web3=w3, contract_abi=abi)
+        # Anchor authority (2026-10-12): the deployer is the genesis signer
+        # and must be a registered agent to carry weight.
+        sub = w3.eth.contract(address=addr, abi=abi)
+        w3.eth.wait_for_transaction_receipt(sub.functions.registerAgent(
+            Web3.keccak(text="genesis"), b"genesis-peer",
+        ).transact({"from": fx["deployer"], "gas": 400_000}))
         anchor_result = anchorer.anchor_close_result(
-            result, from_address=fx["deployer"])
+            result, from_address=fx["deployer"],
+            signer_keys=[keys[fx["deployer"].lower()]])
         assert anchor_result.success
 
         state = read_voice_state(addr, web3=w3)

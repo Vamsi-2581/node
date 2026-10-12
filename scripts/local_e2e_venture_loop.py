@@ -77,6 +77,7 @@ if str(REPO) not in sys.path:
 # scoreboard, runtime + agent builders, the fake embedder.
 from scripts.local_e2e_tool_economy import (  # noqa: E402
     CHAIN_ID,
+    HH_GENESIS_PK,
     RPC_URL,
     Board,
     _fake_embedder,
@@ -133,52 +134,31 @@ def _mint_leaf(agent_addr: str, amount: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# ATN mint faucet (the substrate's only mint path) — a registered agent
-# mints via one anchored single-leaf epoch, then transfers.
+# ATN faucet. Since 2026-10-12 a training mint needs a quorum-signed anchor
+# AND a fees-only pool funded by burned service fees, so test money comes
+# from the purchased-money rail instead: the local deploy wires
+# Substrate.vaultMinter to hardhat account #9 (HH_GENESIS_PK), which
+# mintFromVault's ATN to the faucet agent, which then transfers.
 # ---------------------------------------------------------------------------
 
 class ATNFaucet:
-    """Mints ATN to a faucet agent through the real anchor + record path,
-    then distributes by ordinary transfer. One anchored epoch per mint."""
+    """Buys ATN for a faucet agent via mintFromVault (test vaultMinter),
+    then distributes by ordinary transfer."""
 
     def __init__(self, w3, substrate, faucet_addr: str, faucet_key: str,
-                 submitter_key: str):
+                 minter_key: str):
         self.w3 = w3
         self.substrate = substrate
         self.faucet_addr = faucet_addr
         self.faucet_key = faucet_key
-        self.submitter_key = submitter_key
-        self._epoch = 0
-
-    def _digest(self, s: str) -> bytes:
-        return _keccak(s.encode("utf-8"))
+        self.minter_key = minter_key
 
     def mint(self, amount: int) -> None:
         from eth_account import Account
-        self._epoch += 1
-        epoch_id = f"venture-faucet-epoch-{self._epoch}"
-        root = _mint_leaf(self.faucet_addr, amount)
-        prev_root = self.substrate.functions.latestEpochRoot().call()
-        prev_anchor = self.substrate.functions.latestAnchorHash().call()
-
-        submitter = Account.from_key(self.submitter_key)
-        anchor_call = self.substrate.functions.submitAnchor(
-            epoch_id,
-            self._digest("root-" + epoch_id),
-            prev_root,
-            prev_anchor,
-            "cid-" + epoch_id,
-            self._digest("payload-" + epoch_id),
-            root,
-        )
-        self._send(anchor_call, self.submitter_key, submitter.address,
-                   gas=1_200_000)
-
-        epoch_id_hash = self._digest(epoch_id)
-        faucet = Account.from_key(self.faucet_key)
-        rec_call = self.substrate.functions.recordTrainingForEpoch(
-            amount, epoch_id_hash, [])
-        self._send(rec_call, self.faucet_key, faucet.address, gas=800_000)
+        minter = Account.from_key(self.minter_key)
+        call = self.substrate.functions.mintFromVault(
+            self.w3.to_checksum_address(self.faucet_addr), amount)
+        self._send(call, self.minter_key, minter.address, gas=300_000)
 
     def fund(self, to_addr: str, amount: int) -> None:
         from eth_account import Account
@@ -429,7 +409,8 @@ async def amain(from_stage: str = "A", to_stage: str = "G") -> int:
             faucet_lin, b"peer-faucet")
         send_agent_tx(w3, reg_call, faucet_key, faucet_addr, gas=800_000)
 
-        faucet = ATNFaucet(w3, substrate, faucet_addr, faucet_key, HH_KEYS[0])
+        faucet = ATNFaucet(w3, substrate, faucet_addr, faucet_key,
+                           HH_GENESIS_PK)
 
         # Owner-bound registrations: venture agent (owner VOWNER), verifiers
         # (distinct owners V1OWNER / V2OWNER, both != VOWNER).

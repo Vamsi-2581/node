@@ -22,8 +22,8 @@ Encoding (must match the contract byte-for-byte):
   odd levels promote the unpaired node unchanged
   single-leaf tree: root == leaf, proof == []
 
-Scaling: the same ``int(raw_float * mint_scale)`` truncation the
-agent-side submitter applies (authoritative_submitter, default 1e6).
+Scaling: ``round(raw_float * mint_scale)`` (scale_mint), the same
+conversion the agent-side submitter applies (default 1e6).
 Both sides MUST route through ``scale_mint`` here — a one-ulp float
 disagreement means an unprovable leaf.
 
@@ -48,9 +48,12 @@ EMPTY_ROOT = b"\x00" * 32
 
 
 def scale_mint(raw: float, mint_scale: int = DEFAULT_MINT_SCALE) -> int:
-    """The canonical float→int truncation. Identical to the submitter's
-    ``int(raw_mint * mint_scale)``."""
-    return int(float(raw) * mint_scale)
+    """The canonical float->int scaling, shared by the anchor (merkle root)
+    and the agent-side submitter. ROUNDS to the nearest base unit (changed
+    2026-10-12 from truncation): the close floors pool shares to exact
+    integers k and emits k/scale, which truncation could turn into k-1
+    (k/1e6*1e6 is not always exactly k in binary floating point)."""
+    return int(round(float(raw) * mint_scale))
 
 
 def mint_leaves(

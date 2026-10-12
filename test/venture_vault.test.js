@@ -20,16 +20,11 @@ function grossFor(net) {
   return g;
 }
 
-async function deploySubstrate() {
-  const Substrate = await ethers.getContractFactory("Substrate");
-  const s = await Substrate.deploy(
-    (await ethers.getSigners())[0].address,
-    "0x0000000000000000000000000000000000000000",
-    "0x0000000000000000000000000000000000000000"
-  );
-  await s.waitForDeployment();
-  return s;
-}
+const {
+  deploySubstrate,
+  mintATN: _helperMintATN,
+  fundATN: _helperFundATN,
+} = require("./helpers");
 
 async function registerAgent(substrate, signer, lineage) {
   return substrate
@@ -88,37 +83,9 @@ function mintLeaf(agentAddr, amount) {
   return ethers.keccak256(ethers.solidityPacked(["bytes32"], [inner]));
 }
 
-// Mint `amount` ATN to `faucetSigner` (a registered agent) via one anchored
-// epoch, then it is free to transfer. Returns nothing; balance lands on faucet.
-let _epochCounter = 0;
-async function mintATN(substrate, submitterSigner, faucetSigner, amount) {
-  _epochCounter += 1;
-  const epochId = "epoch-" + _epochCounter;
-  const root = mintLeaf(faucetSigner.address, amount);
-  const prevEpochRoot = await substrate.latestEpochRoot();
-  const prevAnchorHash = await substrate.latestAnchorHash();
-  await substrate
-    .connect(submitterSigner)
-    .submitAnchor(
-      epochId,
-      digest("root-" + epochId),
-      prevEpochRoot,
-      prevAnchorHash,
-      "cid-" + epochId,
-      digest("payload-" + epochId),
-      root
-    );
-  const epochIdHash = digest(epochId);
-  await substrate
-    .connect(faucetSigner)
-    .recordTrainingForEpoch(amount, epochIdHash, []);
-}
-
-// Fund `to` with `amount` ATN by minting to the faucet and transferring.
-async function fundATN(substrate, submitter, faucet, to, amount) {
-  await mintATN(substrate, submitter, faucet, amount);
-  await substrate.connect(faucet).transfer(to, amount);
-}
+// ATN faucet: purchased money via the test vault faucet (helpers.js).
+const mintATN = _helperMintATN;
+const fundATN = _helperFundATN;
 
 describe("VentureVault", function () {
   let substrate, factory;

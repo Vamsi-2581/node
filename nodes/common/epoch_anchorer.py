@@ -45,13 +45,19 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .authoritative_encoding import (
     cid_for_blob,
     encode_agent_mint_blob,
     encode_authoritative_payload,
     payload_hash,
+)
+from .anchor_auth import (
+    AnchorFields,
+    anchor_digest,
+    order_signatures,
+    sign_digest,
 )
 from .mint_merkle import mint_merkle_root
 
@@ -85,6 +91,19 @@ class AnchorResult:
     payload_hash_hex: str = ""
     agent_mint_root_hex: str = ""
     error: str = ""
+    # Anchor authority (2026-10-12): the EIP-712 digest signed and the
+    # recovered signer set that accompanied the submission.
+    digest_hex: str = ""
+    signers: list = field(default_factory=list)
+
+
+@dataclass
+class PreparedAnchor:
+    """Everything needed to sign + submit one anchor. ``result`` carries
+    the encoded blobs (success=False until submitted)."""
+    fields: AnchorFields
+    digest: bytes
+    result: AnchorResult
 
 
 class EpochAnchorer:
@@ -172,30 +191,30 @@ class EpochAnchorer:
     # Submit
     # ------------------------------------------------------------------
 
-    def anchor_close_result(
-        self,
-        close_result: Dict[str, Any],
-        *,
-        from_address: Optional[str] = None,
-    ) -> AnchorResult:
-        """Submit a federated close result to the chain.
+    def chain_id(self) -> int:
+        """The chain id the EIP-712 domain binds to (read from the node,
+        cached; falls back to config when the node cannot answer)."""
+        cached = getattr(self, "_chain_id_cache", None)
+        if cached is not None:
+            return cached
+        self._get_contract()
+        try:
+            cid = int(self._w3.eth.chain_id)
+        except Exception:
+            cid = int(self.config.chain_id)
+        self._chain_id_cache = cid
+        return cid
 
-        ``close_result`` is the dict returned by
-        ``federated_epoch_close``. We extract:
-          - ``authoritative_payload``: the chain-anchorable subset
-          - ``epoch_root``: hex string
-          - ``agent_mint``: dict for the off-chain blob
-
-        ``from_address`` overrides the submitter address (useful in
-        tests).
-        """
+    def prepare_anchor(self, close_result: Dict[str, Any]) -> PreparedAnchor:
+        """Encode a federated close result into anchor fields + the
+        AnchorApproval digest every signer signs. Reads the chain head
+        (latestEpochRoot / latestAnchorHash), so honest daemons reading
+        the same head derive the identical digest. Raises ValueError on a
+        malformed close result."""
         with self._lock:
             payload = close_result.get("authoritative_payload")
             if payload is None:
-                return AnchorResult(
-                    success=False,
-                    error="close_result has no authoritative_payload",
-                )
+                raise ValueError("close_result has no authoritative_payload")
 
             epoch_id = str(close_result.get("epoch_id") or "")
             if not epoch_id:
@@ -203,10 +222,7 @@ class EpochAnchorer:
                 epoch_id = f"e_{payload.get('epoch_root', '')[:16]}"
             epoch_root_hex = str(payload.get("epoch_root", ""))
             if not epoch_root_hex:
-                return AnchorResult(
-                    success=False,
-                    error="authoritative_payload missing epoch_root",
-                )
+                raise ValueError("authoritative_payload missing epoch_root")
 
             prev_root_bytes = self.latest_epoch_root()
             prev_anchor_bytes = self.latest_anchor_hash()
@@ -221,7 +237,7 @@ class EpochAnchorer:
                     prev_epoch_root_hex=prev_root_hex,
                 )
             except Exception as e:
-                return AnchorResult(success=False, error=f"encoding failed: {e}")
+                raise ValueError(f"encoding failed: {e}") from e
 
             ph = payload_hash(payload_bytes)
 
@@ -236,34 +252,19 @@ class EpochAnchorer:
             # 2-field (agent, amount) leaf.
             mint_root = mint_merkle_root(agent_mint)
 
-            try:
-                tx_hash = self._submit(
-                    epoch_id=epoch_id,
-                    epoch_root=bytes.fromhex(epoch_root_hex),
-                    prev_epoch_root=prev_root_bytes,
-                    prev_anchor_hash=prev_anchor_bytes,
-                    agent_mint_cid=cid,
-                    payload_hash_bytes=ph,
-                    agent_mint_root=mint_root,
-                    from_address=from_address,
-                )
-            except Exception as e:
-                return AnchorResult(
-                    success=False,
-                    error=f"submitAnchor reverted: {e}",
-                    epoch_id=epoch_id,
-                    epoch_root_hex=epoch_root_hex,
-                    prev_epoch_root_hex=prev_root_hex,
-                    agent_mint_cid=cid,
-                    agent_mint_blob=mint_blob,
-                    payload_bytes=payload_bytes,
-                    payload_hash_hex=ph.hex(),
-                    agent_mint_root_hex=mint_root.hex(),
-                )
-
-            return AnchorResult(
-                success=True,
-                tx_hash=tx_hash,
+            fields = AnchorFields(
+                epoch_id=epoch_id,
+                epoch_root=bytes.fromhex(epoch_root_hex),
+                prev_epoch_root=prev_root_bytes,
+                prev_anchor_hash=prev_anchor_bytes,
+                agent_mint_cid=cid,
+                payload_hash=ph,
+                agent_mint_root=mint_root,
+            )
+            digest = anchor_digest(
+                fields, self.chain_id(), self.config.epoch_anchor_address)
+            result = AnchorResult(
+                success=False,
                 epoch_id=epoch_id,
                 epoch_root_hex=epoch_root_hex,
                 prev_epoch_root_hex=prev_root_hex,
@@ -272,7 +273,87 @@ class EpochAnchorer:
                 payload_bytes=payload_bytes,
                 payload_hash_hex=ph.hex(),
                 agent_mint_root_hex=mint_root.hex(),
+                digest_hex=digest.hex(),
             )
+            return PreparedAnchor(fields=fields, digest=digest, result=result)
+
+    def anchor_count(self) -> int:
+        return int(self._get_contract().functions.anchorCount().call())
+
+    def are_registered(self, addrs: List[str]) -> List[bool]:
+        if not addrs:
+            return []
+        contract = self._get_contract()
+        return [bool(x) for x in contract.functions.areRegistered(
+            [self._w3.to_checksum_address(a) for a in addrs]).call()]
+
+    def anchor_quorum(self, signers: List[str]) -> Dict[str, Any]:
+        """Contract view: quorum status of a (sorted) signer set for the
+        NEXT anchor. {weight, total, genesis, reached}."""
+        contract = self._get_contract()
+        w, t, g, ok = contract.functions.anchorQuorum(
+            [self._w3.to_checksum_address(a) for a in signers]).call()
+        return {"weight": int(w), "total": int(t), "genesis": bool(g),
+                "reached": bool(ok)}
+
+    def submit_prepared(
+        self,
+        prepared: PreparedAnchor,
+        signatures: List[bytes],
+        *,
+        from_address: Optional[str] = None,
+    ) -> AnchorResult:
+        """Submit a prepared anchor with the collected signatures (any
+        order, duplicates fine: they are recovered, deduped and sorted)."""
+        with self._lock:
+            r = prepared.result
+            signers, ordered = order_signatures(prepared.digest, signatures)
+            r.signers = signers
+            try:
+                r.tx_hash = self._submit(
+                    epoch_id=prepared.fields.epoch_id,
+                    epoch_root=prepared.fields.epoch_root,
+                    prev_epoch_root=prepared.fields.prev_epoch_root,
+                    prev_anchor_hash=prepared.fields.prev_anchor_hash,
+                    agent_mint_cid=prepared.fields.agent_mint_cid,
+                    payload_hash_bytes=prepared.fields.payload_hash,
+                    agent_mint_root=prepared.fields.agent_mint_root,
+                    signatures=ordered,
+                    from_address=from_address,
+                )
+                r.success = True
+                r.error = ""
+            except Exception as e:
+                r.success = False
+                r.error = f"submitAnchor reverted: {e}"
+            return r
+
+    def anchor_close_result(
+        self,
+        close_result: Dict[str, Any],
+        *,
+        from_address: Optional[str] = None,
+        signatures: Optional[List[bytes]] = None,
+        signer_keys: Optional[List[str]] = None,
+    ) -> AnchorResult:
+        """Prepare + sign + submit in one call.
+
+        ``signatures`` are pre-collected AnchorApproval signatures;
+        ``signer_keys`` are agent private keys this process signs with
+        directly (single-daemon / tests). ``from_address`` overrides the
+        relaying submitter address (useful in tests); the relayer itself
+        carries no authority.
+        """
+        with self._lock:
+            try:
+                prepared = self.prepare_anchor(close_result)
+            except ValueError as e:
+                return AnchorResult(success=False, error=str(e))
+            sigs = list(signatures or [])
+            for k in signer_keys or []:
+                sigs.append(sign_digest(k, prepared.digest))
+            return self.submit_prepared(
+                prepared, sigs, from_address=from_address)
 
     def _submit(
         self,
@@ -284,12 +365,14 @@ class EpochAnchorer:
         agent_mint_cid: str,
         payload_hash_bytes: bytes,
         agent_mint_root: bytes,
+        signatures: Optional[List[bytes]] = None,
         from_address: Optional[str] = None,
     ) -> str:
         contract = self._get_contract()
         w3 = self._w3
         if w3 is None:
             raise RuntimeError("EpochAnchorer has no Web3 instance")
+        sigs = [bytes(x) for x in (signatures or [])]
 
         # Resolve sender: explicit override > previously-set address >
         # derive from private key (production) > eth_accounts[0]
@@ -324,6 +407,7 @@ class EpochAnchorer:
                 agent_mint_cid,
                 payload_hash_bytes,
                 agent_mint_root,
+                sigs,
             ).transact({"from": sender})
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
             if receipt.status != 1:
@@ -346,6 +430,7 @@ class EpochAnchorer:
                 agent_mint_cid,
                 payload_hash_bytes,
                 agent_mint_root,
+                sigs,
             ).estimate_gas({"from": sender})
             gas_limit = max(int(estimated * 12 // 10), 1_500_000)
         except Exception:
@@ -358,6 +443,7 @@ class EpochAnchorer:
             agent_mint_cid,
             payload_hash_bytes,
             agent_mint_root,
+            sigs,
         ).build_transaction({
             "from": sender,
             "nonce": w3.eth.get_transaction_count(sender),

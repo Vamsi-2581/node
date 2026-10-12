@@ -208,7 +208,11 @@ async function main() {
   // Substrate(treasury, vaultMinter, governor). governor=zero => the service
   // fee is frozen at its 2.5% default, which is what this script asserts.
   const Substrate = await ethers.getContractFactory("Substrate");
-  const substrate = await Substrate.deploy(deployer.address, zero, zero);
+  // Substrate(treasury, vaultMinter, governor, repToken, anchorQuorumBps,
+  // genesisSigners, genesisQuorum): deployer = treasury + test vaultMinter
+  // (purchased-ATN faucet) + sole genesis anchor signer (2026-10-12).
+  const substrate = await Substrate.deploy(
+    deployer.address, deployer.address, zero, zero, 5000, [deployer.address], 1);
   await substrate.waitForDeployment();
   const substrateAddr = await substrate.getAddress();
 
@@ -758,33 +762,16 @@ async def amain() -> int:  # noqa: C901 — a linear E2E script, staged for read
     try:
         if provider is None:
             raise RuntimeError("no ServiceProvider from stage 5")
-        # Fund the child's wallet. ATN only enters existence through the epoch
-        # mint path (Substrate has no admin mint), so this uses the production
-        # rail: anchor an epoch whose agentMintRoot commits the child's share,
-        # then have the CHILD record its own mint from its own key. That is
-        # also the honest story of where a child's operating float comes from —
-        # the employer allocates it in the close, the child claims it itself.
-        from eth_utils import keccak
-        from nodes.common.mint_merkle import mint_merkle_proof, mint_merkle_root
-
-        epoch_id = "e2e-svcprov-epoch-1"
-        epoch_hash = keccak(text=epoch_id)
-        # mint_scale=1: CHILD_FUNDING is already in base units here.
-        mint_map = {child_addr: float(CHILD_FUNDING)}
-        mint_root = mint_merkle_root(mint_map, 1)
-        proof = mint_merkle_proof(mint_map, child_addr, 1) or []
-        ZERO32 = b"\x00" * 32
-        send_tx(w3, substrate.functions.submitAnchor(
-            epoch_id,          # epochId (string)
-            ZERO32,            # epochRoot (unused by this rail)
-            ZERO32,            # prevEpochRoot (clean genesis)
-            ZERO32,            # prevAnchorHash (clean genesis)
-            "",                # agentMintCid (blob served off-chain)
-            ZERO32,            # payloadHash
-            mint_root,         # agentMintRoot — what the proof verifies against
-        ), owner_seller._private_key.hex(), owner_seller.address)
-        send_tx(w3, substrate.functions.recordTrainingForEpoch(
-            CHILD_FUNDING, epoch_hash, proof), child_key, child_addr)
+        # Fund the child's wallet. Since 2026-10-12 a training mint needs a
+        # quorum-signed anchor and a fee-backed pool, so local float comes
+        # from the purchased-money rail: the deploy wires vaultMinter to the
+        # deployer (hardhat account 0).
+        from eth_account import Account as _Acct
+        _deployer = _Acct.from_key(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+        send_tx(w3, substrate.functions.mintFromVault(
+            child_addr, CHILD_FUNDING), _deployer._private_key.hex(),
+            _deployer.address)
         child_atn = substrate.functions.balanceOf(child_addr).call()
         assert child_atn >= SERVICE_ASK, (
             f"child wallet only holds {child_atn}, needs >= {SERVICE_ASK}")

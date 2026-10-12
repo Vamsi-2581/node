@@ -120,21 +120,17 @@ def chain():
     data = json.loads(ARTIFACT.read_text(encoding="utf-8"))
     w3 = Web3(EthereumTesterProvider())
     deployer = w3.eth.accounts[0]
-    zero = "0x0000000000000000000000000000000000000000"
-    contract_f = w3.eth.contract(abi=data["abi"], bytecode=data["bytecode"])
-    # Substrate(treasury, vaultMinter, governor). governor=zero => fee lever
-    # frozen; irrelevant to the mint-proof path.
-    tx = contract_f.constructor(deployer, zero, zero).transact(
-        {"from": deployer, "gas": 8_000_000})
-    receipt = w3.eth.wait_for_transaction_receipt(tx)
-    assert receipt.status == 1
-    contract = w3.eth.contract(address=receipt.contractAddress, abi=data["abi"])
+    from tests.substrate_chain_helpers import deploy_substrate, seed_pool
+    addr = deploy_substrate(w3, data["abi"], data["bytecode"], deployer)
+    contract = w3.eth.contract(address=addr, abi=data["abi"])
     agent_addrs = w3.eth.accounts[1:4]
     for i, a in enumerate(agent_addrs):
         tx = contract.functions.registerAgent(
             Web3.keccak(text=f"lineage-{i}"), f"peer-{i}".encode(),
         ).transact({"from": a, "gas": 500_000})
         assert w3.eth.wait_for_transaction_receipt(tx).status == 1
+    # Fees-only pool for the next anchor (on-chain conservation).
+    seed_pool(w3, contract)
     return {
         "w3": w3, "abi": data["abi"], "addr": contract.address,
         "contract": contract, "deployer": deployer,
@@ -167,7 +163,10 @@ def _anchor_with_mint(chain, mint: Dict[str, float], epoch_id: str):
         config=EpochAnchorerConfig(epoch_anchor_address=chain["addr"]),
         web3=chain["w3"], contract_abi=chain["abi"],
     )
-    s = anchorer.anchor_close_result(result, from_address=chain["deployer"])
+    from tests.substrate_chain_helpers import genesis_keys
+    s = anchorer.anchor_close_result(
+        result, from_address=chain["deployer"],
+        signer_keys=genesis_keys(chain["w3"]))
     assert s.success, s.error
     return s
 
@@ -204,6 +203,7 @@ def test_contract_mints_atn_at_amount(chain):
     contract = chain["contract"]
     addrs = chain["agent_addrs"]
     mint = {addrs[0]: 4.0, addrs[1]: 1.0}
+    supply0 = contract.functions.atnTotalSupply().call()
     s = _anchor_with_mint(chain, mint, "e_atn")
     eid = epoch_id_hash("e_atn")
 
@@ -213,7 +213,7 @@ def test_contract_mints_atn_at_amount(chain):
     assert _record(chain, a, amount, eid, proof)
 
     assert contract.functions.balanceOf(a).call() == amount
-    assert contract.functions.atnTotalSupply().call() == amount
+    assert contract.functions.atnTotalSupply().call() == supply0 + amount
     assert contract.functions.mintForEpoch(a, eid).call() == amount
     # agentMintTotal = cumulative pool earnings (money).
     assert contract.functions.agentMintTotal(a).call() == amount

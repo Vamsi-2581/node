@@ -372,7 +372,11 @@ async function main() {
   // Substrate(treasury, vaultMinter, governor). governor=zero => the service
   // fee is frozen at its 2.5% default, which is what this script asserts.
   const Substrate = await ethers.getContractFactory("Substrate");
-  const substrate = await Substrate.deploy(deployer.address, zero, zero);
+  // Substrate(treasury, vaultMinter, governor, repToken, anchorQuorumBps,
+  // genesisSigners, genesisQuorum): deployer = treasury + test vaultMinter
+  // (purchased-ATN faucet) + sole genesis anchor signer (2026-10-12).
+  const substrate = await Substrate.deploy(
+    deployer.address, deployer.address, zero, zero, 5000, [deployer.address], 1);
   await substrate.waitForDeployment();
   const substrateAddr = await substrate.getAddress();
 
@@ -508,40 +512,17 @@ def register_agent_on_chain(w3, substrate, shape, *, agent_pk: str,
 def fund_agent_atn(w3, substrate, *, epoch_id: str, agent_addr: str,
                    agent_key: str, amount: int, anchor_pk: str,
                    anchor_addr: str) -> int:
-    """Mint ATN into an agent's own wallet through the PRODUCTION rail.
+    """Fund an agent's own wallet with ATN.
 
-    Substrate has no admin mint: ATN only enters existence via the epoch close.
-    So we anchor an epoch whose agentMintRoot commits this agent's share, then
-    have the AGENT record its own mint from its own key. That is also the honest
-    story of where an agent's operating float comes from — the network allocates
-    it in the close and the agent claims it itself.
+    Since 2026-10-12 a training mint needs a quorum-signed anchor AND a
+    fees-only pool backed by burned service fees, so a fresh local chain
+    cannot mint operating float through the close. The local deploy wires
+    Substrate.vaultMinter to the deployer (``anchor_pk``), so this uses the
+    purchased-money rail (mintFromVault) instead. ``epoch_id`` and
+    ``agent_key`` are kept for call-site compatibility.
     """
-    from eth_utils import keccak
-    from nodes.common.mint_merkle import mint_merkle_proof, mint_merkle_root
-
-    epoch_hash = keccak(text=epoch_id)
-    # mint_scale=1: `amount` is already in base units.
-    mint_map = {agent_addr: float(amount)}
-    mint_root = mint_merkle_root(mint_map, 1)
-    proof = mint_merkle_proof(mint_map, agent_addr, 1) or []
-    ZERO32 = b"\x00" * 32
-    # submitAnchor HASH-CHAINS: prevEpochRoot/prevAnchorHash must equal the
-    # contract's current latest*, not zeros. Zeros are right only for the very
-    # first anchor — and in a split run the provider box anchors first, so the
-    # consumer's anchor would revert with PrevAnchorHashMismatch. Read the head.
-    prev_epoch_root = bytes(substrate.functions.latestEpochRoot().call())
-    prev_anchor_hash = bytes(substrate.functions.latestAnchorHash().call())
-    send_tx(w3, substrate.functions.submitAnchor(
-        epoch_id,          # epochId (string)
-        ZERO32,            # epochRoot (unused by this rail)
-        prev_epoch_root,   # prevEpochRoot — the chain head
-        prev_anchor_hash,  # prevAnchorHash — the chain head
-        "",                # agentMintCid (blob served off-chain)
-        ZERO32,            # payloadHash
-        mint_root,         # agentMintRoot — what the proof verifies against
-    ), anchor_pk, anchor_addr)
-    send_tx(w3, substrate.functions.recordTrainingForEpoch(
-        amount, epoch_hash, proof), agent_key, agent_addr)
+    send_tx(w3, substrate.functions.mintFromVault(agent_addr, amount),
+            anchor_pk, anchor_addr)
     return substrate.functions.balanceOf(agent_addr).call()
 
 

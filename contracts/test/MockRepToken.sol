@@ -31,6 +31,12 @@ contract MockRepToken {
         _supply.push(Point(ts, supplyPrev + value - prev));
     }
 
+    /// @dev Bump total supply WITHOUT any account's votes (models REP held
+    ///      by a holder that never delegated: counts in supply, votes nowhere).
+    function addUndelegatedSupply(uint256 amount) external {
+        _supply.push(Point(block.timestamp, _latest(_supply) + amount));
+    }
+
     function _latest(Point[] storage pts) private view returns (uint256) {
         if (pts.length == 0) return 0;
         return pts[pts.length - 1].value;

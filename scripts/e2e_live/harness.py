@@ -317,7 +317,10 @@ def deploy(w3) -> Dict[str, str]:
             raise RuntimeError(f"deploy {name} failed: {rcpt}")
         return rcpt.contractAddress
 
-    sub = _deploy("Substrate", "Substrate", acct.address, zero, zero)
+    # (treasury, vaultMinter, governor, repToken, anchorQuorumBps,
+    #  genesisSigners, genesisQuorum), 2026-10-12 anchor authority.
+    sub = _deploy("Substrate", "Substrate", acct.address, acct.address,
+                  zero, zero, 5000, [acct.address], 1)
     out = {
         "substrate": sub,
         "service_registry": _deploy("ServiceRegistry", "ServiceMarket", sub),

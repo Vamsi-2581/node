@@ -1044,6 +1044,9 @@ class AutonetService:
                 config=cfg,
                 agent_chain_resolver=agent_chain_resolver,
                 blob_resolver=blob_resolver,
+                # Anchor signatures ride the same gossip transport as the
+                # event batches (topic <event topic>/anchor-sig/1).
+                gossip=getattr(self._federated_close_driver, "gossip", None),
             )
         except Exception as e:
             logger.warning("ChainSubmissionDriver build failed: %s", e)

@@ -39,6 +39,11 @@ from nodes.common.canonical_ordering import canonical_order
 from nodes.common.epoch_anchorer import EpochAnchorer, EpochAnchorerConfig
 from nodes.common.event_gossip import EventBatch, Keypair
 from nodes.common.federated_reconcile import federated_epoch_close
+from tests.substrate_chain_helpers import (
+    deploy_substrate,
+    genesis_keys,
+    seed_pool,
+)
 
 
 SUBSTRATE_JSON = Path("C:/code/autonet/artifacts/contracts/core/Substrate.sol/Substrate.json")
@@ -52,14 +57,9 @@ def _load_substrate() -> Tuple[list, str]:
 
 
 def _deploy(w3: Web3, deployer: str, abi: list, bytecode: str) -> str:
-    contract = w3.eth.contract(abi=abi, bytecode=bytecode)
-    zero = "0x0000000000000000000000000000000000000000"
-    tx = contract.constructor(
-        deployer, zero, zero
-    ).transact({"from": deployer, "gas": 8_000_000})
-    receipt = w3.eth.wait_for_transaction_receipt(tx)
-    assert receipt.status == 1
-    return receipt.contractAddress
+    # Genesis-mode anchor authority (account 9, registered); treasury =
+    # deployer.
+    return deploy_substrate(w3, abi, bytecode, deployer)
 
 
 def _register_agent(w3: Web3, contract, agent_addr: str, lineage_seed: str) -> None:
@@ -148,7 +148,8 @@ def _give_agent_some_atn(chain_fixture, agent_id: str, agent_addr: str) -> int:
         config=EpochAnchorerConfig(epoch_anchor_address=chain_fixture["addr"]),
         web3=w3, contract_abi=chain_fixture["abi"],
     )
-    s = anchorer.anchor_close_result(result, from_address=deployer)
+    s = anchorer.anchor_close_result(
+        result, from_address=deployer, signer_keys=genesis_keys(w3))
     assert s.success
     resolver = InMemoryBlobResolver()
     resolver.put(s.agent_mint_blob)
@@ -175,6 +176,8 @@ def chain():
     agent_addrs = accounts[1:5]
     for i, ad in enumerate(agent_addrs):
         _register_agent(w3, contract, ad, f"agent-lineage-{i}")
+    # Fees-only pool so _give_agent_some_atn's anchor can mint.
+    seed_pool(w3, contract)
 
     return {
         "w3": w3, "abi": abi, "addr": addr, "contract": contract,

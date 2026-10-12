@@ -47,7 +47,9 @@ owner map derive from ``AgentRegistered`` / ``OwnerBound`` event logs up
 to the snapshot block (last binding per agent wins).
 
 The emission pool is FEES-ONLY (Decision 2026-07-10): the burned
-ServiceFee shares in the snapshot anchor's window, no base floor. Zero
+ServiceFee shares in the snapshot anchor's window, no base floor. Since
+2026-10-12 it is read from the anchor struct's ``windowBurned`` (the exact
+quantity Substrate caps the next epoch's mints at), not summed from logs. Zero
 service volume => zero pool => zero mint. It is MONEY, ATN-denominated.
 
 No prior anchor = no agreed snapshot: the refresh returns empty maps and
@@ -109,6 +111,9 @@ _VOICE_ABI = [
                 {"internalType": "uint256", "name": "blockNumber",   "type": "uint256"},
                 {"internalType": "uint256", "name": "timestamp",     "type": "uint256"},
                 {"internalType": "bytes32", "name": "agentMintRoot", "type": "bytes32"},
+                {"internalType": "uint256", "name": "windowBurned",  "type": "uint256"},
+                {"internalType": "uint256", "name": "mintPool",      "type": "uint256"},
+                {"internalType": "uint256", "name": "minted",        "type": "uint256"},
             ],
             "internalType": "struct Substrate.Anchor",
             "name": "",
@@ -271,25 +276,20 @@ def read_voice_state(
             "snapshot_block": None,
             "emission_pool": 0.0,
             "recycled": 0.0,
+            "emission_pool_raw": 0,
+            "snapshot_anchor_count": 0,
             "weight_source": "reputation",
         }
     anchor = contract.functions.getAnchor(anchor_count - 1).call()
     block = int(anchor[7])       # Anchor.blockNumber (struct field 7)
     timestamp = int(anchor[8])   # Anchor.timestamp (struct field 8)
 
-    # Fees-only emission: sum the burned fee shares in this anchor's
-    # window — (previous anchor block, this anchor block]. Every fee
-    # lands in exactly one window, so recycling conserves across epochs.
-    if anchor_count >= 2:
-        prev_anchor = contract.functions.getAnchor(anchor_count - 2).call()
-        window_start = int(prev_anchor[7]) + 1
-    else:
-        window_start = _deployment_block(w3, contract.address)
-    burned_raw = 0
-    for log in _get_logs(contract.events.ServiceFee, w3,
-                         contract.address, block):
-        if int(log["blockNumber"]) >= window_start:
-            burned_raw += int(log["args"]["burned"])
+    # Fees-only emission, read from the SAME on-chain quantity Substrate
+    # caps mints with (2026-10-12): the snapshot anchor's windowBurned =
+    # fees burned between the previous anchor and it (tx-order exact).
+    # Substrate sets the next anchor's mintPool to exactly this value, so
+    # the close's pool and the on-chain cap cannot disagree.
+    burned_raw = int(anchor[10]) if len(anchor) > 10 else 0
     recycled = burned_raw / _ATN_SCALE
 
     # Agent set + owner map from event logs up to the snapshot block —
@@ -370,5 +370,10 @@ def read_voice_state(
         # Fees-only pool (Decision 2026-07-10): burned fees, no base floor.
         "emission_pool": round(recycled, 10),
         "recycled": round(recycled, 10),
+        # Exact on-chain pool (base units) + which anchor it was read at:
+        # the anchor this close produces is valid only as anchor number
+        # snapshot_anchor_count (else its on-chain mintPool differs).
+        "emission_pool_raw": burned_raw,
+        "snapshot_anchor_count": int(anchor_count),
         "weight_source": "reputation",
     }

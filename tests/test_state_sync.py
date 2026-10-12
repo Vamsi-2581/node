@@ -41,6 +41,7 @@ from nodes.common.state_sync import (
 )
 from nodes.common.world_persistence import PersistenceConfig, WorldPersistence
 from world_model.generalized import worlds_equal
+from tests.substrate_chain_helpers import deploy_substrate, genesis_keys
 
 ARTIFACT = Path("C:/code/autonet/artifacts/contracts/core/Substrate.sol/Substrate.json")
 EMBED_DIM = 8
@@ -54,15 +55,14 @@ def chain():
     data = json.loads(ARTIFACT.read_text(encoding="utf-8"))
     w3 = Web3(EthereumTesterProvider())
     deployer = w3.eth.accounts[0]
-    contract = w3.eth.contract(abi=data["abi"], bytecode=data["bytecode"])
-    tx = contract.constructor(deployer, "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000").transact({"from": deployer, "gas": 8_000_000})
-    receipt = w3.eth.wait_for_transaction_receipt(tx)
-    assert receipt.status == 1
+    # Genesis-mode anchor authority (account 9, registered). No seed
+    # pool: these tests anchor but never mint.
+    addr = deploy_substrate(w3, data["abi"], data["bytecode"], deployer)
     return {
         "w3": w3,
         "abi": data["abi"],
-        "addr": receipt.contractAddress,
-        "contract": w3.eth.contract(address=receipt.contractAddress, abi=data["abi"]),
+        "addr": addr,
+        "contract": w3.eth.contract(address=addr, abi=data["abi"]),
         "deployer": deployer,
     }
 
@@ -95,7 +95,8 @@ def _batches(kp: Keypair, agent_id: str, n: int, start_seq: int = 1) -> List[Eve
     return out
 
 
-def _close_one_epoch(tracker, anchorer, resolver, kp, epoch_id, start_seq=1):
+def _close_one_epoch(tracker, anchorer, resolver, kp, epoch_id, keys,
+                     start_seq=1):
     """Replicate the FederatedCloseDriver + ChainSubmissionDriver flow
     for one epoch: canonical order -> federated close -> tracker ->
     world_cid into payload -> anchor -> publish blobs.
@@ -111,7 +112,7 @@ def _close_one_epoch(tracker, anchorer, resolver, kp, epoch_id, start_seq=1):
     )
     close_result["authoritative_payload"]["world_cid"] = ckpt.cid
 
-    anchor = anchorer.anchor_close_result(close_result)
+    anchor = anchorer.anchor_close_result(close_result, signer_keys=keys)
     assert anchor.success, anchor.error
     resolver.put(anchor.payload_bytes)   # cid == on-chain payloadHash
     resolver.put(ckpt.blob)
@@ -130,8 +131,11 @@ def synced_network(chain):
     tracker = CanonicalWorldTracker(embedding_dim=EMBED_DIM)
     kp = Keypair.generate()
 
-    ckpt1, _ = _close_one_epoch(tracker, anchorer, resolver, kp, "e_sync_1", start_seq=1)
-    ckpt2, _ = _close_one_epoch(tracker, anchorer, resolver, kp, "e_sync_2", start_seq=10)
+    keys = genesis_keys(chain["w3"])
+    ckpt1, _ = _close_one_epoch(tracker, anchorer, resolver, kp, "e_sync_1",
+                                keys, start_seq=1)
+    ckpt2, _ = _close_one_epoch(tracker, anchorer, resolver, kp, "e_sync_2",
+                                keys, start_seq=10)
     return {
         "chain": chain,
         "resolver": resolver,
@@ -256,7 +260,8 @@ def test_catch_up_none_for_pre_state_sync_anchor(chain):
     close_result = federated_epoch_close(canonical, embedding_dim=EMBED_DIM)
     close_result["epoch_id"] = "e_old"
     # No world_cid injected -> encodes as "".
-    anchor = anchorer.anchor_close_result(close_result)
+    anchor = anchorer.anchor_close_result(
+        close_result, signer_keys=genesis_keys(chain["w3"]))
     assert anchor.success, anchor.error
     resolver = InMemoryBlobResolver()
     resolver.put(anchor.payload_bytes)
