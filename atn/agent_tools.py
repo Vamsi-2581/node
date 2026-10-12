@@ -347,11 +347,14 @@ _TOOLS: list[ToolDefinition] = [
                         "REQUIRED (cognitive mode). The provider the child "
                         "runs on: a built-in id (claude_max, codex_max, "
                         "anthropic, openai, gemini, deepseek, ollama, "
-                        "substrate, service), a custom provider id from "
+                        "substrate, service, jev), a custom provider id from "
                         "config.yaml, or 'rpb' for sponsor-routed dependents. "
                         "Choose deliberately: nothing is inherited from you "
                         "and there is no default. Not needed when "
-                        "'service_provider' binds the child to a purchase."
+                        "'service_provider' binds the child to a purchase. "
+                        "'jev' is a judgment model (choice/score/true-false), "
+                        "not an LLM: no tools, no prose; declare its questions "
+                        "in a ```jev JSON block in system_prompt."
                     ),
                 },
                 "max_turns": {
@@ -1722,6 +1725,14 @@ async def _update_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
         if routing_err:
             return {"error": f"update_agent: {routing_err}. Provider and "
                              "model can be changed but not cleared."}
+    if "provider" in input or "tools" in input:
+        # A tool-less provider (Jev) cannot run an agent that has tools.
+        from .provider_identity import tool_binding_error
+        tool_err = tool_binding_error(
+            input["provider"] if "provider" in input else defn.provider,
+            input["tools"] if "tools" in input else defn.tools)
+        if tool_err:
+            return {"error": f"update_agent: {tool_err}."}
     if "model" in input:
         defn.cognitive_model = input["model"]
         changed.append("model")
@@ -2096,6 +2107,21 @@ async def _create_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
                              "'provider' and 'model' explicitly; a child "
                              "never inherits its parent's."}
 
+        # A tool-less provider (Jev) gets no tools unless the caller asks,
+        # and an explicit tool list on one is refused.
+        from .provider_identity import TOOLLESS_PROVIDER_IDS, tool_binding_error
+        _chain = (explicit_provider if isinstance(explicit_provider, list)
+                  else [explicit_provider])
+        if "tools" in input:
+            agent_tools_spec = input["tools"]
+        elif any(p in TOOLLESS_PROVIDER_IDS for p in _chain if isinstance(p, str)):
+            agent_tools_spec = []
+        else:
+            agent_tools_spec = ["sdk_builtin", "atn_core"]
+        tool_err = tool_binding_error(explicit_provider, agent_tools_spec)
+        if tool_err:
+            return {"error": f"create_agent: {tool_err}."}
+
         model_tier = get_model_tier(effective_model)
 
         # Warn if model tier seems low for agent_type
@@ -2117,7 +2143,7 @@ async def _create_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
             task_prompt=prompt,
             agent_type=agent_type,
             max_turns=input.get("max_turns", 50),
-            tools=input.get("tools", ["sdk_builtin", "atn_core"]),
+            tools=agent_tools_spec,
             concurrency=input.get("concurrency", 1),
             schedule=input.get("schedule"),
             description=input.get("description", prompt[:200] if prompt else ""),

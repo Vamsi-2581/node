@@ -17,6 +17,7 @@ _HINTS: list[tuple[str, list[str]]] = [
     ("ANTHROPIC", ["api.anthropic.com"]),
     ("OPENAI", ["api.openai.com"]),
     ("DEEPSEEK", ["api.deepseek.com"]),
+    ("TYPESAFE", ["api.typesafe.ai"]),
     ("GEMINI", ["generativelanguage.googleapis.com"]),
     ("GOOGLE_API", ["generativelanguage.googleapis.com"]),
     ("ELEVENLABS", ["api.elevenlabs.io"]),

@@ -61,7 +61,7 @@ log = logging.getLogger(__name__)
 # openai.com/api/pricing, ai.google.dev/pricing, deepseek published rates),
 # reconciled 2026-07-05. Subscription models (claude_max) have no per-token
 # dollar price — their cost is a flat monthly fee, metered by quota instead.
-_PRICING_AS_OF = "2026-09-17"
+_PRICING_AS_OF = "2026-10-13"
 
 
 @dataclass(frozen=True)
@@ -109,6 +109,10 @@ _PRICING: dict[str, ModelPricing] = {
     "deepseek-chat":     ModelPricing(input=0.27, output=1.10, cache_read=0.07),
     "deepseek-v4-pro":   ModelPricing(input=0.55, output=2.19, cache_read=0.14),
     "deepseek-v4-flash": ModelPricing(input=0.14, output=0.28, cache_read=0.035),
+    # ---- TypeSafe Jev: billed per INPUT token only, output free
+    # (docs.typesafe.ai/models, jev-1.13.0: $0.042/Mtok). Prefix "jev"
+    # covers the jev-latest / jev-preview aliases.
+    "jev":               ModelPricing(input=0.042, output=0.0),
     # ---- Google Gemini ----
     "gemini-3-pro":     ModelPricing(input=1.25, output=10.0, cache_read=0.3125),
     "gemini-3-flash":   ModelPricing(input=0.30, output=2.5,  cache_read=0.075),

@@ -254,6 +254,23 @@ _MODELS: tuple[ModelSpec, ...] = (
         relative_cost=0.05, default_channel="deepseek",
     ),
 
+    # ---- TypeSafe Jev (judgment model, not an LLM) ----
+    # 64k per request, 32k for state plus the longest question
+    # (docs.typesafe.ai/models). Answers are typed and tiny, never text.
+    ModelSpec(
+        id="jev-1.13.0", family="jev", klass="other",
+        display_name="Jev 1.13.0",
+        context_window=32_000, max_output_tokens=1_024,
+        relative_cost=0.0, default_channel="jev",
+        aliases=("jev-latest", "jev-preview"),
+    ),
+    ModelSpec(
+        id="jev", family="jev", klass="other",
+        display_name="Jev",
+        context_window=32_000, max_output_tokens=1_024,
+        relative_cost=0.0, default_channel="jev",
+    ),
+
     # ---- Google Gemini ----
     ModelSpec(
         id="gemini-3-pro", family="gemini", klass="other",

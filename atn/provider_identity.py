@@ -20,11 +20,16 @@ from typing import Any, Callable, Iterable
 # Provider ids the daemon knows how to build (ProviderManager._KNOWN_PROVIDERS).
 KNOWN_PROVIDER_IDS = frozenset({
     "claude_max", "codex_max", "anthropic", "gemini", "openai", "deepseek",
-    "ollama", "rpb", "service", "substrate",
+    "ollama", "rpb", "service", "substrate", "jev",
 })
 
 # Providers that can only be built with an API key on file.
-_API_KEY_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "deepseek"})
+_API_KEY_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "deepseek", "jev"})
+
+# Providers that answer typed questions but cannot call tools (Jev: a
+# calibrated judgment model, no text generation, no tool arguments). An agent
+# bound to one must have an empty tool list; see tool_binding_error.
+TOOLLESS_PROVIDER_IDS = frozenset({"jev"})
 
 # The provider id older clients wrote as a stand-in for "whatever the daemon
 # picks". Only the budget-key migration below may reference it.
@@ -76,6 +81,21 @@ def routing_error(
     if not (isinstance(model, str) and model.strip()):
         return "model is required: choose the model this agent runs on"
     return None
+
+
+def tool_binding_error(provider: Any, tools: Any) -> str | None:
+    """Why an agent with this provider and tool list cannot run, or None.
+
+    A provider in TOOLLESS_PROVIDER_IDS (anywhere in a fallback chain) cannot
+    call tools, so the agent must declare ``tools: []``. Refused at
+    create/update and again at resolve time."""
+    names = provider if isinstance(provider, list) else [provider]
+    toolless = [p for p in names if isinstance(p, str) and p in TOOLLESS_PROVIDER_IDS]
+    if not toolless or not tools:
+        return None
+    return (f"provider {toolless[0]!r} cannot call tools (it answers typed "
+            "questions only), so this agent must have tools=[]; "
+            f"got tools={list(tools)!r}")
 
 
 def effective_provider_id(

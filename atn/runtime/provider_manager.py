@@ -87,6 +87,9 @@ _MODEL_TIERS: dict[str, int] = {
     "gpt-4-turbo": 3,
     "gpt-4": 3,
     "gpt-3.5": 2,
+    # TypeSafe Jev: a judgment model (choice/score/true-false), no generation
+    # and no tool calls. Lowest tier so nothing tier-gated picks it by accident.
+    "jev": 1,
     # DeepSeek
     "deepseek-reasoner": 4,
     "deepseek-v4-pro": 4,
@@ -158,6 +161,13 @@ _PROVIDER_MODELS: dict[str, list[dict[str, str]]] = {
     "deepseek": [
         {"id": "deepseek-reasoner", "name": "DeepSeek V4-Pro (Reasoner)"},
         {"id": "deepseek-chat",     "name": "DeepSeek V4-Flash"},
+    ],
+    # docs.typesafe.ai/models: jev-latest and jev-preview are aliases (both
+    # -> jev-1.13.0 as of 2026-10); the versioned id pins a release.
+    "jev": [
+        {"id": "jev-latest", "name": "Jev (latest)"},
+        {"id": "jev-1.13.0", "name": "Jev 1.13.0"},
+        {"id": "jev-preview", "name": "Jev (preview)"},
     ],
 }
 
@@ -239,6 +249,16 @@ class ProviderManager:
             "description": "DeepSeek V4 models via DeepSeek API (requires API key)",
             "auth_type": "api_key",
         },
+        "jev": {
+            "name": "Jev (TypeSafe)",
+            "description": (
+                "Calibrated judgments (choice, score, true/false) via the "
+                "TypeSafe System One API. No text generation and no tool "
+                "calls: for classifier, router and identity-holding agents "
+                "with tools=[] (requires API key)."
+            ),
+            "auth_type": "api_key",
+        },
         "ollama": {
             "name": "Ollama (Local)",
             "description": "Local models via Ollama — no API key needed",
@@ -278,6 +298,10 @@ class ProviderManager:
         },
         "ollama": {
             "base_url": "http://localhost:11434",
+            "default_model": "",
+        },
+        "jev": {
+            "base_url": "https://api.typesafe.ai/v1",
             "default_model": "",
         },
     }
@@ -441,6 +465,10 @@ class ProviderManager:
         err = self.routing_error(providers, model)
         if err:
             raise ProviderError(f"Agent '{defn.id}' cannot run: {err}.")
+        from ..provider_identity import tool_binding_error
+        err = tool_binding_error(providers, getattr(defn, "tools", None))
+        if err:
+            raise ProviderError(f"Agent '{defn.id}' cannot run: {err}.")
 
         if isinstance(providers, list):
             names = [p for p in providers if isinstance(p, str) and p]
@@ -507,6 +535,8 @@ class ProviderManager:
                 api_key=api_key,
                 default_model=model,
             )
+        if provider_name == "jev":
+            return self._build_jev_provider(model, name=f"jev-{agent_id}")
         if provider_name == "ollama":
             defaults = self._PROVIDER_DEFAULTS.get("ollama", {})
             pconfig = self._config.providers.get("ollama")
@@ -538,6 +568,22 @@ class ProviderManager:
                     default_model=model,
                 )
         raise ProviderError(f"Unknown provider: {provider_name}")
+
+    def _build_jev_provider(self, model: str = "", *, name: str = "jev") -> Any:
+        """A JevProvider from the stored key (credential store, then config)
+        and the configured base_url (default: the public TypeSafe API)."""
+        from ..providers.jev import JevProvider
+        api_key = self._resolve_api_key("jev")
+        if not api_key:
+            raise ProviderError("No Jev (TypeSafe) API key configured")
+        pconfig = self._config.providers.get("jev")
+        return JevProvider(
+            api_key=api_key,
+            default_model=model,
+            base_url=(pconfig.base_url if pconfig else "") or "",
+            name=name,
+            provider_id="jev",
+        )
 
     def _build_service_provider(
         self, model: str, *,
@@ -761,6 +807,11 @@ class ProviderManager:
                         default_model=pconfig.default_model,
                         base_url=pconfig.base_url,
                     )
+                elif name == "jev":
+                    if not self._resolve_api_key("jev"):
+                        log.warning("Provider 'jev' has no API key, skipping")
+                        continue
+                    provider = self._build_jev_provider(pconfig.default_model)
                 elif name == "service":
                     # Marketplace inference (docs/services_market.md). Config
                     # is provider_address + spec_digest, no key/base_url — a
@@ -821,7 +872,7 @@ class ProviderManager:
                 log.warning("Failed to initialise provider '%s': %s", name, exc)
 
         # Credential-store providers not in config
-        for pid in ("anthropic", "gemini", "openai", "deepseek"):
+        for pid in ("anthropic", "gemini", "openai", "deepseek", "jev"):
             if pid in self._config.providers:
                 continue
             api_key = self._resolve_api_key(pid)
@@ -830,6 +881,8 @@ class ProviderManager:
             try:
                 if pid == "anthropic":
                     provider = AnthropicProvider(api_key=api_key, default_model="", base_url="")
+                elif pid == "jev":
+                    provider = self._build_jev_provider("")
                 else:
                     defaults = self._PROVIDER_DEFAULTS.get(pid, {})
                     provider = OpenAICompatibleProvider(
@@ -1550,6 +1603,14 @@ class ProviderManager:
                     base_url=(pconfig.base_url if pconfig else "") or defaults.get("base_url", ""),
                     default_model=(pconfig.default_model if pconfig else "") or defaults.get("default_model", ""),
                 )
+            elif provider_id == "jev":
+                from ..providers.jev import JevProvider
+                pconfig = self._config.providers.get("jev")
+                provider = JevProvider(
+                    api_key=api_key or self._resolve_api_key("jev"),
+                    default_model=pconfig.default_model if pconfig else "",
+                    base_url=(pconfig.base_url if pconfig else "") or "",
+                )
             else:
                 return
             cognitive.register_provider(provider)
@@ -1617,6 +1678,21 @@ class ProviderManager:
                         headers={"Authorization": f"Bearer {api_key}"},
                     )
                     if resp.status_code == 401:
+                        raise ValueError("Invalid API key")
+                    if resp.status_code not in (200, 429):
+                        raise ValueError(_api_error_text(resp))
+            elif provider_id == "jev":
+                # GET /v1/models lists the model names the key may send and
+                # costs nothing (Jev bills input tokens of /systemone only).
+                pconfig = self._config.providers.get("jev")
+                base_url = ((pconfig.base_url if pconfig else "")
+                            or self._PROVIDER_DEFAULTS["jev"]["base_url"]).rstrip("/")
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(
+                        f"{base_url}/models",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                    )
+                    if resp.status_code in (401, 403):
                         raise ValueError("Invalid API key")
                     if resp.status_code not in (200, 429):
                         raise ValueError(_api_error_text(resp))

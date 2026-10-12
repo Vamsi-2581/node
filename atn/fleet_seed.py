@@ -107,7 +107,10 @@ def seed_route(runtime: "Runtime") -> tuple[str, str] | None:
     ids_fn = getattr(providers, "registered_provider_ids", None)
     if not callable(ids_fn):
         return None
+    from .provider_identity import TOOLLESS_PROVIDER_IDS
     for pid in ids_fn():
+        if pid in TOOLLESS_PROVIDER_IDS:
+            continue  # Kevin orchestrates with tools; a judgment model can't
         try:
             models = providers.get_available_models(pid)
         except Exception:
