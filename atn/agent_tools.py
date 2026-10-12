@@ -1477,6 +1477,95 @@ _TOOLS: list[ToolDefinition] = [
 
 
 # ---------------------------------------------------------------------------
+# Group threads (atn/group_chat.py, docs/group_chat.md)
+# ---------------------------------------------------------------------------
+# group_post / group_read / group_list / group_pass are surfaced to every
+# agent that is a member of a group (execution_engine appends them) and are
+# always granted: each is membership-checked. group_create rides the
+# "delegation" bundle: a parent may open a group over its own children.
+_GROUP_TOOLS: list[ToolDefinition] = [
+    ToolDefinition(
+        name="group_post",
+        description=(
+            "Post a message to a group thread you are a member of. Every other "
+            "member is woken to read it. Post only when you have something to "
+            "add; staying silent is fine."),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "The group id."},
+                "content": {"type": "string", "description": "Your message."},
+            },
+            "required": ["group_id", "content"],
+        },
+    ),
+    ToolDefinition(
+        name="group_read",
+        description=(
+            "Read a group thread's recent turns (sender + content). New turns "
+            "are already delivered to you when you are woken; use this for "
+            "older history."),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "The group id."},
+                "limit": {"type": "integer", "description": "Max turns (default 50).",
+                          "default": 50},
+            },
+            "required": ["group_id"],
+        },
+    ),
+    ToolDefinition(
+        name="group_list",
+        description="List the group threads you are a member of.",
+        input_schema={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="group_pass",
+        description=(
+            "Explicitly decline to reply in a group (optional: simply ending "
+            "your turn without group_post is the same). Posts nothing."),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "The group id."},
+            },
+            "required": ["group_id"],
+        },
+    ),
+    ToolDefinition(
+        name="group_create",
+        description=(
+            "Create a group thread over your own direct children (you are "
+            "included automatically). Members talk as peers; every post wakes "
+            "all other members."),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Group name."},
+                "members": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Agent ids of your direct children.",
+                },
+            },
+            "required": ["name", "members"],
+        },
+    ),
+]
+_TOOLS.extend(_GROUP_TOOLS)
+
+_GROUP_MEMBER_TOOL_NAMES = ("group_post", "group_read", "group_list", "group_pass")
+
+
+def group_member_tool_schemas() -> list[dict[str, Any]]:
+    """Schemas a group member sees regardless of its bundle grant."""
+    return [
+        {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+        for t in _GROUP_TOOLS if t.name in _GROUP_MEMBER_TOOL_NAMES
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Tool executors — async functions that perform the actual operations
 # ---------------------------------------------------------------------------
 
@@ -2458,9 +2547,18 @@ async def _post_message(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
     # for every agent.  Adding it here caused duplicate user messages in
     # the conversation store.
 
+    # Sender attribution: an agent caller is stamped with its own id (the
+    # engine renders it as "[from <id>]"); a "source" argument from an agent
+    # is ignored so it cannot forge one. Only the owner surface may name a
+    # source (the WS server tags UI posts "user").
+    if caller_id and not is_owner_caller(caller_id):
+        source = caller_id
+    else:
+        source = input.get("source") or "owner"
+
     msg = InboxMessage(
         id=InboxMessage.generate_id(),
-        source=input.get("source", "owner"),
+        source=source,
         target=target,
         type=msg_type,
         priority=priority,
@@ -2479,7 +2577,7 @@ async def _post_message(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
         AgentStatus.ACTIVE, AgentStatus.COMPLETED, AgentStatus.ERROR
     ):
         runtime._status[target] = AgentStatus.ACTIVE
-        execution_id = await runtime.trigger_run(target, source="owner")
+        execution_id = await runtime.trigger_run(target, source=source)
 
     result: dict[str, Any] = {
         "message_id": msg.id, "target": target, "type": msg_type.value,
@@ -3975,6 +4073,7 @@ _DELEGATE_TOOL_NAMES = {
     "post_message",   # communicate with other agents
     "get_snapshot",   # see system state
     "compact_agent",  # §15 compact a direct child's context
+    "group_create",   # open a peer group over own children
 }
 
 
@@ -3999,7 +4098,7 @@ _TOOL_CATEGORIES: dict[str, set[str]] = {
     "delegation": {
         "create_agent", "update_agent", "delegate_status", "delegate_collect",
         "delegate_message", "get_latest_thought", "get_children_status",
-        "trigger_run", "get_output", "compact_agent",
+        "trigger_run", "get_output", "compact_agent", "group_create",
     },
     "messaging": {"post_message"},
     "observation": {"get_snapshot", "list_agents", "get_agent", "get_execution", "get_history"},
@@ -4078,7 +4177,11 @@ _PROGRESSIVE_DIRECT_TOOLS = {
 # Tools every agent may call regardless of its grant: its OWN budget
 # status is not a capability, it is self-knowledge (and nothing else is
 # uncategorised — see _TOOL_CATEGORIES above).
-_ALWAYS_GRANTED_TOOLS: frozenset[str] = frozenset({"get_my_budget_status"})
+_ALWAYS_GRANTED_TOOLS: frozenset[str] = frozenset({
+    "get_my_budget_status",
+    # Group membership is the grant (each call is membership-checked).
+    "group_post", "group_read", "group_list", "group_pass",
+})
 
 
 def resolve_tool_grant(tool_spec: list[str]) -> set[str] | None:
@@ -4218,6 +4321,13 @@ async def _delegate_message(runtime: Runtime, input: dict[str, Any]) -> dict[str
     if not content:
         return {"error": "Missing 'content'."}
 
+    # Sender attribution: a delegate_message from an agent carries its id.
+    # The live injection has no source field, so the label goes in the text;
+    # the inbox fallback carries the real source and the engine labels it.
+    caller_id = input.get("_caller_id")
+    sender = caller_id if (caller_id and not is_owner_caller(caller_id)) else ""
+    live_content = f"[from {sender}] {content}" if sender else content
+
     # Try live injection (direct delivery). Dual-mode: for an in-process agent
     # this hits the daemon-resident provider; for an ISOLATED worker the
     # provider lives in the worker, so control.send_delegate_message routes the
@@ -4226,7 +4336,7 @@ async def _delegate_message(runtime: Runtime, input: dict[str, Any]) -> dict[str
     control = getattr(runtime, "control", None)
     if control is not None:
         try:
-            if await control.send_delegate_message(agent_id, content):
+            if await control.send_delegate_message(agent_id, live_content):
                 return {"status": "delivered", "agent_id": agent_id}
         except Exception:
             pass  # fall through to the inbox fallback below
@@ -4237,7 +4347,7 @@ async def _delegate_message(runtime: Runtime, input: dict[str, Any]) -> dict[str
     if defn is not None:
         runtime.inbox.post(InboxMessage(
             id=InboxMessage.generate_id(),
-            source="owner",
+            source=sender or "owner",
             target=agent_id,
             type=MessageType.WORK,
             priority=MessagePriority.HIGH,
@@ -4815,7 +4925,196 @@ async def _compact_idle_store(
 # Registry: name -> (ToolDefinition, executor)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Group thread executors (atn/group_chat.py, docs/group_chat.md)
+# ---------------------------------------------------------------------------
+
+def _group_actor(input: dict[str, Any]) -> str:
+    """The sender identity for a group call: the calling agent's id, or
+    "admin" for the owner surface. Never read from the tool arguments."""
+    from .group_chat import ADMIN_SENDER
+    caller = input.get("_caller_id")
+    return ADMIN_SENDER if is_owner_caller(caller) else str(caller)
+
+
+def _group_svc(runtime: Runtime):
+    return getattr(runtime, "groups", None)
+
+
+async def _group_call(fn):
+    from .group_chat import GroupError
+    try:
+        return await fn()
+    except GroupError as exc:
+        return {"error": str(exc)}
+
+
+def _group_member_gate(runtime: Runtime, input: dict[str, Any]) -> str | None:
+    """Error string when an agent caller is not a member of the group."""
+    from .group_chat import ADMIN_SENDER
+    actor = _group_actor(input)
+    gid = input.get("group_id", "")
+    svc = _group_svc(runtime)
+    if svc is None or svc.get(gid) is None:
+        return f"Group '{gid}' not found."
+    if actor != ADMIN_SENDER and not svc.is_member(gid, actor):
+        return f"'{actor}' is not a member of group '{gid}'."
+    return None
+
+
+async def _group_post(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    err = _group_member_gate(runtime, input)
+    if err:
+        return {"error": err}
+    svc = _group_svc(runtime)
+
+    async def run():
+        turn, woken = await svc.post(
+            input.get("group_id", ""), _group_actor(input), input.get("content", ""))
+        return {"turn": turn, "woken": woken}
+    return await _group_call(run)
+
+
+async def _group_read(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    from .group_chat import ADMIN_SENDER
+    err = _group_member_gate(runtime, input)
+    if err:
+        return {"error": err}
+    svc = _group_svc(runtime)
+    gid = input.get("group_id", "")
+    try:
+        limit = int(input.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 500))
+    turns = svc.turns(gid, limit=limit)
+    actor = _group_actor(input)
+    if actor != ADMIN_SENDER:
+        svc.mark_read(gid, actor)
+    return {"group": svc.summary(gid), "turns": turns,
+            "total": svc.summary(gid)["turn_count"]}
+
+
+async def _group_list(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    from .group_chat import ADMIN_SENDER
+    svc = _group_svc(runtime)
+    if svc is None:
+        return {"groups": []}
+    actor = _group_actor(input)
+    return {"groups": svc.list_groups(None if actor == ADMIN_SENDER else actor)}
+
+
+async def _group_pass(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    err = _group_member_gate(runtime, input)
+    if err:
+        return {"error": err}
+    return {"status": "passed", "group_id": input.get("group_id", ""),
+            "note": "Nothing posted. End your turn."}
+
+
+async def _group_create(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    from .group_chat import ADMIN_SENDER
+    svc = _group_svc(runtime)
+    if svc is None:
+        return {"error": "Group threads are not available."}
+    actor = _group_actor(input)
+    members = input.get("members") or []
+    if isinstance(members, str):
+        members = [m.strip() for m in members.split(",") if m.strip()]
+    if not isinstance(members, list):
+        return {"error": "'members' must be a list of agent ids."}
+    if actor != ADMIN_SENDER:
+        # A parent may group only its own direct children (plus itself).
+        children = {d.id for d in runtime.registry.get_children(actor)}
+        bad = [m for m in members if m != actor and m not in children]
+        if bad:
+            return {"error": (
+                f"Agent '{actor}' can only create groups over its own direct "
+                f"children; not children: {', '.join(bad)}")}
+        members = [actor] + [m for m in members if m != actor]
+
+    async def run():
+        return {"group": await svc.create(
+            input.get("name", ""), members, created_by=actor)}
+    return await _group_call(run)
+
+
+# Owner-only group operations (NOT in _TOOLS, so no agent can call them;
+# listed in ws_server.OWNER_ONLY_TOOLS so a scoped session cannot either).
+
+async def _group_get(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    svc = _group_svc(runtime)
+    gid = input.get("group_id", "")
+    if svc is None or svc.get(gid) is None:
+        return {"error": f"Group '{gid}' not found."}
+    try:
+        limit = int(input.get("limit") or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    summary = svc.summary(gid)
+    return {"group": summary, "turns": svc.turns(gid, limit=max(1, limit)),
+            "total": summary["turn_count"]}
+
+
+async def _group_add_member(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    svc = _group_svc(runtime)
+
+    async def run():
+        return {"group": await svc.add_member(
+            input.get("group_id", ""), input.get("agent_id", ""))}
+    return await _group_call(run)
+
+
+async def _group_remove_member(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    svc = _group_svc(runtime)
+
+    async def run():
+        return {"group": await svc.remove_member(
+            input.get("group_id", ""), input.get("agent_id", ""))}
+    return await _group_call(run)
+
+
+async def _group_take_seat(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    svc = _group_svc(runtime)
+
+    async def run():
+        return {"group": await svc.take_seat(
+            input.get("group_id", ""), input.get("agent_id", ""))}
+    return await _group_call(run)
+
+
+async def _group_release_seat(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    svc = _group_svc(runtime)
+
+    async def run():
+        group, redelivered = await svc.release_seat(
+            input.get("group_id", ""), input.get("agent_id", ""))
+        return {"group": group, "redelivered": redelivered}
+    return await _group_call(run)
+
+
+async def _group_delete(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
+    svc = _group_svc(runtime)
+    gid = input.get("group_id", "")
+
+    async def run():
+        await svc.delete(gid)
+        return {"deleted": True, "group_id": gid}
+    return await _group_call(run)
+
+
 _EXECUTORS: dict[str, ToolExecutor] = {
+    "group_post": _group_post,
+    "group_read": _group_read,
+    "group_list": _group_list,
+    "group_pass": _group_pass,
+    "group_create": _group_create,
+    "group_get": _group_get,
+    "group_add_member": _group_add_member,
+    "group_remove_member": _group_remove_member,
+    "group_take_seat": _group_take_seat,
+    "group_release_seat": _group_release_seat,
+    "group_delete": _group_delete,
     "list_agents": _list_agents,
     "get_agent": _get_agent,
     "update_agent": _update_agent,

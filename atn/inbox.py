@@ -43,6 +43,19 @@ class InboxManager:
             self._notify[agent_id].clear()
         return messages
 
+    def remove_where(self, agent_id: str, predicate) -> int:
+        """Drop queued messages matching ``predicate``; returns how many."""
+        queue = self._queues.get(agent_id)
+        if not queue:
+            return 0
+        keep = [m for m in queue if not predicate(m)]
+        removed = len(queue) - len(keep)
+        if keep:
+            self._queues[agent_id] = keep
+        else:
+            self._queues.pop(agent_id, None)
+        return removed
+
     def peek(self, agent_id: str) -> list[InboxMessage]:
         """Return a copy of all messages without removing them."""
         return list(self._queues.get(agent_id, []))

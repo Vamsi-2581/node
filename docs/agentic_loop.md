@@ -458,6 +458,41 @@ validation. Policy-as-code hooks (`capabilities.provides:
 ["policy:compaction"]`, etc.) are declarable but not dispatched yet;
 see `POLICY_HOOKS` in `atn/harness_policy.py` for the intended contract.
 
+## §26 Sender attribution and group delivery (2026-10-13)
+
+**Attribution.** Every inbox message carries a `source`. When the engine
+drains the inbox into a turn (`execution_engine._attribute`), a message
+whose source is ANOTHER registered agent is prefixed `[from <agent id>] `.
+Owner and runtime sources (`user`, `owner`, `voice`, `heartbeat`,
+`scheduler`, `group:<id>`, ...) stay unlabeled: in an agent's private
+thread, an unlabeled message is from the owner or the runtime. Child
+completion notices are not relabeled (their text already names the
+child), and text that already starts with `[from ` is left alone.
+
+- `post_message` stamps `source = _caller_id` for an agent caller and
+  ignores any `source` argument it passes (no forging). Only the owner
+  surface may name a source; the WS server tags UI posts `user`.
+- `delegate_message` from an agent injects `[from <caller>] <content>`
+  into a running target (the steering channel has no source field), and
+  its inbox fallback carries `source = <caller>` (the engine labels it).
+  From the owner it stays unlabeled.
+- Isolated workers already stamp `source = <agent id>` on `inbox_post`.
+
+**Group delivery.** A group post (docs/group_chat.md) wakes every other
+agent-seated member. An idle member gets one coalesced inbox wake per
+group (`data.group_wake = <group id>`, HIGH); the engine renders the
+member's unseen turns at drain time (`[group <name>] <sender>: <content>`,
+the owner shows as `admin`), advances its cursor, and appends the
+"stay silent if you have nothing to add" instruction. A running member
+gets the rendered turns through the same steering path as
+`delegate_message` (posts arriving during an in-flight injection are
+coalesced into one follow-up). A wake whose turns were already delivered
+renders a one-line "nothing new, end your turn" message instead of the
+agent description. Group members always see `group_post`, `group_read`,
+`group_list` and `group_pass`, whatever their bundles.
+
+Tests: `tests/atn/test_group_chat.py`.
+
 ## Not ported: AGENTS.md
 
 Codex loads AGENTS.md from repo root down to the working directory.

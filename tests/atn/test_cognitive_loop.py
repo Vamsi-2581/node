@@ -268,6 +268,8 @@ async def test():
         "get_my_budget_status", "register_on_chain", "metering_report",
         # Manual compaction (spec §15)
         "compact_agent",
+        # Group threads (docs/group_chat.md)
+        "group_post", "group_read", "group_list", "group_pass", "group_create",
     }
     assert tool_names == expected, f"Missing: {expected - tool_names}, Extra: {tool_names - expected}"
     # Each tool has a name, description, and input_schema

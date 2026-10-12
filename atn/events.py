@@ -107,6 +107,12 @@ class EventType(Enum):
     # ``source``, the data carries NO agent_id key and NEVER a value/path.
     SECRET_ACCESS = "security.secret_access"
 
+    # Group threads (atn/group_chat.py, docs/group_chat.md). source is
+    # "group:<group_id>". data: group_id + turn | group.
+    GROUP_TURN = "group.turn"
+    GROUP_UPDATED = "group.updated"
+    GROUP_DELETED = "group.deleted"
+
     # Generic / custom events
     CUSTOM = "custom"
 

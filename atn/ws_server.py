@@ -148,6 +148,11 @@ OWNER_ONLY_TOOLS = frozenset({
     "set_credit_budget", "get_credit_budget", "get_user_profile",
     "update_user_profile",
     "set_agent_model",
+    # Group-thread administration (docs/group_chat.md): membership, seats,
+    # full transcripts and deletion are the owner's. group_post/list/read/
+    # create stay agent-callable and membership-checked.
+    "group_get", "group_add_member", "group_remove_member",
+    "group_take_seat", "group_release_seat", "group_delete",
 })
 
 # For scoped sessions, the message keys that name a target agent. Every one

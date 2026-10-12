@@ -128,6 +128,11 @@ class Runtime:
         self._bridge_update_task: asyncio.Task | None = None
         inject_connector_credentials(self.connectors, self.credential_store)
 
+        # Group threads (docs/group_chat.md): shared transcripts several
+        # agents and the owner post to, alongside each agent's own thread.
+        from ..group_chat import GroupChatService
+        self.groups = GroupChatService(self._config.data_dir / "groups", self)
+
         # Delegate registry
         self.delegate_registry = DelegateRegistry(
             store_path=self._config.data_dir / "delegates.json",

@@ -609,6 +609,24 @@ class ExecutionEngine:
         # framework tools (execute_tool → registries/stores/on-chain/creds).
         return True
 
+    def _attribute(self, msg: Any, recipient_id: str, text: str) -> str:
+        """Prefix ``text`` with ``[from <agent id>] `` when ``msg`` came from
+        another registered agent. Owner and runtime sources stay unlabeled;
+        child completion notices already name the child; text that already
+        carries a ``[from `` label is left alone."""
+        src = getattr(msg, "source", "") or ""
+        if not src or src == recipient_id:
+            return text
+        agents = getattr(self.registry, "_agents", None) or {}
+        if src not in agents:
+            return text
+        data = getattr(msg, "data", None) or {}
+        if data.get("origin") == "child_notification":
+            return text
+        if text.startswith("[from "):
+            return text
+        return f"[from {src}] {text}"
+
     async def route_tool_call(
         self, name: str, tool_input: dict, agent_id: str,
     ) -> dict:
@@ -1012,6 +1030,16 @@ class ExecutionEngine:
             # --- Tool surface ---
             agent_tools = resolve_tool_surface(_agent_tool_cats)
 
+            # Group threads: a member of any group sees the group tools
+            # regardless of its bundles (each is membership-checked).
+            _grp_svc = getattr(getattr(self, "_runtime_ref", None), "groups", None)
+            if _grp_svc is not None and _grp_svc.groups_for(defn.id):
+                from ..agent_tools import group_member_tool_schemas
+                _have = {t.get("name") for t in agent_tools}
+                agent_tools.extend(
+                    t for t in group_member_tool_schemas()
+                    if t["name"] not in _have)
+
             # Whether this agent should also get the SDK's native built-in
             # tools (Bash/Read/Write/Edit/Glob/Grep/WebSearch/...). These are
             # heavy in first-turn context, so they're OFF unless the agent's
@@ -1105,8 +1133,27 @@ class ExecutionEngine:
             ]
 
             # --- Build user message ---
+            # Sender attribution (docs/agentic_loop.md, "Sender
+            # attribution"): a message whose source is ANOTHER registered
+            # agent is prefixed "[from <agent id>] ". Owner / runtime
+            # sources (user, owner, voice, heartbeat, scheduler, inbox,
+            # group:...) stay unlabeled: an unlabeled message is from the
+            # owner or the runtime. Group wakes render the group's unseen
+            # turns (atn/group_chat.py), each line already carrying its
+            # sender.
+            from ..group_chat import WAKE_KEY as _GROUP_WAKE
+            _groups = getattr(getattr(self, "_runtime_ref", None), "groups", None)
+            _group_wakes = 0
             prompt_parts: list[str] = []
             for msg in work_messages:
+                if msg.data and msg.data.get(_GROUP_WAKE):
+                    _group_wakes += 1
+                    if _groups is not None:
+                        _txt = _groups.render_delivery(
+                            defn.id, str(msg.data.get(_GROUP_WAKE)))
+                        if _txt:
+                            prompt_parts.append(_txt)
+                    continue
                 if msg.data:
                     # Heartbeat trigger from the scheduler
                     if msg.source == "heartbeat" and msg.data.get("heartbeat"):
@@ -1122,9 +1169,19 @@ class ExecutionEngine:
                     if instruction:
                         if msg.source == "voice":
                             instruction = f"\U0001f3a4 [Voice Input] {instruction}"
+                        else:
+                            instruction = self._attribute(
+                                msg, defn.id, instruction)
                         prompt_parts.append(instruction)
                     else:
-                        prompt_parts.append(str(msg.data))
+                        prompt_parts.append(
+                            self._attribute(msg, defn.id, str(msg.data)))
+            if not prompt_parts and _group_wakes:
+                # Only group wakes, and their turns were already delivered
+                # (live injection) or the seat was taken: nothing to say.
+                prompt_parts.append(
+                    "[group] No new group posts since your last delivery. "
+                    "Nothing to do; end your turn.")
             if not prompt_parts:
                 prompt_parts.append(defn.description or defn.name)
             user_message = "\n\n".join(prompt_parts)
