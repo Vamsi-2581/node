@@ -539,3 +539,42 @@ class TestUpdatePlan:
 
 async def _noop(name, inp):
     return "ok"
+
+
+# ---------------------------------------------------------------------------
+# §23 Context headroom signal
+# ---------------------------------------------------------------------------
+
+from atn.providers.base import (  # noqa: E402
+    _headroom_level,
+    compaction_trigger_tokens,
+    get_context_window,
+)
+
+
+class TestHeadroomSignal:
+    def test_levels(self):
+        assert _headroom_level(50, 100) == 0
+        assert _headroom_level(70, 100) == 1
+        assert _headroom_level(85, 100) == 2
+        assert _headroom_level(95, 100) == 3
+
+    async def test_note_appended_once_per_level(self):
+        trigger = compaction_trigger_tokens("test-model", get_context_window("test-model"))
+        at = lambda frac: Usage(input_tokens=int(trigger * frac))  # noqa: E731
+        tc = lambda i: [ToolCall(id=f"c{i}", name="bash", input={"i": i})]  # noqa: E731
+        p = ScriptedProvider([
+            _resp(tool_calls=tc(0), stop_reason="tool_use", usage=at(0.50)),
+            _resp(tool_calls=tc(1), stop_reason="tool_use", usage=at(0.72)),
+            _resp(tool_calls=tc(2), stop_reason="tool_use", usage=at(0.74)),
+            _resp(tool_calls=tc(3), stop_reason="tool_use", usage=at(0.82)),
+            _resp(text="done", stop_reason="end_turn"),
+        ])
+        await p.run_agent_loop(message="go", tools=[{"name": "bash"}], tool_executor=_noop)
+        final = p.seen_messages[-1]
+        trs = _tool_results(final)
+        notes = ["[Context:" in t["content"] for t in trs]
+        assert notes == [False, True, False, True]
+        # The system prompt is never touched.
+        assert all("[Context:" not in str(m.get("content")) for m in final
+                   if m.get("role") == "assistant")

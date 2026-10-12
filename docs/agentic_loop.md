@@ -383,6 +383,25 @@ one in_progress, max 50 steps. Each call replaces the whole plan.
   tier-3 hard-reset notice (not left to the summarizer).
 - Bridge providers keep their own SDK todo tooling; unaffected.
 
+## §23 Context headroom signal
+
+After a turn's tool results are built, the loop computes the next
+request size (§19 estimate) against the usable input budget
+(`compaction_trigger_tokens`). On first crossing 70%, 80% and 90%, a
+short note (percent in use, tokens left before older history is
+summarized, advice to keep output small) is appended to the LAST tool
+result of that turn. Never in the system prompt, which must stay
+byte-stable for the prompt cache. Each level is announced once per
+run; falling back under 70% (after a reduction) re-arms them.
+
+## §24 AGENTS.md (skipped)
+
+Codex loads AGENTS.md from repo root down to the working directory.
+Not ported: cognitive agents on the generic loop have no working
+directory of their own (shell tools run in the daemon's process cwd;
+`agents_dir/<id>` work dirs exist only for pipeline agents). Revisit if
+a per-agent workdir is introduced.
+
 ## Testing (targeted only, never the full suite)
 
 New/updated files: `tests/atn/test_loop_hardening.py` (§1-§6, §8:

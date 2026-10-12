@@ -643,6 +643,8 @@ class Provider(ABC):
         # §19: (provider-reported input tokens of the last response, length of
         # the message stack that request carried). None = no usable usage yet.
         usage_anchor: tuple[int, int] | None = None
+        # §23: highest context-headroom level already announced this run.
+        headroom_noted = 0
 
         for turn in range(max_turns):
             if self._interrupted:
@@ -1185,6 +1187,26 @@ class Provider(ABC):
                 response.tool_calls, _run_one, parallel_names,
             )
             messages.append({"role": "user", "content": tool_result_content})
+
+            # §23 headroom signal: once the next request crosses 70/80/90% of
+            # the usable input budget, tell the model with these tool results
+            # (never in the system prompt, which must stay byte-stable for the
+            # prompt cache). Each level is announced once; dropping back under
+            # the first level (after a reduction) re-arms it.
+            _trigger = compaction_trigger_tokens(
+                self._active_model or model,
+                get_context_window(self._active_model or model),
+            )
+            if _trigger > 0 and tool_result_content:
+                _est = _next_input_estimate(system, messages, usage_anchor)
+                _level = _headroom_level(_est, _trigger)
+                if _level > headroom_noted:
+                    last = tool_result_content[-1]
+                    if isinstance(last.get("content"), str):
+                        last["content"] += _headroom_note(_est, _trigger)
+                    headroom_noted = _level
+                elif _level == 0:
+                    headroom_noted = 0
 
             # §2 note: context reduction runs PRE-SEND at the top of the next
             # iteration (estimate-based) and reactively on an overflow 400, so
@@ -2031,6 +2053,35 @@ def _next_input_estimate(
         if reported > 0 and 0 <= n <= len(messages):
             return reported + _estimate_chars("", messages[n:]) // _CHARS_PER_TOKEN
     return _estimate_chars(system, messages) // _CHARS_PER_TOKEN
+
+
+# §23: fractions of the usable input budget (compaction trigger) at which the
+# model is told how much room is left. Each is announced once per run.
+_HEADROOM_LEVELS: tuple[float, ...] = (0.70, 0.80, 0.90)
+
+
+def _headroom_level(est_tokens: int, trigger_tokens: int) -> int:
+    """1-based index of the highest headroom level reached, 0 if none."""
+    if trigger_tokens <= 0:
+        return 0
+    frac = est_tokens / trigger_tokens
+    level = 0
+    for i, threshold in enumerate(_HEADROOM_LEVELS, 1):
+        if frac >= threshold:
+            level = i
+    return level
+
+
+def _headroom_note(est_tokens: int, trigger_tokens: int) -> str:
+    """Short context-headroom note appended to a tool result (§23)."""
+    remaining = max(0, trigger_tokens - est_tokens)
+    pct = min(100, round(100 * est_tokens / trigger_tokens)) if trigger_tokens else 0
+    return (
+        f"\n\n[Context: about {pct}% of the usable context is in use; roughly "
+        f"{remaining} tokens remain before older history is summarized. Keep "
+        f"tool output small and prefer finishing or delegating over broad "
+        f"new exploration.]"
+    )
 
 
 def _trim_tail_tool_results(messages: list[dict[str, Any]], budget_chars: int) -> bool:
