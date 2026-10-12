@@ -4448,27 +4448,42 @@ async def _register_on_chain(runtime: Runtime, input: dict[str, Any]) -> dict[st
         autonet.ensure_network_config()
 
     from .on_chain import OnChainService
-    svc = OnChainService(runtime._config.rpb)
+    svc = OnChainService(autonet.config if autonet is not None else runtime._config.rpb)
     if not svc.available:
         return {"error": "On-chain service not configured (missing rpb_contract_address or rpc_url)."}
 
-    parent_address = ""
-    if defn.parent_id:
-        parent_defn = runtime.get_agent(defn.parent_id)
-        if parent_defn and parent_defn.identity:
-            parent_address = parent_defn.identity.address
+    # Substrate.registerAgent needs the daemon's libp2p PeerId. Registering is
+    # the signal to join the network, so start autonet if the host is not up
+    # (same as the frontend's register_agent_on_chain path).
+    def _peer_id() -> str:
+        host = getattr(autonet, "_p2p_host", None) if autonet is not None else None
+        return (getattr(host, "peer_id", "") or "") if host is not None else ""
+
+    peer_id = _peer_id()
+    if not peer_id and autonet is not None:
+        start_result = await autonet.start()
+        if isinstance(start_result, dict) and start_result.get("status") == "error":
+            return {"error": f"Could not start autonet to register: "
+                             f"{start_result.get('error', 'unknown')}"}
+        for _ in range(60):
+            peer_id = _peer_id()
+            if peer_id:
+                break
+            await asyncio.sleep(0.5)
+    if not peer_id:
+        return {"error": "libp2p host did not come up in time; try again shortly."}
 
     result = await svc.register_agent(
         identity=defn.identity,
         private_key=private_key,
-        system_prompt=defn.system_prompt or "",
-        parent_address=parent_address,
+        peer_id=peer_id,
         sponsor_address=sponsor_address,
     )
 
     if result.get("success"):
         defn.identity.registered_on_chain = True
         defn.identity.registration_tx = result.get("tx_hash", "")
+        runtime.registry.persist_identity(agent_id)
         log.info("Agent %s registered on-chain: tx=%s", agent_id, result.get("tx_hash"))
 
     return result
