@@ -163,10 +163,11 @@ async def dispatch_shell(runtime: Any, agent_id: str, name: str,
     # Gate (b): bonded on ToolBond (fail closed).
     from .tool_bond import gate_for
     bonded, reason = await gate_for(runtime).is_bonded(record.digest)
+    await note_swap_state(runtime, agent_id, _bond_row(record, bonded, reason))
     if not bonded:
-        log.warning("core provider %s for %r refused for agent %s (%s); "
-                    "running the built-in", record.digest[:16], name,
-                    agent_id, reason)
+        log.debug("core provider %s for %r refused for agent %s (%s); "
+                  "running the built-in", record.digest[:16], name,
+                  agent_id, reason)
         return None
     store = runtime.tool_store
     trace_dir = Path(store._dir) / "evidence" / "tmp"
@@ -193,6 +194,160 @@ async def dispatch_shell(runtime: Any, agent_id: str, name: str,
     if envelope.get("ok"):
         return envelope.get("result")
     return {"error": str(envelope.get("error") or "shell provider error")}
+
+
+# ---------------------------------------------------------------------------
+# Swap status (owner-visible fallback)
+# ---------------------------------------------------------------------------
+#
+# A failed gate keeps the built-in running (fail closed), but the owner must
+# see it: an agent whose loadout names a core-replacing tool and is quietly
+# running the built-in is not running the harness the owner picked. Status is
+# per (agent, tool). HARNESS_SWAP_STATUS fires on a state TRANSITION only
+# (fallback reason changed, recovered to active, or the tool left the
+# loadout), never per call, so a refused bash call in a loop costs nothing.
+
+FALLBACK_REASONS = ("not_approved", "not_bonded", "bond_check_error",
+                    "not_in_loadout", "swaps_disabled")
+
+
+def _row(record: Any, reason: str = "", detail: str = "",
+         state: str = "fallback") -> dict[str, Any]:
+    return {"tool_digest": record.digest,
+            "tool_name": str(record.manifest.get("name") or ""),
+            "provides": core_claims(record.manifest),
+            "state": state, "reason": reason if state == "fallback" else "",
+            "detail": detail}
+
+
+def _bond_row(record: Any, bonded: bool, reason: str) -> dict[str, Any]:
+    if bonded:
+        return _row(record, state="active", detail=reason)
+    code = "not_bonded" if reason.startswith("not bonded") else "bond_check_error"
+    return _row(record, code, reason)
+
+
+def _gate_rows(runtime: Any, agent_id: str) -> list[dict[str, Any]]:
+    """Every core-claiming dep of ``agent_id``'s bound loadout with its
+    sync-gate verdict: a fallback row, or state "eligible" (bond unchecked).
+    Mirrors resolve_shell_provider (which stays the dispatch authority)."""
+    from ..harness_policy import agent_loadout
+    store = getattr(runtime, "tool_store", None)
+    loadout = agent_loadout(runtime, agent_id)
+    if not store or not loadout:
+        return []
+    distro = store.resolve(loadout)
+    if distro is None:
+        return []
+    winners = {r.digest for r in resolve_shell_provider(runtime, agent_id).values()}
+    # The reference distro's resident modules (atn_shell claims every core
+    # name) ARE the built-ins, never an override: not reported.
+    ref = store.resolve(getattr(store, "active_loadout", "") or "")
+    resident = set(ref.manifest.get("dependencies") or []) if ref else set()
+    rows: list[dict[str, Any]] = []
+    for dep in (distro.manifest.get("dependencies") or []):
+        if str(dep) in resident:
+            continue
+        record = store.resolve(str(dep))
+        if record is None or not core_claims(record.manifest):
+            continue
+        if not swap_enabled():
+            row = _row(record, "swaps_disabled",
+                       "core swaps are switched off on this daemon")
+        elif not distro.enabled:
+            row = _row(record, "not_in_loadout", "the bound harness distro is disabled")
+        elif not record.enabled:
+            row = _row(record, "not_approved", "the tool is disabled")
+        elif record.origin != "adopted" or not record.core_replacement_ack:
+            row = _row(record, "not_approved",
+                       "adopted without the core-replacement acknowledgment"
+                       if record.origin == "adopted"
+                       else "only an adopted tool can replace a core tool")
+        elif record.manifest.get("dependencies"):
+            row = _row(record, "not_in_loadout",
+                       "a provider with dependencies cannot replace core tools")
+        elif not store.allowed(agent_id, record):
+            row = _row(record, "not_in_loadout", "the tool is not granted to this agent")
+        elif record.digest not in winners:
+            row = _row(record, "not_in_loadout",
+                       "another provider in the loadout claims the same core tool")
+        else:
+            row = _row(record, state="eligible")
+        rows.append(row)
+    return rows
+
+
+def _tracker(runtime: Any) -> dict[tuple[str, str], str]:
+    t = getattr(runtime, "_core_swap_state", None)
+    if not isinstance(t, dict):
+        t = {}
+        try:
+            setattr(runtime, "_core_swap_state", t)
+        except Exception:  # noqa: BLE001
+            pass
+    return t
+
+
+async def _emit(runtime: Any, agent_id: str, row: dict[str, Any]) -> None:
+    events = getattr(runtime, "events", None)
+    if events is None:
+        return
+    from ..events import Event, EventType
+    try:
+        await events.emit(Event(type=EventType.HARNESS_SWAP_STATUS,
+                                source=agent_id,
+                                data={"agent_id": agent_id, **row}))
+    except Exception:  # noqa: BLE001 — a notice must never break dispatch
+        log.debug("swap status emit failed", exc_info=True)
+
+
+async def note_swap_state(runtime: Any, agent_id: str, row: dict[str, Any]) -> None:
+    """Record one (agent, tool) state; emit only on a transition. A tool
+    that is active from the first look is silent."""
+    state = row["reason"] if row["state"] == "fallback" else "active"
+    tracker = _tracker(runtime)
+    key = (agent_id, row["tool_digest"])
+    prior = tracker.get(key)
+    tracker[key] = state
+    if prior == state or (prior is None and state == "active"):
+        return
+    if state != "active":
+        log.warning("agent %s: core provider %s (%s) falls back to the built-in: "
+                    "%s (%s)", agent_id, row["tool_digest"][:16],
+                    ",".join(row["provides"]), state, row["detail"])
+    await _emit(runtime, agent_id, row)
+
+
+async def swap_status(runtime: Any, agent_id: str) -> list[dict[str, Any]]:
+    """Current per-tool swap status for ``agent_id`` (bond gate included)
+    and sync the transition tracker. [] when no core-replacing tool is in
+    the agent's loadout. Never raises."""
+    try:
+        rows = _gate_rows(runtime, agent_id)
+        if rows and any(r["state"] == "eligible" for r in rows):
+            from .tool_bond import gate_for
+            gate = gate_for(runtime)
+            for i, r in enumerate(rows):
+                if r["state"] != "eligible":
+                    continue
+                record = runtime.tool_store.resolve(r["tool_digest"])
+                bonded, reason = await gate.is_bonded(r["tool_digest"])
+                rows[i] = _bond_row(record, bonded, reason)
+        for r in rows:
+            await note_swap_state(runtime, agent_id, r)
+        tracker = _tracker(runtime)
+        present = {r["tool_digest"] for r in rows}
+        for key in [k for k in tracker if k[0] == agent_id and k[1] not in present]:
+            prior = tracker.pop(key)
+            if prior != "active":
+                await _emit(runtime, agent_id, {
+                    "tool_digest": key[1], "tool_name": "", "provides": [],
+                    "state": "gone", "reason": "",
+                    "detail": "no longer in the agent's loadout"})
+        return rows
+    except Exception:  # noqa: BLE001
+        log.debug("swap status failed", exc_info=True)
+        return []
 
 
 # ---------------------------------------------------------------------------

@@ -1603,6 +1603,10 @@ async def _get_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
         result["inference_payer"] = "self" if defn.identity else "unregistered"
     # Harness distro (Decision 2026-10-12). "" = the reference distro.
     result["loadout"] = getattr(defn, "loadout", "") or ""
+    # Per core-replacing tool in that loadout: active, or falling back to
+    # the built-in with the failed gate (atn/runtime/shell_provider.py).
+    from .runtime.shell_provider import swap_status
+    result["core_swap"] = await swap_status(runtime, defn.id)
     if defn.is_cognitive:
         result["agent_type"] = defn.agent_type
         result["max_turns"] = defn.max_turns

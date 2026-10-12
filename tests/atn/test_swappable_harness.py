@@ -507,3 +507,75 @@ async def test_policy_hook_names_are_declarable_but_not_core(tmp_path):
         capabilities={"provides": ["policy:compaction", "policy:invented"]})
     assert res["manifest"]["capabilities"]["provides"] == ["policy:compaction"]
     assert shell_provider.core_claims(res["manifest"]) == []
+
+
+# ---------------------------------------------------------------------------
+# 4. Fallback is surfaced to the owner (transition-only events)
+# ---------------------------------------------------------------------------
+
+def _swap_events(rt):
+    seen: list[dict] = []
+
+    async def _h(ev):
+        if ev.type.value == "harness.swap_status":
+            seen.append(dict(ev.data))
+    rt.events.subscribe(None, _h)
+    return seen
+
+
+async def test_fallback_notice_fires_once_per_transition(tmp_path, monkeypatch):
+    monkeypatch.delenv(DEV_OVERRIDE_ENV, raising=False)
+    rt, digest, fork = await _bound_swap(tmp_path)
+    rt.get_agent("worker").loadout = fork
+    bonded = {"v": False}
+    rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: bonded["v"])
+    seen = _swap_events(rt)
+
+    for _ in range(3):  # per-call refusals: one notice, not three
+        assert await shell_provider.dispatch_shell(
+            rt, "worker", "bash", {"command": "x"}) is None
+    assert [(e["state"], e["reason"]) for e in seen] == [("fallback", "not_bonded")]
+    assert seen[0]["agent_id"] == "worker" and seen[0]["tool_digest"] == digest
+    assert seen[0]["provides"] == ["bash"] and seen[0]["tool_name"] == "fast_shell"
+
+    detail = await execute_tool("get_agent", {"agent_id": "worker"}, rt)
+    assert [(r["state"], r["reason"]) for r in detail["core_swap"]] == [
+        ("fallback", "not_bonded")]
+    assert len(seen) == 1  # same state again: silent
+
+    # Bond lands: active again, the notice clears.
+    bonded["v"] = True
+    rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: bonded["v"])
+    detail = await execute_tool("get_agent", {"agent_id": "worker"}, rt)
+    assert detail["core_swap"][0]["state"] == "active"
+    assert [e["state"] for e in seen] == ["fallback", "active"]
+
+    # Unbinding the loadout after a fallback emits "gone".
+    rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: (_ for _ in ()).throw(
+        RuntimeError("rpc down")))
+    detail = await execute_tool("get_agent", {"agent_id": "worker"}, rt)
+    assert detail["core_swap"][0]["reason"] == "bond_check_error"
+    rt.get_agent("worker").loadout = ""
+    detail = await execute_tool("get_agent", {"agent_id": "worker"}, rt)
+    assert detail["core_swap"] == []
+    assert [e["state"] for e in seen] == ["fallback", "active", "fallback", "gone"]
+
+
+async def test_fallback_reasons_for_sync_gates(tmp_path, monkeypatch):
+    monkeypatch.setenv(DEV_OVERRIDE_ENV, "1")
+    rt, digest, fork = await _bound_swap(tmp_path, ack=False)
+    rt.get_agent("worker").loadout = fork
+    rows = await shell_provider.swap_status(rt, "worker")
+    assert [(r["reason"], r["provides"]) for r in rows] == [("not_approved", ["bash"])]
+
+    rt.tool_store.get(digest).core_replacement_ack = True
+    assert (await shell_provider.swap_status(rt, "worker"))[0]["state"] == "active"
+
+    monkeypatch.setattr(rt.tool_store, "allowed", lambda a, r: False)
+    assert (await shell_provider.swap_status(rt, "worker"))[0]["reason"] == "not_in_loadout"
+    monkeypatch.undo()
+    monkeypatch.setenv(shell_provider.KILL_SWITCH_ENV, "1")
+    assert (await shell_provider.swap_status(rt, "worker"))[0]["reason"] == "swaps_disabled"
+    # An agent with no core-replacing tool in its loadout has no rows.
+    await _register_agent(rt, "plain")
+    assert await shell_provider.swap_status(rt, "plain") == []

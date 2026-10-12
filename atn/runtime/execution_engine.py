@@ -920,6 +920,12 @@ class ExecutionEngine:
         # loadout's config, else the reference (byte-identical default).
         _policy = policy_for_agent(getattr(self, "_runtime_ref", None), defn)
         _agent_tool_cats = _policy.select_tools(defn.tools or [])
+        if getattr(defn, "loadout", ""):
+            # Surface a core-swap fallback to the owner (transition-only
+            # event). Gates (a)/(c) never reach dispatch_shell on the worker
+            # path, so this per-run check is where they become visible.
+            from .shell_provider import swap_status
+            await swap_status(getattr(self, "_runtime_ref", None), defn.id)
 
         sub_provider = None
         owns_provider = True

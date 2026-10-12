@@ -94,6 +94,12 @@ class EventType(Enum):
     INPUT_GRANTED = "input.granted"
     INPUT_GRANT_DENIED = "input.denied"
 
+    # Core built-in swap status (atn/runtime/shell_provider.py): emitted on
+    # a per (agent, tool) state transition only, never per call. data:
+    # agent_id, tool_digest, tool_name, provides, state (active | fallback |
+    # gone), reason (fallback code or ""), detail.
+    HARNESS_SWAP_STATUS = "harness.swap_status"
+
     # Security (stub — full monitor is the security track)
     SECURITY_ALARM = "security.alarm"
     # Secret-access audit trail (names-only; see runtime/secret_audit.py).

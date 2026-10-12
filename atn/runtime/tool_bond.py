@@ -66,7 +66,7 @@ class ToolBondGate:
                  checker: Optional[Callable[[str], bool]] = None) -> None:
         self._runtime = runtime
         self._checker = checker
-        self._cache: dict[str, tuple[bool, float]] = {}
+        self._cache: dict[str, tuple[bool, float, str]] = {}
         self._address: Optional[str] = None
         self._rpc_url: Optional[str] = None
 
@@ -114,7 +114,7 @@ class ToolBondGate:
         now = time.monotonic()
         hit = self._cache.get(digest)
         if hit is not None and hit[1] > now:
-            return hit[0], "cached"
+            return hit[0], f"{hit[2]} (cached)"
         if not self.configured():
             return False, ("no ToolBond address configured (registry key "
                            "'tool_bond'); core replacement fails closed")
@@ -125,7 +125,7 @@ class ToolBondGate:
             log.warning("ToolBond isBonded(%s) failed: %s", digest[:16], exc)
             bonded, reason = False, f"ToolBond query failed: {exc}"
         ttl = _POSITIVE_TTL_S if bonded else _NEGATIVE_TTL_S
-        self._cache[digest] = (bonded, now + ttl)
+        self._cache[digest] = (bonded, now + ttl, reason)
         return bonded, reason
 
 
