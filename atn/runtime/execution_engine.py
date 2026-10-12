@@ -88,6 +88,13 @@ class ExecutionEngine:
         # is OFF.
         self._booked_by_execution: dict[str, dict[str, float]] = {}
 
+        # execution_id -> (agent_id, tool names resolved for that run). The
+        # tool surface of a bridge / worker run is fixed at run start, so a
+        # live injection that asks the agent to call a tool must check that
+        # the RUNNING run actually has it (group_chat.py). Set once the
+        # surface is resolved; popped in _finalize_execution.
+        self._run_tool_names: dict[str, tuple[str, frozenset[str]]] = {}
+
         # Per-execution "finalize done" events for the isolated-worker path.
         # A worker run's driver task (``_run_cognitive_in_worker``) parks on the
         # event for its execution_id; ``_finalize_execution`` sets it at the very
@@ -609,6 +616,17 @@ class ExecutionEngine:
         # framework tools (execute_tool → registries/stores/on-chain/creds).
         return True
 
+    def running_runs_have_tool(self, agent_id: str, name: str) -> bool:
+        """True when ``agent_id`` has at least one running execution and EVERY
+        one of them resolved ``name`` into its tool surface. False when a run
+        has not resolved its surface yet (it will drain the inbox itself)."""
+        surfaces = [names for aid, names in self._run_tool_names.values()
+                    if aid == agent_id]
+        running = self.registry._running_count.get(agent_id, 0)
+        if not surfaces or len(surfaces) < running:
+            return False
+        return all(name in s for s in surfaces)
+
     def _attribute(self, msg: Any, recipient_id: str, text: str) -> str:
         """Prefix ``text`` with ``[from <agent id>] `` when ``msg`` came from
         another registered agent. Owner and runtime sources stay unlabeled;
@@ -1125,6 +1143,10 @@ class ExecutionEngine:
             except Exception:
                 log.debug("secret tool surface gate failed", exc_info=True)
 
+            _surface_names = frozenset(
+                t.get("name", "") for t in agent_tools if isinstance(t, dict))
+            self._run_tool_names[record.execution_id] = (defn.id, _surface_names)
+
             # --- Drain inbox ---
             all_messages = self.inbox.drain(defn.id)
             work_messages = [
@@ -1144,9 +1166,16 @@ class ExecutionEngine:
             from ..group_chat import WAKE_KEY as _GROUP_WAKE
             _groups = getattr(getattr(self, "_runtime_ref", None), "groups", None)
             _group_wakes = 0
+            _deferred_wakes: list[Any] = []
             prompt_parts: list[str] = []
             for msg in work_messages:
                 if msg.data and msg.data.get(_GROUP_WAKE):
+                    if "group_post" not in _surface_names:
+                        # Membership arrived after this run resolved its
+                        # tools: it could not reply. Leave the turns unseen
+                        # and hand the wake to the next run.
+                        _deferred_wakes.append(msg)
+                        continue
                     _group_wakes += 1
                     if _groups is not None:
                         _txt = _groups.render_delivery(
@@ -1176,7 +1205,9 @@ class ExecutionEngine:
                     else:
                         prompt_parts.append(
                             self._attribute(msg, defn.id, str(msg.data)))
-            if not prompt_parts and _group_wakes:
+            for msg in _deferred_wakes:
+                self.inbox.post(msg)
+            if not prompt_parts and (_group_wakes or _deferred_wakes):
                 # Only group wakes, and their turns were already delivered
                 # (live injection) or the seat was taken: nothing to say.
                 prompt_parts.append(
@@ -1837,12 +1868,24 @@ class ExecutionEngine:
         # Drop the isolated-worker budget tally for this execution so the map
         # doesn't leak (no-op on the in-process path where it was never set).
         self._booked_by_execution.pop(record.execution_id, None)
+        self._run_tool_names.pop(record.execution_id, None)
 
         # Provider lifecycle: keep the provider alive in _active_providers
         # so it is reused across executions. This preserves session state,
         # prompt caching, and allows session_stats to be fetched after
         # execution completes. Cleanup happens on explicit reset
         # (new_conversation, agent unregistered) not after each execution.
+
+        # Group turns that arrived during the run and could not be handed to
+        # it (no group tools, or injection refused) get a wake now that the
+        # agent is idle (atn/group_chat.py).
+        _groups_svc = getattr(getattr(self, "_runtime_ref", None), "groups", None)
+        if (_groups_svc is not None
+                and self.registry._running_count.get(defn.id, 0) == 0):
+            try:
+                await _groups_svc.on_run_finished(defn.id)
+            except Exception:
+                log.debug("group wake on completion failed", exc_info=True)
 
         if self.registry._running_count.get(defn.id, 0) == 0:
             self.registry._last_idle[defn.id] = datetime.now(timezone.utc)

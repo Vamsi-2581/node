@@ -17,7 +17,11 @@ then advances the cursor. An idle member gets ONE coalesced inbox wake per
 group (the turns are rendered when the engine drains the inbox, so several
 posts arriving before it runs become one delivery). A running member gets the
 rendered turns injected through the same steering path delegate_message
-uses. A member whose seat the owner has taken is not woken; when the seat is
+uses, but ONLY when that run's tool surface has group_post (bridge and worker
+runs fix their tools at run start, so a run that began before the agent
+joined cannot reply). Otherwise the cursor stays put and one coalesced wake
+is queued for after the run; the engine also queues one when a run ends with
+unseen turns. A cursor advances only when turns reach a run that can act. A member whose seat the owner has taken is not woken; when the seat is
 released it receives everything since its cursor.
 
 There is no cap on turns (budgets are the bound). A woken agent may stay
@@ -330,17 +334,33 @@ class GroupChatService:
     def render_delivery(self, agent_id: str, gid: str) -> str:
         """Render the turns ``agent_id`` has not seen in ``gid`` and advance
         its cursor. Returns "" when there is nothing new (or the agent is no
-        longer an agent-seated member)."""
+        longer an agent-seated member). Only call this when the text is
+        being handed to a run whose tool surface has group_post."""
+        text, upto = self._render(agent_id, gid)
+        if upto:
+            self._advance(agent_id, gid, upto)
+        return text
+
+    def _advance(self, agent_id: str, gid: str, upto: int) -> None:
         g = self._groups.get(gid)
         if g is None or agent_id not in g["members"]:
-            return ""
+            return
+        if int(g["cursors"].get(agent_id, 0)) < upto:
+            g["cursors"][agent_id] = upto
+            self._save_meta(gid)
+
+    def _render(self, agent_id: str, gid: str) -> tuple[str, int]:
+        """(text, seq the cursor may advance to once the text is delivered).
+        Does not move the cursor."""
+        g = self._groups.get(gid)
+        if g is None or agent_id not in g["members"]:
+            return "", 0
         if g["seats"].get(agent_id) != SEAT_AGENT:
-            return ""
+            return "", 0
         new = self._unseen(gid, agent_id)
-        g["cursors"][agent_id] = self.last_seq(gid)
-        self._save_meta(gid)
+        upto = self.last_seq(gid)
         if not new:
-            return ""
+            return "", upto
         name = g["name"]
         others = [m for m in g["members"] if m != agent_id]
         lines = [
@@ -361,8 +381,10 @@ class GroupChatService:
             f"with group_post(group_id=\"{gid}\", content=...) only if you have "
             f"something to add. If you have nothing to add, stay silent: end "
             f"your turn without posting (group_pass is optional). Your final "
-            f"answer text is NOT posted to the group.)")
-        return "\n".join(lines)
+            f"answer text is NOT posted to the group, and post_message cannot "
+            f"reach {ADMIN_SENDER}: group_post is how a reply reaches the "
+            f"group.)")
+        return "\n".join(lines), upto
 
     def _running(self, agent_id: str) -> bool:
         rt = self._rt
@@ -373,6 +395,32 @@ class GroupChatService:
         except Exception:
             return False
 
+    def _injectable(self, agent_id: str) -> bool:
+        """True when the agent's running run(s) can act on a group delivery:
+        their tool surface (fixed at run start for bridge and worker runs)
+        contains group_post. A run that started before the agent joined the
+        group, or one that has not resolved its surface yet, is not."""
+        engine = getattr(self._rt, "engine", None)
+        check = getattr(engine, "running_runs_have_tool", None)
+        if check is None:
+            return False
+        try:
+            return bool(check(agent_id, "group_post"))
+        except Exception:
+            return False
+
+    async def on_run_finished(self, agent_id: str) -> None:
+        """Called by the engine when the agent's last run ends: any group
+        with turns the agent has not been handed gets a wake."""
+        for gid in self.groups_for(agent_id):
+            g = self._groups.get(gid)
+            if g is None or g["seats"].get(agent_id) != SEAT_AGENT:
+                continue
+            if (agent_id, gid) in self._inflight:
+                continue  # the inject loop requeues on its own
+            if self._unseen(gid, agent_id):
+                await self._wake(agent_id, gid)
+
     async def _wake(self, agent_id: str, gid: str) -> bool:
         """Deliver (or schedule delivery of) unseen turns to one member.
         Returns True when a wake was issued or coalesced."""
@@ -382,17 +430,23 @@ class GroupChatService:
         if not self._unseen(gid, agent_id):
             return False
         key = (agent_id, gid)
-        if self._running(agent_id):
-            if key in self._inflight:
-                self._dirty.add(key)
-                return True
+        if key in self._inflight:
+            self._dirty.add(key)
+            return True
+        if self._running(agent_id) and self._injectable(agent_id):
             self._inflight.add(key)
             task = asyncio.ensure_future(self._inject_loop(agent_id, gid))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             return True
-        # Idle: one coalesced inbox wake per (agent, group). The turns are
-        # rendered when the engine drains it, so later posts ride along.
+        return self._queue_wake(agent_id, gid)
+
+    def _queue_wake(self, agent_id: str, gid: str) -> bool:
+        """One coalesced inbox wake per (agent, group). The turns are rendered
+        (and the cursor advanced) only when a run that has the group tools
+        drains it, so later posts ride along. A wake queued while the agent
+        is running (its run lacks group_post) fires after that run ends."""
+        rt = self._rt
         for m in rt.inbox.peek(agent_id):
             if (m.data or {}).get(WAKE_KEY) == gid:
                 return True
@@ -412,26 +466,31 @@ class GroupChatService:
         try:
             while True:
                 self._dirty.discard(key)
-                text = self.render_delivery(agent_id, gid)
+                if not (self._running(agent_id) and self._injectable(agent_id)):
+                    # The run ended (or one without group tools is running):
+                    # leave the turns unseen for the next run.
+                    if self._unseen(gid, agent_id):
+                        self._queue_wake(agent_id, gid)
+                    break
+                text, upto = self._render(agent_id, gid)
                 if text:
                     control = getattr(self._rt, "control", None)
                     delivered = False
                     if control is not None:
                         try:
+                            # "injected", or "inbox_fallback" (control re-posted
+                            # the text for the next run): handed on either way.
                             delivered = bool(
                                 await control.send_delegate_message(agent_id, text))
                         except Exception:
                             log.debug("group injection failed for %s", agent_id,
                                       exc_info=True)
-                    if not delivered:
-                        # Nothing took it: re-queue as a plain inbox message.
-                        from .models import InboxMessage, MessagePriority, MessageType
-                        self._rt.inbox.post(InboxMessage(
-                            id=InboxMessage.generate_id(),
-                            source=f"group:{gid}", target=agent_id,
-                            type=MessageType.WORK, priority=MessagePriority.HIGH,
-                            data={"instruction": text},
-                        ))
+                    if delivered:
+                        self._advance(agent_id, gid, upto)
+                    else:
+                        # Nothing took it: the cursor stays, the next run gets it.
+                        self._queue_wake(agent_id, gid)
+                        break
                 if key not in self._dirty:
                     break
         finally:

@@ -2508,9 +2508,19 @@ async def _kill_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]
 ## orphaned processes.  The user restarts manually from the console.
 
 
+_OWNER_ALIASES = frozenset({"admin", "owner", "user", "human"})
+
+
 async def _post_message(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
     target = input["target"]
     defn = runtime.get_agent(target)
+    if defn is None and str(target).strip().lower() in _OWNER_ALIASES:
+        # The owner is not an agent and has no inbox (docs/group_chat.md).
+        return {"error": (
+            f"'{target}' is the human owner, not an agent; post_message only "
+            f"reaches agents. To answer in a group, call group_post(group_id=..., "
+            f"content=...). Otherwise just reply in your final answer: the "
+            f"owner reads your own thread.")}
     if defn is None:
         return {"error": f"Agent '{target}' not found."}
 

@@ -39,8 +39,25 @@ Stored under the daemon data dir: `groups/<id>/meta.json` and
   `group_read`.
 - Idle member: one coalesced inbox wake per group; turns are rendered when
   the engine drains it, so a burst of posts becomes one delivery.
-- Running member: the rendered turns are injected like `delegate_message`;
-  posts that arrive during an injection are coalesced into one follow-up.
+- Running member: the rendered turns are injected like `delegate_message`,
+  but only when the running run's tool surface contains `group_post` (the
+  engine records each run's resolved tool names; bridge and worker runs fix
+  their tools at run start, so a run that began before the agent joined
+  cannot reply). Otherwise no injection: the cursor stays and one coalesced
+  wake is queued, which fires after the run ends and starts a fresh run that
+  has the group tools. Posts that arrive during an injection are coalesced
+  into one follow-up. The same rule holds for every provider.
+- The cursor advances only when the turns reach a run that can act on them
+  (engine drain with group tools, or an injection the provider accepted or
+  re-queued). A run that drains a group wake without group tools puts it
+  back. When an agent's last run ends with unseen turns, the engine queues a
+  wake.
+- Group tools are added to every member's run regardless of `tools` (also
+  `tools=[]`); the bridge allows them as `mcp__atn__group_*`.
+- `post_message` to `admin` / `owner` / `user` is refused with a pointer to
+  `group_post` (or the agent's final answer, which the owner reads in the
+  agent's own thread). The owner has no inbox; `group_post` is the one way
+  an agent answers in a group.
 - No turn cap. Budgets are the only bound. The delivery tells the agent it
   may stay silent: a run that ends without `group_post` posts nothing
   (`group_pass` is an explicit, optional no-op). The run's final text is
@@ -69,7 +86,5 @@ Frontend: `atn_web` Groups button on the Agents page
 
 ## Gaps
 
-- A bridge session started before the agent joined a group may not see
-  the group tools until its next session.
 - Removing an agent from the fleet does not remove it from groups; wakes
   to unknown agents are skipped.

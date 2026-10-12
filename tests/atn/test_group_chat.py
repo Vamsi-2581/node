@@ -241,6 +241,8 @@ async def test_running_member_gets_live_injection(tmp_path):
     rt = await _fleet(tmp_path)
     gid = (await _owner(rt, "group_create", name="g", members=["a", "b"]))["group"]["id"]
     rt.registry._running_count["b"] = 1
+    # The running run resolved its tools with group_post in them.
+    rt.engine._run_tool_names["eid_b"] = ("b", frozenset({"group_post"}))
     sent: list[tuple[str, str]] = []
     gate = asyncio.Event()
 
@@ -389,3 +391,135 @@ async def test_delegate_message_attribution(tmp_path):
         await _owner(rt, "delegate_message", agent_id="a", content="owner steer")
         assert sent[-1] == "owner steer"
         assert rt.inbox.peek("a")[-1].source == "owner"
+
+
+# ---------------------------------------------------------------------------
+# Running member WITHOUT group tools (live repro 2026-10-13)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_running_member_without_group_tools_gets_no_injection(tmp_path):
+    rt = await _fleet(tmp_path)
+    rt.registry._running_count["b"] = 1
+    rt.engine._run_tool_names["eid_b"] = ("b", frozenset({"post_message"}))
+    gid = (await _owner(rt, "group_create", name="g", members=["a", "b"]))["group"]["id"]
+    send = AsyncMock(return_value="injected")
+    with patch.object(rt.control, "send_delegate_message", send):
+        await _owner(rt, "group_post", group_id=gid, content="p1")
+        await _owner(rt, "group_post", group_id=gid, content="p2")
+        await rt.groups.wait_idle()
+    send.assert_not_called()
+    assert rt.groups.get(gid)["cursors"]["b"] == 0
+    assert len(_wakes(rt, "b", gid)) == 1  # coalesced, fires after the run
+
+
+@pytest.mark.asyncio
+async def test_refused_injection_keeps_cursor_and_queues_wake(tmp_path):
+    rt = await _fleet(tmp_path)
+    rt.registry._running_count["b"] = 1
+    rt.engine._run_tool_names["eid_b"] = ("b", frozenset({"group_post"}))
+    gid = (await _owner(rt, "group_create", name="g", members=["a", "b"]))["group"]["id"]
+    with patch.object(rt.control, "send_delegate_message",
+                      AsyncMock(return_value=False)):
+        await _owner(rt, "group_post", group_id=gid, content="p1")
+        await rt.groups.wait_idle()
+    assert rt.groups.get(gid)["cursors"]["b"] == 0
+    assert len(_wakes(rt, "b", gid)) == 1
+
+
+def _gated_provider(captured: list, gate: asyncio.Event, started: asyncio.Event):
+    resp = ProviderResponse(text="ok", usage=Usage(input_tokens=1, output_tokens=1),
+                            stop_reason="end_turn", model="sonnet")
+
+    async def loop(**kwargs):
+        captured.append(kwargs)
+        if len(captured) == 1:
+            started.set()
+            await gate.wait()
+        return resp
+
+    p = AsyncMock()
+    p.run_agent_loop = loop
+    p.close = AsyncMock()
+    p.interrupt = AsyncMock()
+    return p
+
+
+@pytest.mark.asyncio
+async def test_group_created_mid_run_delivers_to_next_run_with_tools(tmp_path):
+    """Owner creates two tools=[] claude_max agents; their first runs are in
+    flight when the owner opens a group and posts. The running runs have no
+    group_post, so nothing is injected and no cursor moves; when a run ends
+    the queued wake starts a fresh run that has the group tools and the
+    turns."""
+    from atn.models import AgentMode
+    rt = _make_runtime(EventBus(), tmp_path)
+    for aid in ("a", "b"):
+        await rt.register_agent(AgentDefinition(
+            id=aid, name=aid.upper(), mode=AgentMode.COGNITIVE,
+            provider="claude_max", cognitive_model="sonnet", tools=[]))
+    captured: list = []
+    gate, started = asyncio.Event(), asyncio.Event()
+    done = asyncio.Event()
+
+    async def on_done(e):
+        if (e.data or {}).get("agent_id") == "b":
+            done.set()
+    rt.events.subscribe(EventType.EXECUTION_COMPLETED, on_done)
+    rt.events.subscribe(EventType.EXECUTION_FAILED, on_done)
+
+    send = AsyncMock(return_value="injected")
+    with patch("atn.runtime.provider_manager.BridgeProvider",
+               return_value=_gated_provider(captured, gate, started)),             patch.object(rt.control, "send_delegate_message", send):
+        await rt.activate_agent("b")
+        await rt.trigger_run("b", source="test")
+        await asyncio.wait_for(started.wait(), 10)
+        first_tools = {t["name"] for t in captured[0].get("tools") or []}
+        assert "group_post" not in first_tools
+
+        gid = (await _owner(rt, "group_create", name="crew",
+                            members=["a", "b"]))["group"]["id"]
+        await _owner(rt, "group_post", group_id=gid, content="hello both")
+        await rt.groups.wait_idle()
+        send.assert_not_called()
+        assert rt.groups.get(gid)["cursors"]["b"] == 0
+        assert len(_wakes(rt, "b", gid)) == 1
+
+        gate.set()
+        await asyncio.wait_for(done.wait(), 10)
+        # Still pending after the run ended: the wake survives for the next run.
+        assert len(_wakes(rt, "b", gid)) == 1
+        assert rt.groups.get(gid)["cursors"]["b"] == 0
+
+        done.clear()
+        await rt.trigger_run("b", source="inbox")
+        await asyncio.wait_for(done.wait(), 10)
+
+    second_tools = {t["name"] for t in captured[-1].get("tools") or []}
+    assert {"group_post", "group_read", "group_pass"} <= second_tools
+    user = [t.content for t in rt.get_agent_conversation_store("b").get_turns()
+            if t.role == "user"][-1]
+    assert "[group crew] admin: hello both" in user
+    assert f'group_post(group_id="{gid}"' in user and "stay silent" in user
+    assert rt.groups.get(gid)["cursors"]["b"] == 1
+    assert _wakes(rt, "b", gid) == []
+
+
+@pytest.mark.asyncio
+async def test_run_ending_with_unseen_turns_queues_wake(tmp_path):
+    rt = await _fleet(tmp_path)
+    gid = (await _owner(rt, "group_create", name="g", members=["a", "b"]))["group"]["id"]
+    await _owner(rt, "group_post", group_id=gid, content="x")
+    rt.inbox.remove_where("b", lambda m: True)
+    await rt.groups.on_run_finished("b")
+    assert len(_wakes(rt, "b", gid)) == 1
+    assert rt.groups.get(gid)["cursors"]["b"] == 0
+
+
+@pytest.mark.asyncio
+async def test_post_message_to_admin_points_to_group_post(tmp_path):
+    rt = await _fleet(tmp_path)
+    for target in ("admin", "owner"):
+        r = await _as(rt, "a", "post_message", target=target, message_type="info",
+                      data={"instruction": "hi"})
+        assert "group_post" in r["error"] and "not found" not in r["error"]
