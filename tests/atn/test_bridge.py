@@ -204,7 +204,7 @@ async def test_send_empty_message():
 @pytest.mark.asyncio
 async def test_provider_name():
     """Test provider name property."""
-    provider = BridgeProvider()
+    provider = BridgeProvider(model="sonnet")
     assert provider.name == "claude_max"
 
 
@@ -242,7 +242,7 @@ async def test_default_model(bridge_response):
 @pytest.mark.asyncio
 async def test_system_prompt_forwarded(bridge_response):
     """Test that system prompt is forwarded to bridge."""
-    provider = BridgeProvider()
+    provider = BridgeProvider(model="sonnet")
     mock_proc = MockBridgeProcess([bridge_response])
     provider._process = mock_proc
 
@@ -258,7 +258,7 @@ async def test_system_prompt_forwarded(bridge_response):
 @pytest.mark.asyncio
 async def test_content_blocks_extraction(bridge_response):
     """Test extraction of text from content block arrays."""
-    provider = BridgeProvider()
+    provider = BridgeProvider(model="sonnet")
     mock_proc = MockBridgeProcess([bridge_response])
     provider._process = mock_proc
 
@@ -279,7 +279,7 @@ async def test_content_blocks_extraction(bridge_response):
 @pytest.mark.asyncio
 async def test_bridge_script_path():
     """Test that bridge script path is resolved correctly."""
-    provider = BridgeProvider()
+    provider = BridgeProvider(model="sonnet")
     assert provider._bridge_script == _BRIDGE_SCRIPT
     assert provider._bridge_script.name == "claude-bridge.ts"
 

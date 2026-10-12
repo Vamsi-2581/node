@@ -196,19 +196,28 @@ function resolveClaudeExecutable(): string {
 const claudeExecutable = resolveClaudeExecutable()
 log("resolved claude executable", { path: claudeExecutable })
 
-function mapModelToClaudeModel(model: string): string {
+function mapModelToClaudeModel(model: string | undefined): string {
   // Accept full model IDs (e.g. "claude-sonnet-4-20250514", "claude-fable-5")
   // or family names (e.g. "sonnet", "opus", "fable").  Full IDs are passed
   // through as-is — the Agent SDK resolves whatever string we hand it, so new
   // model IDs never need a mapping entry here.  Family names map to the SDK's
-  // short aliases.
+  // short aliases.  There is no default model (decision 2026-10-06): a missing
+  // or non-Claude id is a loud error, never a silent remap onto sonnet.
+  if (!model) {
+    throw new Error(
+      "No model specified: the agent must name its Claude model explicitly (no default model)",
+    )
+  }
   if (model.startsWith("claude-")) return model
   const m = model.toLowerCase()
   if (m.includes("fable")) return "fable"
   if (m.includes("mythos")) return "mythos"
   if (m.includes("opus")) return "opus"
   if (m.includes("haiku")) return "haiku"
-  return "sonnet"
+  if (m.includes("sonnet")) return "sonnet"
+  throw new Error(
+    `Model '${model}' is not a Claude model: the claude_max bridge serves Claude models only`,
+  )
 }
 
 // Capability rules, version-aware so new point releases in a family work with
@@ -788,7 +797,7 @@ function attachConsumptionAcks(q: AsyncQueue<SDKUserMessage>): AsyncQueue<SDKUse
 
 async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
   try {
-    const model = mapModelToClaudeModel(req.model || "sonnet")
+    const model = mapModelToClaudeModel(req.model)
     const maxTurns = req.max_turns || 20
 
     log("request.agent_loop", {
@@ -1216,7 +1225,7 @@ async function handleRequest(req: BridgeRequest): Promise<void> {
   switch (req.type) {
     case "create": {
       try {
-        const model = mapModelToClaudeModel(req.model || "sonnet")
+        const model = mapModelToClaudeModel(req.model)
 
         log("request.create", { model, messageLen: req.message.length })
 

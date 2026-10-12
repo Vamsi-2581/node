@@ -270,11 +270,11 @@ class ProviderManager:
     _PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
         "gemini": {
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-            "default_model": "gemini-2.5-flash",
+            "default_model": "",
         },
         "deepseek": {
             "base_url": "https://api.deepseek.com/v1",
-            "default_model": "deepseek-chat",
+            "default_model": "",
         },
         "ollama": {
             "base_url": "http://localhost:11434",
@@ -1450,7 +1450,8 @@ class ProviderManager:
 
     async def probe_bridge(self) -> bool:
         try:
-            provider = BridgeProvider(model="sonnet")
+            # Ping needs no model; the probe instance never serves an agent.
+            provider = BridgeProvider()
             resp = await asyncio.wait_for(provider._send_request({"type": "ping"}), timeout=15)
             ok = resp.get("ok", False)
             await provider.close()
@@ -1494,10 +1495,12 @@ class ProviderManager:
                 pconfig = self._config.providers.get("claude_max")
                 bridge_script = pconfig.extra.get("bridge_script", "") if pconfig else ""
                 # The registry instance serves no agent directly (each agent
-                # gets its own instance built with its own model).
+                # gets its own instance built with its own model). Only a
+                # configured label, never a hardcoded one: no model => a
+                # request through it fails loud.
                 _label = pconfig.default_model if pconfig else ""
                 provider = BridgeProvider(
-                    **({"model": _label} if _label else {}),
+                    model=_label,
                     bridge_script=bridge_script if bridge_script else None,
                 )
             elif provider_id == "codex_max":
@@ -1505,7 +1508,7 @@ class ProviderManager:
                 codex_key = api_key or self._resolve_api_key("codex_max") \
                     or self._resolve_api_key("openai") or ""
                 provider = CodexBridgeProvider(
-                    model=(pconfig.default_model if pconfig else "") or "gpt-5.6-terra",
+                    model=pconfig.default_model if pconfig else "",
                     api_key=codex_key,
                 )
             elif provider_id == "anthropic":

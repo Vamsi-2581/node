@@ -209,18 +209,30 @@ function stopRelayServer(): void {
 // -- Model mapping --
 
 // ChatGPT-account auth accepts only current Codex models (verified
-// empirically 2026-08: gpt-5.6-terra, gpt-5.5). Retired ids (o3, o4-mini,
-// gpt-4.1, *-codex) are rejected with "not supported when using Codex with
-// a ChatGPT account" — map anything stale onto the default instead of
-// passing it through to a guaranteed 400.
-const DEFAULT_MODEL = "gpt-5.6-terra"
+// empirically 2026-08: gpt-5.6-terra, gpt-5.5). Retired ids (o1, o3,
+// o4-mini, gpt-4*) are rejected by the service with "not supported when
+// using Codex with a ChatGPT account". There is no default model (decision
+// 2026-10-06): a missing, retired or non-gpt id is a loud error naming the
+// model, never a silent remap onto some other model.
 const RETIRED_MODELS = /^(o[134]|gpt-4)/
 
-function mapModel(model: string): string {
-  if (!model) return DEFAULT_MODEL
-  if (RETIRED_MODELS.test(model)) return DEFAULT_MODEL
-  if (model.startsWith("gpt")) return model
-  return DEFAULT_MODEL
+function mapModel(model: string | undefined): string {
+  if (!model) {
+    throw new Error(
+      "No model specified: the agent must name its Codex model explicitly (no default model)",
+    )
+  }
+  if (RETIRED_MODELS.test(model)) {
+    throw new Error(
+      `Model '${model}' is retired: not supported with a ChatGPT account (use a current Codex model such as gpt-5.6-terra or gpt-5.5)`,
+    )
+  }
+  if (!model.startsWith("gpt")) {
+    throw new Error(
+      `Model '${model}' is not a Codex model: the codex_max bridge serves gpt-* models only`,
+    )
+  }
+  return model
 }
 
 // -- Session tracking --
@@ -382,7 +394,7 @@ function respond(resp: BridgeResponse): void {
 
 async function handleCreate(req: CreateRequest): Promise<void> {
   try {
-    const model = mapModel(req.model || DEFAULT_MODEL)
+    const model = mapModel(req.model)
     log("request.create", { model, messageLen: req.message.length })
 
     const codex = getSimpleCodex()
@@ -445,7 +457,7 @@ async function handleCreate(req: CreateRequest): Promise<void> {
 
 async function handleAgentLoop(req: AgentLoopRequest): Promise<void> {
   try {
-    const model = mapModel(req.model || DEFAULT_MODEL)
+    const model = mapModel(req.model)
     const maxTurns = req.max_turns || 20
 
     log("request.agent_loop", {

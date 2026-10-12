@@ -188,6 +188,10 @@ class OllamaProvider(Provider):
         temperature: float = 0.0,
     ) -> ProviderResponse:
         model = model or self._default_model
+        if not model:
+            raise ProviderError(
+                "No model specified: the agent must name its model explicitly "
+                "(no default model)", provider="ollama")
 
         # Build message list with system prompt. Structured tool history is
         # translated natively (§9) so multi-turn tool use round-trips.
@@ -229,6 +233,10 @@ class OllamaProvider(Provider):
         on_thinking: Any = None,
     ) -> ProviderResponse:
         model = model or self._default_model
+        if not model:
+            raise ProviderError(
+                "No model specified: the agent must name its model explicitly "
+                "(no default model)", provider="ollama")
 
         ollama_messages: list[dict[str, Any]] = []
         if system:

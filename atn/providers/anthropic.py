@@ -123,8 +123,6 @@ def anthropic_headers(api_key: str, workspace_id: str = "") -> dict[str, str]:
     if ws:
         headers["anthropic-workspace-id"] = ws
     return headers
-_DEFAULT_MODEL = "claude-sonnet-4-20250514"
-
 # Retry config for transient errors
 _MAX_RETRIES = 3
 _RETRY_STATUSES = {429, 503, 529}
@@ -145,7 +143,7 @@ class AnthropicProvider(Provider):
             raise ProviderError("Anthropic API key is required", provider="anthropic")
         self._api_key = api_key
         self._workspace_id = (workspace_id or "").strip()
-        self._default_model = default_model or _DEFAULT_MODEL
+        self._default_model = default_model
         # Raw base_url as passed in (before path normalisation) so an isolated
         # worker can rebuild this provider identically from a manifest — see
         # ExecutionEngine._build_provider_config. "" means the default endpoint.
@@ -167,6 +165,10 @@ class AnthropicProvider(Provider):
         temperature: float = 0.0,
     ) -> ProviderResponse:
         model = model or self._default_model
+        if not model:
+            raise ProviderError(
+                "No model specified: the agent must name its model explicitly "
+                "(no default model)", provider="anthropic")
 
         # Build request body
         body: dict[str, Any] = {
@@ -211,6 +213,10 @@ class AnthropicProvider(Provider):
         on_thinking: Any = None,
     ) -> ProviderResponse:
         model = model or self._default_model
+        if not model:
+            raise ProviderError(
+                "No model specified: the agent must name its model explicitly "
+                "(no default model)", provider="anthropic")
 
         body: dict[str, Any] = {
             "model": model,

@@ -8,7 +8,9 @@ Supports two request types:
   - agent loop: multi-turn with ATN tools relayed as in-process MCP server.
 
 Config keys (in ~/.atn/config.yaml under providers.claude_max):
-  model       (str)   "sonnet" | "opus" | "haiku".  Default: "sonnet".
+  model       (str)   "sonnet" | "opus" | "haiku" | a full claude-* id.  No
+                      default: every request needs the agent's chosen model
+                      (or this label); a request with neither is an error.
 
 The bridge subprocess is started lazily on first request and kept alive
 for subsequent requests.  It shuts down when the provider is closed.
@@ -233,9 +235,11 @@ class BridgeProvider(Provider):
 
     def __init__(
         self,
-        model: str = "sonnet",
+        model: str = "",
         bridge_script: str | Path | None = None,
     ) -> None:
+        # "" is allowed for registry/probe instances that never serve an
+        # agent; a request that needs a model then fails loud (no fallback).
         self._model = model
         self._bridge_script = Path(bridge_script) if bridge_script else _BRIDGE_SCRIPT
         self._process: asyncio.subprocess.Process | None = None
@@ -343,6 +347,18 @@ class BridgeProvider(Provider):
     def name(self) -> str:
         return "claude_max"
 
+    def _require_model(self, model: str) -> str:
+        """The model for this request: the caller's, else this instance's.
+        Neither set is an error, never a silent default (decision 2026-10-06)."""
+        effective = model or self._model
+        if not effective:
+            raise ProviderError(
+                "No model specified for the claude_max bridge: the agent must "
+                "name its model explicitly (no default model)",
+                provider="claude_max",
+            )
+        return effective
+
     @property
     def supports_agent_loop(self) -> bool:
         return True
@@ -381,7 +397,7 @@ class BridgeProvider(Provider):
             "type": "create",
             "message": user_text,
             "system": system,
-            "model": model or self._model,
+            "model": self._require_model(model),
         }
 
         resp = await self._send_request(request)
@@ -464,7 +480,7 @@ class BridgeProvider(Provider):
             "type": "create",
             "message": user_text,
             "system": system,
-            "model": model or self._model,
+            "model": self._require_model(model),
         }
 
         # Drain any stale events from previous requests
@@ -594,7 +610,7 @@ class BridgeProvider(Provider):
         # §11 model-tier guard: reject non-loop-capable models (haiku)
         # BEFORE acquiring the lock or spawning the SDK loop, since the loop
         # hot-spins on them. Cheap, pure model check.
-        effective_model = model or self._model
+        effective_model = self._require_model(model)
         _ok, _reason = _model_is_loop_capable(effective_model)
         if not _ok:
             raise ProviderError(_reason, provider="claude_max")

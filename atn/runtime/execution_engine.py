@@ -275,7 +275,7 @@ class ExecutionEngine:
         # reading ~/.claude/.credentials.json off disk). Special-case it so the
         # worker rebuilds the SAME bridge the daemon picked.
         if cfg.get("kind") == "bridge":
-            cfg["model"] = str(getattr(provider, "_model", "") or "sonnet")
+            cfg["model"] = str(getattr(provider, "_model", "") or "")
             # Ship the resolved script path so the worker uses the same one the
             # daemon chose (a configured bridge_script from pconfig.extra, if
             # any). "" => worker falls back to its own _find_bridge_dir(), which

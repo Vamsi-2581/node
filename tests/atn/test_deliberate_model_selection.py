@@ -378,3 +378,130 @@ def test_migration_skips_bound_agents(tmp_path):
     bound = _agent("bound", service_provider=dict(BINDING))
     assert pin_unpinned_agents_from_legacy_defaults([bound], cfg) == []
     assert bound.provider == ""
+
+
+# --- Providers and bridges: no model is a loud error, never a default ------
+
+from atn.providers.anthropic import AnthropicProvider
+from atn.providers.bridge import BridgeProvider
+from atn.providers.codex_bridge import CodexBridgeProvider
+from atn.providers.ollama import OllamaProvider
+from atn.providers.openai_compat import OpenAICompatibleProvider
+
+_MSGS = [{"role": "user", "content": "hi"}]
+
+
+def test_bridges_construct_without_a_model():
+    # Registry/probe instances may carry no model; nothing is invented.
+    assert BridgeProvider()._model == ""
+    assert CodexBridgeProvider()._model == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [BridgeProvider, CodexBridgeProvider])
+async def test_bridge_request_without_a_model_fails_loud(cls):
+    provider = cls()
+
+    async def _never(_req):  # the bridge must not be reached at all
+        raise AssertionError("request sent without a model")
+
+    provider._send_request = _never
+    with pytest.raises(ProviderError, match="No model specified"):
+        await provider.send(messages=_MSGS)
+    with pytest.raises(ProviderError, match="No model specified"):
+        await provider.run_agent_loop(message="hi", tools=[], tool_executor=None)
+    assert provider._process is None  # no subprocess spawned
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls,model", [
+    (BridgeProvider, "opus"), (CodexBridgeProvider, "gpt-5.5")])
+async def test_bridge_request_uses_the_named_model(cls, model):
+    provider = cls()
+    seen = {}
+
+    async def _capture(req):
+        seen.update(req)
+        return {"ok": True, "text": "x", "usage": {}}
+
+    provider._send_request = _capture
+    await provider.send(messages=_MSGS, model=model)
+    assert seen["model"] == model
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make", [
+    lambda: AnthropicProvider(api_key="sk-test"),
+    lambda: OpenAICompatibleProvider(name="openai", base_url="http://x/v1", api_key="k"),
+    lambda: OllamaProvider(base_url="http://localhost:1"),
+])
+async def test_api_providers_have_no_hardcoded_model(make):
+    with pytest.raises(ProviderError, match="No model specified"):
+        await make().send(messages=_MSGS)
+
+
+def test_registry_defaults_carry_no_model():
+    from atn.runtime.provider_manager import ProviderManager
+    for slot in ProviderManager._PROVIDER_DEFAULTS.values():
+        assert slot.get("default_model", "") == ""
+
+
+def test_bridge_sources_carry_no_default_model():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2] / "bridge"
+    codex = (root / "codex-bridge.ts").read_text(encoding="utf-8")
+    claude = (root / "claude-bridge.ts").read_text(encoding="utf-8")
+    assert "DEFAULT_MODEL" not in codex
+    assert "req.model ||" not in codex and "req.model ||" not in claude
+
+
+# Live bridge subprocess checks (skipped without a JS runtime). They never
+# reach a model: ping needs none, and a bad model is rejected before any
+# service call.
+import shutil
+
+_live = pytest.mark.skipif(not shutil.which("bun"), reason="bun not installed")
+
+
+@_live
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model,needle", [
+    ("", "No model specified"),
+    ("o3", "not supported with a ChatGPT account"),
+    ("gpt-4.1", "not supported with a ChatGPT account"),
+    ("sonnet", "not a Codex model"),
+])
+async def test_codex_bridge_rejects_bad_models_live(model, needle):
+    import asyncio
+    provider = CodexBridgeProvider()
+    try:
+        ping = await asyncio.wait_for(provider._send_request({"type": "ping"}), timeout=60)
+        assert ping.get("ok")
+        resp = await asyncio.wait_for(provider._send_request(
+            {"type": "create", "message": "hi", "system": "", "model": model}), timeout=60)
+        assert not resp.get("ok")
+        assert needle in resp.get("error", "")
+        if model:
+            assert model in resp["error"]
+    finally:
+        await provider.close()
+
+
+@_live
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model,needle", [
+    ("", "No model specified"),
+    ("gpt-5.5", "not a Claude model"),
+])
+async def test_claude_bridge_rejects_bad_models_live(model, needle):
+    import asyncio
+    provider = BridgeProvider()
+    try:
+        ping = await asyncio.wait_for(provider._send_request({"type": "ping"}), timeout=60)
+        assert ping.get("ok")
+        resp = await asyncio.wait_for(provider._send_request(
+            {"type": "create", "message": "hi", "system": "", "model": model}), timeout=60)
+        assert not resp.get("ok")
+        assert needle in resp.get("error", "")
+    finally:
+        await provider.close()

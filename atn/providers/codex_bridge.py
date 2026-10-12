@@ -9,9 +9,10 @@ Supports two request types:
   - agent loop: multi-turn with Codex's built-in tools + ATN tool relay.
 
 Config keys (in ~/.atn/config.yaml under providers.codex_max):
-  model       (str)   e.g. "gpt-5.6-terra" | "gpt-5.5".  Default: "gpt-5.6-terra".
+  model       (str)   e.g. "gpt-5.6-terra" | "gpt-5.5".  No default: every
+                      request needs the agent's chosen model (or this label).
                       ChatGPT-account auth accepts only current Codex models;
-                      retired ids (o3/o4-mini/gpt-4.1) are remapped by the bridge.
+                      the bridge rejects retired ids (o3/o4-mini/gpt-4.1) loudly.
 
 The bridge subprocess is started lazily on first request and kept alive
 for subsequent requests.  It shuts down when the provider is closed.
@@ -72,10 +73,12 @@ class CodexBridgeProvider(Provider):
 
     def __init__(
         self,
-        model: str = "gpt-5.6-terra",
+        model: str = "",
         bridge_script: str | Path | None = None,
         api_key: str = "",
     ) -> None:
+        # "" is allowed for registry/probe instances that never serve an
+        # agent; a request that needs a model then fails loud (no fallback).
         self._model = model
         self._bridge_script = Path(bridge_script) if bridge_script else _BRIDGE_SCRIPT
         self._api_key = api_key
@@ -112,6 +115,18 @@ class CodexBridgeProvider(Provider):
     @property
     def name(self) -> str:
         return "codex_max"
+
+    def _require_model(self, model: str) -> str:
+        """The model for this request: the caller's, else this instance's.
+        Neither set is an error, never a silent default (decision 2026-10-06)."""
+        effective = model or self._model
+        if not effective:
+            raise ProviderError(
+                "No model specified for the codex_max bridge: the agent must "
+                "name its model explicitly (no default model)",
+                provider="codex_max",
+            )
+        return effective
 
     @property
     def supports_agent_loop(self) -> bool:
@@ -151,7 +166,7 @@ class CodexBridgeProvider(Provider):
             "type": "create",
             "message": user_text,
             "system": system,
-            "model": model or self._model,
+            "model": self._require_model(model),
         }
 
         resp = await self._send_request(request)
@@ -224,7 +239,7 @@ class CodexBridgeProvider(Provider):
             "type": "create",
             "message": user_text,
             "system": system,
-            "model": model or self._model,
+            "model": self._require_model(model),
         }
 
         # Drain stale events
@@ -326,6 +341,8 @@ class CodexBridgeProvider(Provider):
         2. Reads stdout lines for tool_call or final response.
         3. Concurrently drains stderr for streaming events.
         """
+        # Fail loud before spawning anything: no model, no run.
+        effective_model = self._require_model(model)
         async with self._lock:
             await self._ensure_process()
             assert self._process and self._process.stdin and self._process.stdout
@@ -333,7 +350,6 @@ class CodexBridgeProvider(Provider):
             self._request_id += 1
             request_id = f"req-{self._request_id}"
 
-            effective_model = model or self._model
             if model:
                 self._model = model
 

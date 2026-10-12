@@ -75,7 +75,7 @@ def build_provider_from_manifest(cfg: dict[str, Any]) -> Provider:
           "default_model": <str>,     # API providers
           "base_url": <str>,          # "" for anthropic default endpoint
           "api_key": <str>,           # see SECRETS note above (API providers)
-          "model": <str>,             # bridge only ("sonnet"/"opus"/...)
+          "model": <str>,             # bridge only ("sonnet"/"opus"/...; no default)
           "bridge_script": <str>,     # bridge only ("" => worker resolves it)
         }
 
@@ -102,7 +102,7 @@ def build_provider_from_manifest(cfg: dict[str, Any]) -> Provider:
         # because bridge's spawn sets only CREATE_NO_WINDOW — no breakaway, no
         # new session (see worker_manager job-assignment + P5 audit §2).
         from ..providers.bridge import BridgeProvider
-        model = str(cfg.get("model", "") or "sonnet")
+        model = str(cfg.get("model", "") or "")
         bridge_script = str(cfg.get("bridge_script", "") or "") or None
         return BridgeProvider(model=model, bridge_script=bridge_script)
 

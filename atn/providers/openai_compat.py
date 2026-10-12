@@ -94,6 +94,10 @@ class OpenAICompatibleProvider(Provider):
         temperature: float = 0.0,
     ) -> ProviderResponse:
         model = model or self._default_model
+        if not model:
+            raise ProviderError(
+                "No model specified: the agent must name its model explicitly "
+                "(no default model)", provider=self._name)
 
         # Translate messages — prepend system as a system message
         oai_messages = _to_openai_messages(messages, system)
@@ -127,6 +131,10 @@ class OpenAICompatibleProvider(Provider):
         on_thinking: Any = None,
     ) -> ProviderResponse:
         model = model or self._default_model
+        if not model:
+            raise ProviderError(
+                "No model specified: the agent must name its model explicitly "
+                "(no default model)", provider=self._name)
         oai_messages = _to_openai_messages(messages, system)
 
         body: dict[str, Any] = {
