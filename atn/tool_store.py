@@ -1458,7 +1458,8 @@ class ToolStore:
         registered tools served the work it just finished. This is the only
         usage the mint counts (docs/tool_substrate.md — two receipt tiers).
 
-        ``judgments`` — list of ``{"tool", "ok", "score"?, "note"?}``. Each
+        ``judgments`` — list of ``{"tool", "ok", "score"?, "axes"?,
+        "own_share"?, "note"?}``. Each
         tool is resolved via ``self.resolve`` and scoping-checked; a tool the
         caller may not use (or can't resolve) is skipped and reported, never
         failing the batch. ``context_text`` (the work item) is embedded ONCE
@@ -1517,6 +1518,18 @@ class ToolStore:
                         axes[str(axis_id)] = max(-1.0, min(1.0, float(value)))
                     except (TypeError, ValueError):
                         continue
+            # Reviewed composition split (Decision 2026-10-13 §9): optional
+            # estimate in [0,1] of how much of a composite's value is its
+            # own logic vs its declared deps. Garbage is dropped.
+            own_share: float | None = None
+            raw_own = judgment.get("own_share")
+            if raw_own is not None and not isinstance(raw_own, bool):
+                try:
+                    v = float(raw_own)
+                    if v == v and abs(v) != float("inf"):  # finite only
+                        own_share = round(max(0.0, min(1.0, v)), 6)
+                except (TypeError, ValueError):
+                    own_share = None
             note = judgment.get("note")
 
             review_digest = ""
@@ -1533,6 +1546,8 @@ class ToolStore:
                 }
                 if axes:
                     review["axes"] = dict(sorted(axes.items()))
+                if own_share is not None:
+                    review["own_share"] = own_share
                 try:
                     review_digest = blobs.add_json(review) or ""
                 except Exception as exc:
@@ -1552,6 +1567,8 @@ class ToolStore:
             }
             if axes:
                 row["axes"] = dict(sorted(axes.items()))
+            if own_share is not None:
+                row["own_share"] = own_share
             # Stamp the CALLER's harness distro (docs/tool_substrate.md —
             # loadout digest is atomic with the attestation; Decision
             # 2026-10-12: per-agent binding, not the daemon-wide default).
@@ -1588,6 +1605,8 @@ class ToolStore:
                 }
                 if axes:
                     event["axes"] = dict(sorted(axes.items()))
+                if own_share is not None:
+                    event["own_share"] = own_share
                 if _loadout:
                     event["loadout"] = _loadout
                 try:

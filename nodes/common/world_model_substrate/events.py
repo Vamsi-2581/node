@@ -223,9 +223,17 @@ class ToolUsed:
     # from distinct fleets) which gates mint eligibility. review_digest
     # carries the vet report blob. Serialized only when True.
     vet: bool = False
+    # Reviewed composition split (Decision 2026-10-13 §9): the reviewer's
+    # estimate in [0,1] of how much of a composite's value is its own
+    # logic vs its declared deps. Serialized only when present.
+    own_share: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
+        if self.own_share is None:
+            d.pop("own_share", None)
+        else:
+            d["own_share"] = round(max(0.0, min(1.0, float(self.own_share))), 6)
         if not self.problem_coords:
             d.pop("problem_coords", None)
         # Back-compat: attestation fields serialize only on attested
