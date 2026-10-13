@@ -376,7 +376,7 @@ class AutoUpdateConfig:
 
 @dataclass
 class WorkerIsolationConfig:
-    """Agent per-PID process isolation (phases 0-3 foundation, default OFF).
+    """Agent per-PID process isolation (default ON since 2026-10-13).
 
     When ``enabled`` (env ``ATN_WORKER_ISOLATION`` or config
     ``worker_isolation.enabled``), the execution engine will spawn each
@@ -392,14 +392,15 @@ class WorkerIsolationConfig:
     in-process, as does delegate SPAWN (P6): a worker that tries to create a
     child issues a spawn_child RPC instead. See
     ``atn.runtime.execution_engine.ExecutionEngine._worker_eligible`` for the
-    single source of truth. With the flag OFF (default) ``trigger_run``
-    is byte-identical to today — the in-process asyncio path is untouched.
+    single source of truth. With the flag OFF ``trigger_run`` takes the
+    in-process asyncio path. Default ON (docs/tool_substrate.md, Decision
+    2026-10-13): third-party tool code must not share the daemon's process.
 
     The flag is read at ``load_config`` time from EITHER the env var (takes
     precedence, so an operator can force it without editing config) OR the
     config file. Any truthy string ("1", "true", "yes", "on") enables it.
     """
-    enabled: bool = False
+    enabled: bool = True
     # Optional per-worker memory cap (MiB) enforced via the Win32 Job Object
     # (JOB_OBJECT_LIMIT_PROCESS_MEMORY). 0 => no cap. POSIX: advisory only in
     # this phase (no Job Object).
@@ -711,7 +712,7 @@ def _load_worker_isolation(wi_raw: dict[str, Any]) -> WorkerIsolationConfig:
     can force the flag on/off without editing config.yaml. Any truthy string
     ("1"/"true"/"yes"/"on", case-insensitive) enables it.
     """
-    wi_enabled = bool(wi_raw.get("enabled", False))
+    wi_enabled = bool(wi_raw.get("enabled", True))
     env_iso = os.environ.get("ATN_WORKER_ISOLATION")
     if env_iso is not None:
         wi_enabled = env_iso.strip().lower() in ("1", "true", "yes", "on")
@@ -1002,7 +1003,7 @@ def load_config(path: Path | None = None) -> ATNConfig:
         )
     _apply_auto_update_env(config)
 
-    # Worker isolation (agent per-PID process isolation, default OFF).
+    # Worker isolation (agent per-PID process isolation, default ON).
     wi_raw = raw.get("worker_isolation", {})
     config.worker_isolation = _load_worker_isolation(
         wi_raw if isinstance(wi_raw, dict) else {})

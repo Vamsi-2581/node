@@ -401,7 +401,7 @@ class TestRunningWorker:
         # Isolation OFF: the worker branch is a no-op even if a supervisor with
         # this agent exists — behavior byte-for-byte unchanged (idle path).
         rt = _make_runtime(EventBus(), tmp_path)
-        # worker_isolation defaults off
+        rt._config.worker_isolation.enabled = False
         await _register(rt, "wkr-4")
         _seed_conversation(rt, "wkr-4", 6)
         channel = _FakeChannel({"accepted": True})
