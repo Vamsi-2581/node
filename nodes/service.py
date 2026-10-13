@@ -924,13 +924,18 @@ class AutonetService:
             # REP (voice) now lives DAO-side in RepToken (Decision
             # 2026-07-10). Empty => genesis regime: fees-only pool, no rep.
             rep_token_addr = getattr(bc, "rep_token_address", "") or ""
+            # ToolBond (Decision 2026-10-13): vetted tools' auditors share
+            # their mint; read pinned on the same snapshot as the voices.
+            tool_bond_addr = getattr(bc, "tool_bond_address", "") or ""
         except Exception:
             substrate_addr, rpc_url, rep_token_addr = "", "", ""
+            tool_bond_addr = ""
         if substrate_addr and rpc_url:
             def _voice_source():
                 from .common.voice_state import read_voice_state
                 return read_voice_state(
                     substrate_addr, rpc_url, rep_token_address=rep_token_addr,
+                    tool_bond_address=tool_bond_addr,
                 )
 
             self._federated_close_driver.voice_source = _voice_source

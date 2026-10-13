@@ -61,9 +61,9 @@ address configured => empty rep (genesis regime), pool still fees-only.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
-from .federated_reconcile import VOICE_EPSILON
+from .federated_reconcile import AUDITOR_SHARE_BPS_DEFAULT, VOICE_EPSILON
 
 logger = logging.getLogger(__name__)
 
@@ -228,17 +228,201 @@ def _get_logs(event, w3, address: str, to_block: int):
     return out
 
 
+# ---------------------------------------------------------------------------
+# ToolBond vetting snapshot (docs/tool_substrate.md, Decision 2026-10-13).
+#
+# The close gives a VETTED tool's auditors (the green flaggers of the round
+# that vetted it) ``auditorShareBps`` of the tool's mint, split by flag
+# weight. That needs ToolBond state AS OF the same snapshot as the voice
+# weights. ToolBond keeps no checkpoints, and an eth_call at the anchor
+# block needs archive state (a non-archive daemon would fall back and fork
+# from an archive one), so the state is REBUILT from ToolBond's event logs
+# up to the snapshot block, exactly like the owner map above: deterministic
+# chain history, served by non-archive nodes. The fold mirrors the
+# contract's storage writes:
+#
+#   isBonded  = !slashed && no pending unbond && stake > 0 && stake >= minStake
+#   isVetted  = isBonded && vetted && no Malware verdict pending on the
+#               current round (VerdictReached/Overruled Malware, not yet
+#               Finalized: isVetted turns false as soon as it settles)
+#   auditors  = revealed green flaggers of the latest round Finalized Clean,
+#               weight = FlagCommitted.weight (== flags(...).weight)
+#   bps       = auditorShareBps of the last ParamsSet (the constructor emits
+#               one); older deployments have no such event => default.
+# ---------------------------------------------------------------------------
+
+def _ev(name: str, fields: list) -> Dict[str, Any]:
+    return {
+        "anonymous": False, "name": name, "type": "event",
+        "inputs": [{"indexed": idx, "internalType": t, "name": n, "type": t}
+                   for n, t, idx in fields],
+    }
+
+
+_TOOL_BOND_EVENTS_ABI = [
+    _ev("Bonded", [("digest", "bytes32", True), ("author", "address", True),
+                   ("amount", "uint256", False), ("stake", "uint256", False)]),
+    _ev("UnbondRequested", [("digest", "bytes32", True),
+                            ("availableAt", "uint256", False)]),
+    _ev("Unbonded", [("digest", "bytes32", True), ("author", "address", True),
+                     ("amount", "uint256", False)]),
+    _ev("FlagCommitted", [("digest", "bytes32", True), ("round", "uint32", True),
+                          ("auditor", "address", True), ("weight", "uint256", False)]),
+    _ev("FlagRevealed", [("digest", "bytes32", True), ("round", "uint32", True),
+                         ("auditor", "address", True), ("red", "bool", False),
+                         ("evidenceHash", "bytes32", False)]),
+    _ev("VerdictReached", [("digest", "bytes32", True), ("round", "uint32", True),
+                           ("verdict", "uint8", False), ("appealEnds", "uint48", False)]),
+    _ev("Overruled", [("digest", "bytes32", True), ("round", "uint32", True),
+                      ("verdict", "uint8", False)]),
+    _ev("Finalized", [("digest", "bytes32", True), ("round", "uint32", True),
+                      ("verdict", "uint8", False), ("repPool", "uint256", False),
+                      ("atnPool", "uint256", False)]),
+    _ev("ParamsSet", [("minStake", "uint256", False), ("thresholdBps", "uint256", False),
+                      ("reviewWindow", "uint256", False), ("revealWindow", "uint256", False),
+                      ("finderBps", "uint256", False), ("degradeBps", "uint256", False),
+                      ("authorSlashBps", "uint256", False), ("unbondDelay", "uint256", False),
+                      ("auditorShareBps", "uint256", False)]),
+]
+
+# ToolBond.Verdict enum
+_VERDICT_CLEAN = 1
+_VERDICT_MALWARE = 2
+
+
+def _hex32(value: Any) -> str:
+    raw = value.hex() if hasattr(value, "hex") else str(value)
+    return str(raw).lower().removeprefix("0x")
+
+
+def tool_vetting_snapshot_from_logs(
+    records: List[Dict[str, Any]],
+    *,
+    default_bps: int = AUDITOR_SHARE_BPS_DEFAULT,
+) -> Dict[str, Any]:
+    """Fold ToolBond event records into the close's vetting snapshot.
+
+    ``records``: ``{"block", "index", "event", "args"}`` dicts (any order;
+    folded in (block, logIndex) order). Pure, so it is testable without a
+    chain. Returns {"auditor_share_bps": int, "tools": {digest: {"round":
+    int, "auditors": {address_lower: weight}}}} listing only vetted tools
+    with at least one weighted green auditor.
+    """
+    ordered = sorted(records, key=lambda r: (int(r["block"]), int(r["index"])))
+    min_stake = 0
+    bps: Optional[int] = None
+    bonds: Dict[str, Dict[str, Any]] = {}
+    weights: Dict[Tuple[str, int, str], int] = {}
+    green: Dict[Tuple[str, int], set] = {}
+
+    def bond(d: str) -> Dict[str, Any]:
+        return bonds.setdefault(d, {
+            "stake": 0, "unbond": False, "slashed": False, "vetted": False,
+            "round": 0, "clean_round": None, "verdicts": {}, "finalized": set(),
+        })
+
+    for r in ordered:
+        name, a = r["event"], r["args"]
+        if name == "ParamsSet":
+            min_stake = int(a["minStake"])
+            bps = int(a["auditorShareBps"])
+            continue
+        d = _hex32(a["digest"])
+        b = bond(d)
+        if "round" in a:
+            b["round"] = max(b["round"], int(a["round"]))
+        if name == "Bonded":
+            b["stake"] = int(a["stake"])
+            b["unbond"] = False
+        elif name == "UnbondRequested":
+            b["unbond"] = True
+        elif name == "Unbonded":
+            b["stake"], b["unbond"], b["vetted"] = 0, False, False
+        elif name == "FlagCommitted":
+            key = (d, int(a["round"]), str(a["auditor"]).lower())
+            weights[key] = int(a["weight"])
+        elif name == "FlagRevealed":
+            if not bool(a["red"]):
+                green.setdefault((d, int(a["round"])), set()).add(
+                    str(a["auditor"]).lower())
+        elif name in ("VerdictReached", "Overruled"):
+            b["verdicts"][int(a["round"])] = int(a["verdict"])
+        elif name == "Finalized":
+            rnd, verdict = int(a["round"]), int(a["verdict"])
+            b["finalized"].add(rnd)
+            if verdict == _VERDICT_MALWARE:
+                b["stake"], b["unbond"] = 0, False
+                b["slashed"], b["vetted"] = True, False
+            elif verdict == _VERDICT_CLEAN:
+                b["vetted"] = True
+                b["clean_round"] = rnd
+
+    tools: Dict[str, Any] = {}
+    for d in sorted(bonds):
+        b = bonds[d]
+        bonded = (not b["slashed"] and not b["unbond"] and b["stake"] > 0
+                  and b["stake"] >= min_stake)
+        cur = b["round"]
+        malware_pending = (b["verdicts"].get(cur) == _VERDICT_MALWARE
+                           and cur not in b["finalized"])
+        if not (bonded and b["vetted"]) or malware_pending:
+            continue
+        rnd = b["clean_round"]
+        auditors = {
+            addr: weights.get((d, rnd, addr), 0)
+            for addr in sorted(green.get((d, rnd), set()))
+        }
+        auditors = {k: v for k, v in auditors.items() if v > 0}
+        if auditors:
+            tools[d] = {"round": int(rnd), "auditors": auditors}
+    return {
+        "auditor_share_bps": int(default_bps if bps is None else bps),
+        "tools": tools,
+    }
+
+
+def read_tool_vetting_snapshot(
+    w3: Any, tool_bond_address: str, block: int,
+) -> Dict[str, Any]:
+    """ToolBond vetting snapshot as of ``block`` (the snapshot anchor's
+    block), rebuilt from event logs. Raises on RPC failure, like the rest
+    of the voice read: the driver keeps its previous snapshot."""
+    from web3 import Web3
+
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(tool_bond_address),
+        abi=_TOOL_BOND_EVENTS_ABI,
+    )
+    records: List[Dict[str, Any]] = []
+    for spec in _TOOL_BOND_EVENTS_ABI:
+        event = getattr(contract.events, spec["name"])
+        for log in _get_logs(event, w3, contract.address, block):
+            records.append({
+                "block": int(log["blockNumber"]),
+                "index": int(log["logIndex"]),
+                "event": spec["name"],
+                "args": dict(log["args"]),
+            })
+    return tool_vetting_snapshot_from_logs(records)
+
+
 def read_voice_state(
     substrate_address: str,
     rpc_url: str = "",
     *,
     epsilon: float = VOICE_EPSILON,
     rep_token_address: str = "",
+    tool_bond_address: str = "",
     web3: Any = None,
 ) -> Dict[str, Any]:
     """Read {owner_map, voice_weights, rep_shares, rep_supply, supply,
-    snapshot_block, emission_pool, recycled, weight_source} as of the
-    previous epoch's anchor.
+    snapshot_block, emission_pool, recycled, weight_source,
+    vetting_snapshot} as of the previous epoch's anchor.
+
+    ``vetting_snapshot`` (Decision 2026-10-13): ToolBond vetted tools and
+    their auditors, rebuilt from ToolBond logs up to the SAME snapshot
+    block as the owner map (``read_tool_vetting_snapshot``). Empty
+    (``tools == {}``) when ``tool_bond_address`` is unset or at genesis.
 
     ``emission_pool`` (Decision 2026-07-10, fees-only) = the burned fee
     shares (ServiceFee logs) in the snapshot anchor's window — NO base
@@ -279,6 +463,8 @@ def read_voice_state(
             "emission_pool_raw": 0,
             "snapshot_anchor_count": 0,
             "weight_source": "reputation",
+            "vetting_snapshot": {
+                "auditor_share_bps": AUDITOR_SHARE_BPS_DEFAULT, "tools": {}},
         }
     anchor = contract.functions.getAnchor(anchor_count - 1).call()
     block = int(anchor[7])       # Anchor.blockNumber (struct field 7)
@@ -358,6 +544,13 @@ def read_voice_state(
             voice_weights[house] = round(epsilon + share, 9)
             rep_shares[house] = round(share, 9)
 
+    # ToolBond vetting snapshot, pinned to the same anchor block.
+    vetting_snapshot: Dict[str, Any] = {
+        "auditor_share_bps": AUDITOR_SHARE_BPS_DEFAULT, "tools": {}}
+    if tool_bond_address:
+        vetting_snapshot = read_tool_vetting_snapshot(
+            w3, tool_bond_address, block)
+
     return {
         "owner_map": owner_map,
         "voice_weights": voice_weights,
@@ -376,4 +569,5 @@ def read_voice_state(
         "emission_pool_raw": burned_raw,
         "snapshot_anchor_count": int(anchor_count),
         "weight_source": "reputation",
+        "vetting_snapshot": vetting_snapshot,
     }

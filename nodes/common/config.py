@@ -42,6 +42,10 @@ class BlockchainConfig:
     # anchoring + authoritative mint submission (Phase 10.3b/c).
     # Empty = chain submission disabled (offline mode).
     substrate_address: str = ""
+    # Deployed ToolBond.sol (Decision 2026-10-13). The federated close reads
+    # vetted tools + their auditors from its logs, pinned to the previous
+    # anchor. Empty => no auditor shares (seeded from registry.json).
+    tool_bond_address: str = ""
 
 
 @dataclass
@@ -248,6 +252,7 @@ def _apply_env_overrides(raw: dict) -> dict:
         "AUTONET_CHAIN_ID": ("blockchain.chain_id", int),
         "AUTONET_PRIVATE_KEY": ("blockchain.private_key", str),
         "AUTONET_SUBSTRATE_ADDRESS": ("blockchain.substrate_address", str),
+        "AUTONET_TOOL_BOND_ADDRESS": ("blockchain.tool_bond_address", str),
         "AUTONET_BLOB_DIR": ("blob_store.data_dir", str),
         "AUTONET_DATA_DIR": ("data_dir", str),
         "AUTONET_LOG_LEVEL": ("log_level", str),
@@ -370,6 +375,9 @@ def load_config(path: Optional[str] = None) -> AutonetConfig:
                 "blockchain.substrate_address seeded from registry.json: %s…",
                 seeded[:10],
             )
+    if not cfg.blockchain.tool_bond_address:
+        cfg.blockchain.tool_bond_address = _registry_substrate_address(
+            path, key="tool_bond")
 
     logger.info(
         f"Config: device={cfg.device}, arch={cfg.model.architecture}, "
@@ -379,8 +387,11 @@ def load_config(path: Optional[str] = None) -> AutonetConfig:
     return cfg
 
 
-def _registry_substrate_address(config_path: Optional[str]) -> str:
-    """Resolve the deployed Substrate.sol address from registry.json.
+def _registry_substrate_address(
+    config_path: Optional[str], key: str = "substrate",
+) -> str:
+    """Resolve the deployed Substrate.sol address (or another
+    ``contracts.<key>`` entry, e.g. ``tool_bond``) from registry.json.
 
     The copy packaged with atn comes first: it is the one the atn daemon
     registers agents against (atn.config._load_registry_seed), so the
@@ -404,7 +415,7 @@ def _registry_substrate_address(config_path: Optional[str]) -> str:
                 continue
             data = _json.loads(candidate.read_text(encoding="utf-8"))
             for entry in data.get("jurisdictions", {}).values():
-                addr = entry.get("contracts", {}).get("substrate", "")
+                addr = entry.get("contracts", {}).get(key, "")
                 if addr:
                     return str(addr)
         except Exception as e:
