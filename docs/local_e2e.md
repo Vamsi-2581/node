@@ -553,3 +553,70 @@ is reachable from such a session.
     live daemon's port). The script always puts the repo first on
     `PYTHONPATH`, but on a box with a pip-installed daemon, verify with
     `python -c "import atn; print(atn.__file__)"` before trusting a run.
+
+# Local end-to-end: the tool security rail
+
+`scripts/local_e2e_tool_security.py` proves the staked-tool rail
+(docs/tool_substrate.md, Decision 2026-10-13) against real contracts on a
+local hardhat node, driving the daemon code paths.
+
+## Run
+
+```bash
+python scripts/local_e2e_tool_security.py
+```
+
+Needs `node_modules` with hardhat + `@openzeppelin/contracts` at or above
+the repo root, and a trustless-contracts checkout (env
+`TRUSTLESS_CONTRACTS_DIR`, default `C:/code/dao/trustless-contracts`). The
+jurisdiction sources it needs (ToolBond, RepToken + Registry and their
+interfaces) are COPIED into a scratch hardhat project at
+`build/e2e_tool_security/` (gitignored) next to this repo's `Substrate.sol`
+and a one-line `EconomyStub` (ToolBond reads only `effectiveAppealPeriod`),
+compiled with solc 0.8.26 and served on port 8557
+(`E2E_TOOL_SECURITY_PORT`). The checkout is never written. Runs in about a
+minute once compiled.
+
+## What it proves
+
+1. **Chain up**: RepToken (deployer is admin, a hardhat account is the
+   timelock), Substrate (with that RepToken, genesis signer #9, deployer as
+   vaultMinter for test ATN), EconomyStub (30s appeal window), ToolBond
+   (minStake 1000 ATN, threshold 80% of REP, review 120s, reveal 30s,
+   finder 50%, degrade 10%, author slash 100%, auditor share 40%), and
+   `setSlasher(ToolBond)`.
+2. **Fleet**: two real `Runtime`s. Daemon A hosts `author-1`, `aud-1`,
+   `aud-3`; daemon B hosts `aud-2` and fetches manifests and code from A
+   through `tool_store.blob_fetcher` (the p2p blob rail). Agents register
+   on Substrate; REP 100/300/200/100; 5000 ATN to the author.
+3. **Publish**: `register_tool` (with a novelty claim) + `publish_tool` ->
+   `publish_with_stake` -> `ToolBondClient.register_and_bond`, for a clean
+   tool and a malware tool. Checks `toolAuthor`, `isBonded`, not
+   `isVetted`, the stakes moved, and the daemon `ToolBondGate`.
+4. **Clean verdict**: `flag_tool` green (aud-1), red with a `code_ref`
+   (aud-3, the minority), then green from daemon B (aud-2) crosses the
+   threshold. `ToolFlagKeeper.tick` on both daemons, on the chain clock,
+   reveals (on-chain `evidenceHash` equals the daemon's `evidence_hash`),
+   settles, finalizes and claims as `evm_increaseTime` passes the windows.
+   `isVetted` true; aud-3 loses 10 REP, reassigned 6/4 to the greens; REP
+   supply plus unreassigned slasher credit is conserved.
+5. **Malware verdict**: red from aud-3 (the finder, first commit), red
+   from aud-1, a wrong green from daemon B. After finalize: the finder gets
+   50% of the stake plus its weight share, aud-1 its weight share, all
+   through `payForService` net of the 2.5% fee (half to treasury); the
+   author's REP is slashed in full and the wrong green degraded, both
+   reassigned to the reds by weight; the bond is slashed, `isBonded` is
+   false, and `register_and_bond` again reverts at `bond`.
+6. **Close**: `read_tool_vetting_snapshot` over this chain's ToolBond logs
+   lists the clean tool with auditors {aud-1: 300, aud-2: 200} REP,
+   omits the malware tool, and (pinned one block before the clean
+   `Finalized`) omits the clean tool too. `federated_epoch_close` with
+   three attested uses of the clean tool and a 10 ATN pool: the author
+   keeps 60%, the auditors 24% and 16%, sum <= pool with sub-unit dust;
+   without the snapshot the author takes 100%.
+7. **Teardown**: kills the node, removes the runtime temp dirs.
+
+Not covered: `read_voice_state(tool_bond_address=...)` (it needs an
+anchored epoch, and anchors need REP-signed approvals), DAO overrule,
+lapse, unbond/withdraw, successor versions, and `run_clearance` for an
+adopted tool.
