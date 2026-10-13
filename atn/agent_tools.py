@@ -159,6 +159,24 @@ ToolExecutor = Callable[["Runtime", dict[str, Any]], Coroutine[Any, Any, dict[st
 # Tool definitions (schemas for the LLM)
 # ---------------------------------------------------------------------------
 
+# Novelty claim (docs/tool_substrate.md, Decision 2026-10-13 item 2), shared
+# by register_tool and publish_tool.
+_NOVELTY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Required to publish. What is NEW about this tool versus what already "
+        "exists (search probe_tools first). Reviewers score this claim on "
+        "correctness: a copy with no real difference, or a claim that omits "
+        "an obvious neighbour, fails. Performance claims ('twice as fast as "
+        "X') count and are checked the same way."),
+    "properties": {
+        "statement": {"type": "string", "description": "What is new, concretely, compared with the prior art."},
+        "prior_art": {"type": "array", "items": {"type": "string"},
+                      "description": "64-hex digests of the closest existing tools. May be empty only if the statement says outright that nothing comparable exists."},
+    },
+    "required": ["statement", "prior_art"],
+}
+
 _TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="list_agents",
@@ -714,7 +732,8 @@ _TOOLS: list[ToolDefinition] = [
                 "provider": {"type": "string", "description": "External provider identity for attested tools (e.g. 'google')."},
                 "dependencies": {"type": "array", "items": {"type": "string"}, "description": "Digests of published tools this tool calls at runtime (pinned only). Declaration = the runtime allowlist; nested calls run under the ORIGINAL caller's authority. Composite tools use the line-framed sandbox protocol (see docs/tool_substrate.md)."},
                 "capabilities": {"type": "object", "description": "What the code needs from the host, deny-by-default: {net: bool, fs: bool, spawn: bool, env: [VAR,...], secrets: [SERVICE,...]}. On adopting daemons this IS the sandbox policy — undeclared use hard-fails, so declare honestly. `secrets` names the vault services the code reads at runtime: the daemon binds ONLY those to the tool's own process (clamped by the calling agent's allowance — declaring does not grant), and the tool reads each value from ATN_TOOL_SECRETS via its own broker session. Omit if the tool only reads stdin and writes stdout."},
-                "version_of": {"type": "string", "description": "Digest of the manifest this revises (artifact lineage)."},
+                "version_of": {"type": "string", "description": "Digest of YOUR OWN earlier tool this revises (artifact lineage; the successor carries its reviews and ranking but starts unvetted). Another author's tool is refused: publish a new tool with its own novelty claim instead."},
+                "novelty": _NOVELTY_SCHEMA,
             },
             "required": ["name", "description", "input_schema"],
         },
@@ -726,12 +745,19 @@ _TOOLS: list[ToolDefinition] = [
             "network-visible and reviewable, and (pinned tools) earns you a share "
             "of the epoch pool from attested third-party usage. This is "
             "a separately granted capability — having register_tool does not imply "
-            "having this. You can only publish your own tools."
+            "having this. You can only publish your own tools. Publishing STAKES "
+            "ATN on ToolBond from your own wallet (you must be registered "
+            "on-chain); the stake stands behind the tool and is slashed if "
+            "auditors find malware. A novelty claim is required: search "
+            "probe_tools first and name the closest existing tools. Passing "
+            "`novelty` here on a tool registered without it re-stamps the "
+            "manifest, so the published digest is NEW (returned as `digest`)."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "digest": {"type": "string", "description": "Manifest digest (or name/reg_ prefix) of a tool you registered."},
+                "novelty": _NOVELTY_SCHEMA,
             },
             "required": ["digest"],
         },
@@ -921,8 +947,13 @@ _TOOLS: list[ToolDefinition] = [
             "with high 'review_mass' = trusted by earned voice, safe to use; "
             "'review_mass' near zero = nobody has reviewed it yet, inspect "
             "it (vet_tool) or verify before trusting; a bad (negative) "
-            "rating = avoid or verify. Use the digest with adopt_tool (if "
-            "granted) or ask your owner to grant/adopt it."
+            "rating = avoid or verify. Only staked tools are listed: "
+            "'bonded' (null = chain unreachable), 'vetted' (auditors found "
+            "it clean; nodes run only vetted network tools unless the owner "
+            "opts in), 'stage'/'verdict' of its audit round, and "
+            "'author_context' (author REP, their other tools, any slashed). "
+            "Author context informs, it does not rank. Use the digest with "
+            "adopt_tool (if granted) or ask your owner to grant/adopt it."
         ),
         input_schema={
             "type": "object",
@@ -2900,6 +2931,10 @@ async def _register_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, A
         return {"error": "capabilities must be an object "
                          "({net, fs, spawn, env})"}
 
+    novelty = input.get("novelty")
+    if novelty is not None and not isinstance(novelty, dict):
+        return {"error": "novelty must be an object {statement, prior_art}"}
+
     # Guest authoring (integration listener): the listener sets _origin AFTER
     # stripping every "_" key from the guest's request, so only the server can
     # mark a record "integration". The value can only make execution STRICTER
@@ -2916,14 +2951,18 @@ async def _register_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, A
             provider=str(input.get("provider") or ""),
             connector_id=str(input.get("connector_id") or ""),
             version_of=input.get("version_of") or None,
-            publish=bool(input.get("publish", False)),
+            # Publishing stakes on-chain (async), so registration itself
+            # is always private; an owner's publish=True runs the staked
+            # publish below.
+            publish=False,
             dependencies=dependencies,
             capabilities=capabilities or None,
             origin=origin,
+            novelty=novelty,
         )
     except (ValueError, RuntimeError) as exc:
         return {"error": str(exc)}
-    return {
+    out = {
         "origin": origin,
         "digest": result["digest"],
         "name": name,
@@ -2932,6 +2971,15 @@ async def _register_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, A
         "published": result["published"],
         "unified_name": f"reg_{result['digest'][:12]}",
     }
+    if input.get("publish") and not result["published"]:
+        from .tool_security import publish_with_stake
+        record = runtime.tool_store.get(result["digest"])
+        pub = await publish_with_stake(runtime, record)
+        if "error" in pub:
+            return {**out, "error": "registered privately; publish failed: "
+                                    + pub["error"]}
+        out.update(published=True, stake=pub.get("stake"))
+    return out
 
 
 async def _publish_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
@@ -2941,7 +2989,15 @@ async def _publish_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
     separately granted capability — the grant IS the gate, case-by-case
     per agent, no approval queue. Author-only: you publish your own
     work, nobody else's.
+
+    Decision 2026-10-13: publishing needs a novelty claim in the manifest
+    and stakes ATN on ToolBond (tool_security.publish_with_stake). The
+    claim is inside the signed manifest, so ``novelty`` given here on a
+    private tool without it (or with a different one) stamps it in: the
+    published tool is that NEW digest, and the private original is
+    retired unless another tool depends on it.
     """
+    from .tool_security import publish_with_stake
     digest = str(input.get("digest") or "")
     if not digest:
         return {"error": "Missing required field: 'digest'"}
@@ -2960,11 +3016,9 @@ async def _publish_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
     if record.published:
         return {"digest": record.digest, "name": record.name,
                 "published": True, "note": "already published"}
-    try:
-        runtime.tool_store.set_published(record.digest, True)
-    except ValueError as exc:  # orphan-author publish gate
-        return {"error": str(exc)}
-    return {"digest": record.digest, "name": record.name, "published": True}
+
+    return await publish_with_stake(runtime, record,
+                                    novelty=input.get("novelty"))
 
 
 async def _adopt_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
@@ -3138,9 +3192,15 @@ async def _probe_tools(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any
                     positions=positions, vetting=vetting,
                     tool_store=runtime.tool_store,
                 ))
-                if len(matches) >= k:
+                # Headroom: the bond pass below drops unbonded tools.
+                if len(matches) >= k * 2:
                     break
             source = "substrate"
+            # Decision 2026-10-13: unstaked tools leave the economy; each
+            # row gains bond/verdict state and author context (REP, other
+            # tools, past slashes). Context only, the order is unchanged.
+            from .tool_security import annotate_probe_rows
+            matches = (await annotate_probe_rows(runtime, matches))[:k]
     except Exception as exc:
         log.debug("probe_tools substrate path failed: %s", exc)
     if not matches:

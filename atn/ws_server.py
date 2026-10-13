@@ -228,6 +228,7 @@ INTEGRATION_DENIED_MESSAGES = frozenset({
     "approve_adoption", "reject_adoption", "list_adoption_proposals",
     "list_distros", "core_replacement_evidence",
     "grant_tool", "revoke_tool", "set_tool_enabled", "set_tool_published",
+    "list_tool_run_optins", "set_tool_run_optin", "tool_bond_status",
     "vet_tool",
     # Tool AUTHORING is allowed (register_tool, above) only because guest
     # records are flagged origin="integration" and never run on the authored
@@ -1799,6 +1800,11 @@ class WebSocketBridge:
         # never part of any agent tool surface. docs/tool_substrate.md.
         if msg_type == "list_registered_tools":
             store = self.runtime.tool_store
+            from .tool_security import run_optins
+            try:
+                _optins = run_optins(store)
+            except Exception:  # noqa: BLE001 — a listing never fails on it
+                _optins = None
             tools = []
             for record in store.visible_to(None):  # owner sees everything
                 m = record.manifest
@@ -1824,6 +1830,11 @@ class WebSocketBridge:
                     "version_of": m.get("version_of"),
                     "dependencies": m.get("dependencies") or [],
                     "input_schema": m.get("input_schema", {}),
+                    # Decision 2026-10-13: the publish-time novelty claim,
+                    # and for network tools the owner's run opt-in.
+                    "novelty": m.get("novelty"),
+                    **({"run_optin": bool(_optins and _optins.allows(record.digest))}
+                       if record.origin == "adopted" else {}),
                 })
             return {"msg_id": msg_id, "ok": True, "result": {"tools": tools}}
 
@@ -1942,6 +1953,23 @@ class WebSocketBridge:
             if not digest:
                 return {"msg_id": msg_id, "ok": False, "error": "Missing 'digest' field"}
             published = bool(msg.get("published", True))
+            if published:
+                # Decision 2026-10-13: publishing needs a novelty claim and
+                # an on-chain stake signed by the AUTHORING agent's key
+                # (owner-authored tools are refused: no owner key here).
+                # Optional "novelty" {statement, prior_art} stamps the claim
+                # in; the published digest may then differ from "digest".
+                from .tool_security import publish_with_stake
+                record = self.runtime.tool_store.get(digest)
+                if record is None:
+                    return {"msg_id": msg_id, "ok": False,
+                            "error": f"Unknown tool digest: {digest[:16]}"}
+                result = await publish_with_stake(
+                    self.runtime, record, novelty=msg.get("novelty"))
+                if "error" in result:
+                    return {"msg_id": msg_id, "ok": False,
+                            "error": result["error"], "result": result}
+                return {"msg_id": msg_id, "ok": True, "result": result}
             try:
                 ok = self.runtime.tool_store.set_published(digest, published)
             except ValueError as exc:  # orphan-author publish gate
@@ -1973,6 +2001,52 @@ class WebSocketBridge:
                 return {"msg_id": msg_id, "ok": False,
                         "error": "adoption approval is owner-only and not "
                                  "available to a scoped session"}
+
+        # Run gate for network tools (Decision 2026-10-13): an adopted tool
+        # runs only while bonded AND (vetted OR the owner opted in for that
+        # exact digest). Opting in is the owner's per-tool risk call, so it
+        # is owner-only like adoption approval.
+        if msg_type in ("list_tool_run_optins", "set_tool_run_optin",
+                        "tool_bond_status"):
+            if session.scope_ids is not None:
+                return {"msg_id": msg_id, "ok": False,
+                        "error": "tool run opt-in is owner-only and not "
+                                 "available to a scoped session"}
+            from .tool_security import run_clearance, run_optins
+            optins = run_optins(self.runtime.tool_store)
+            if msg_type == "list_tool_run_optins":
+                return {"msg_id": msg_id, "ok": True,
+                        "result": {"optins": optins.list()}}
+            digest = str(msg.get("digest") or "").strip().lower().removeprefix("0x")
+            if not digest:
+                return {"msg_id": msg_id, "ok": False, "error": "Missing 'digest' field"}
+            record = self.runtime.tool_store.resolve(digest)
+            if msg_type == "set_tool_run_optin":
+                allowed = msg.get("allowed")
+                if not isinstance(allowed, bool):
+                    return {"msg_id": msg_id, "ok": False,
+                            "error": "'allowed' must be true or false"}
+                try:
+                    optins.set(digest, allowed,
+                               name=record.name if record is not None else "")
+                except ValueError as exc:
+                    return {"msg_id": msg_id, "ok": False, "error": str(exc)}
+                out = {"digest": digest, "allowed": allowed}
+                if record is not None:
+                    out["runnable"], out["reason"] = await run_clearance(
+                        self.runtime, record)
+                return {"msg_id": msg_id, "ok": True, "result": out}
+            # tool_bond_status: chain state + this node's run decision.
+            from .tool_security import client_for
+            status = await client_for(self.runtime).status(digest)
+            out = {"digest": digest, "status": status,
+                   "optin": optins.allows(digest),
+                   "network_tool": bool(record is not None
+                                        and record.origin == "adopted")}
+            if record is not None:
+                out["runnable"], out["reason"] = await run_clearance(
+                    self.runtime, record)
+            return {"msg_id": msg_id, "ok": True, "result": out}
 
         if msg_type == "list_adoption_proposals":
             status = msg.get("status") or None
@@ -2077,9 +2151,14 @@ class WebSocketBridge:
                             "review_mass": max(mass) if mass else 0.0,
                             "inspections": int(vet.get("validators") or 0),
                         })
-                        if len(matches) >= k:
+                        if len(matches) >= k * 2:
                             break
                     source = "substrate"
+                    # Decision 2026-10-13: drop unstaked tools; add bond /
+                    # verdict state and author context (same pass as the
+                    # agent-facing probe_tools).
+                    from .tool_security import annotate_probe_rows
+                    matches = (await annotate_probe_rows(self.runtime, matches))[:k]
             except Exception as exc:
                 log.debug("probe_tools substrate path failed: %s", exc)
             if not matches:
