@@ -252,7 +252,7 @@ async def test():
         # Unified tools
         "list_tools", "use_tool",
         # Tool substrate (docs/tool_substrate.md)
-        "register_tool", "attest_tools", "publish_tool", "vet_tool",
+        "register_tool", "attest_tools", "publish_tool", "vet_tool", "flag_tool",
         "adopt_tool", "probe_tools",
         # Validator rail (vetting bundle)
         "check_evidence", "run_trial",

@@ -5197,6 +5197,12 @@ _EXECUTORS: dict[str, ToolExecutor] = {
     "reject_task": _reject_task,
 }
 
+# Auditor flags on staked tools (atn/tool_flags.py; vetting bundle).
+from .tool_flags import FLAG_TOOL_DEFINITION, flag_tool as _flag_tool  # noqa: E402
+_TOOLS.append(FLAG_TOOL_DEFINITION)
+_EXECUTORS["flag_tool"] = _flag_tool
+_TOOL_CATEGORIES["vetting"].add("flag_tool")
+
 
 # Agent-callable confinement (H2). The tools a sub-agent may invoke via
 # route_tool_call/execute_tool are EXACTLY the schema-backed tools in ``_TOOLS``.

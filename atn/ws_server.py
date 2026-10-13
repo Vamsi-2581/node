@@ -228,7 +228,7 @@ INTEGRATION_DENIED_MESSAGES = frozenset({
     "approve_adoption", "reject_adoption", "list_adoption_proposals",
     "list_distros", "core_replacement_evidence",
     "grant_tool", "revoke_tool", "set_tool_enabled", "set_tool_published",
-    "vet_tool",
+    "vet_tool", "flag_tool", "tool_flags_list", "tool_security_status",
     # Tool AUTHORING is allowed (register_tool, above) only because guest
     # records are flagged origin="integration" and never run on the authored
     # path (daemon env + cwd). See _integration_register_args.
@@ -2012,6 +2012,24 @@ class WebSocketBridge:
                                  int(msg.get("limit") or 50))
             return {"msg_id": msg_id, "ok": True,
                     "result": {"evidence": rows}}
+
+        # Auditor flags (atn/tool_flags.py, Decision 2026-10-13). Owner-only:
+        # a flag's report and transcript path are this daemon's audit
+        # evidence. The salt is never sent.
+        if msg_type in ("tool_flags_list", "tool_security_status"):
+            if session.scope_ids is not None:
+                return {"msg_id": msg_id, "ok": False,
+                        "error": "tool flags are owner-only and not "
+                                 "available to a scoped session"}
+            from . import tool_flags
+            if msg_type == "tool_flags_list":
+                rows = tool_flags.list_flags(self.runtime, str(msg.get("digest") or ""))
+                return {"msg_id": msg_id, "ok": True, "result": {"flags": rows}}
+            result = await tool_flags.security_status(
+                self.runtime, str(msg.get("digest") or ""))
+            if "error" in result:
+                return {"msg_id": msg_id, "ok": False, "error": result["error"]}
+            return {"msg_id": msg_id, "ok": True, "result": result}
 
         if msg_type == "reject_adoption":
             digest = msg.get("digest", "")
