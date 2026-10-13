@@ -240,6 +240,7 @@ class ToolStore:
         dependencies: list[str] | None = None,
         capabilities: dict[str, Any] | None = None,
         origin: str = "authored",
+        novelty: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build, sign, store, and index a tool manifest. Returns
         ``{"digest", "manifest"}`` or raises ValueError on bad input.
@@ -258,9 +259,14 @@ class ToolStore:
         dep MUST already exist in this store and be enabled — you cannot
         declare what you cannot call. The manifest layer additionally
         enforces pinned-only + 64-hex + uniqueness.
+
+        ``novelty`` (Decision 2026-10-13): the ``{statement, prior_art}``
+        claim publishing requires. It is part of the signed manifest, so it
+        is supplied here (or stamped later by ``restamp_novelty``).
+        ``version_of`` must name a predecessor by the SAME author.
         """
         from nodes.common.world_model_substrate.tool_manifest import (
-            build_tool_manifest,
+            build_tool_manifest, normalize_novelty,
         )
         from .guest_sandbox import GUEST_CAPABILITY_KEYS, GUEST_ORIGIN
 
@@ -376,6 +382,13 @@ class ToolStore:
         if publish and not _is_claimable_identity(consensus_author):
             raise ValueError(_ORPHAN_PUBLISH_ERROR)
 
+        if version_of:
+            err = self.successor_error(version_of, consensus_author, author)
+            if err:
+                raise ValueError(err)
+        if novelty is not None:
+            novelty = normalize_novelty(novelty)
+
         # Idempotency — content-addressed in SPIRIT, not just bytes: the
         # manifest bakes ``created_ts``, so re-registering byte-identical
         # content would mint a fresh digest every time (observed live: the
@@ -397,6 +410,7 @@ class ToolStore:
                     and list(m.get("dependencies") or []) == deps
                     and (m.get("capabilities") or None) == (capabilities or None)
                     and m.get("version_of") == version_of
+                    and (m.get("novelty") or None) == (novelty or None)
                     and m.get("input_schema") == input_schema):
                 if publish and not existing.published:
                     self.set_published(existing.digest, True)
@@ -426,6 +440,7 @@ class ToolStore:
             capabilities=capabilities,
             created_ts=int(time.time()),
             authored_via=GUEST_ORIGIN if origin == GUEST_ORIGIN else "",
+            novelty=novelty,
         )
         self._sign(author, manifest)
 
@@ -487,6 +502,85 @@ class ToolStore:
         log.info("pruned %d superseded local record(s) of %r (kept %s)",
                  len(stale), name, keep_digest[:16])
         return len(stale)
+
+    def successor_error(self, version_of: str, consensus_author: str,
+                        local_author: str = "") -> str:
+        """Why ``version_of`` may not be claimed by ``consensus_author``
+        ("" when it may). Decision 2026-10-13 item 6: only the original
+        author publishes a successor (which carries the predecessor's
+        reviews and ranking); everyone else publishes a new tool with its
+        own novelty claim. Compared on the CONSENSUS author (0x), the
+        identity peers can verify. Vetted status never carries: that is
+        ToolBond state keyed by digest, so a new digest starts unvetted."""
+        record = self.resolve(version_of) or self._records.get(version_of)
+        payload = record.manifest if record is not None else None
+        if payload is None:
+            try:
+                payload = self._blob_store().get_json(version_of)
+            except Exception:  # noqa: BLE001
+                payload = None
+        if not isinstance(payload, dict) or payload.get("kind") != "tool_manifest":
+            return (f"version_of {str(version_of)[:16]}... is not a tool "
+                    "manifest known to this daemon; its author cannot be "
+                    "checked")
+        pred_author = str(payload.get("author") or "")
+        if pred_author.lower() != str(consensus_author or "").lower():
+            return ("version_of may only name your own tool: "
+                    f"{str(version_of)[:16]}... is authored by {pred_author!r}. "
+                    "Publish a new tool with its own novelty claim instead")
+        return ""
+
+    def restamp_novelty(self, digest: str,
+                        novelty: dict[str, Any]) -> dict[str, Any]:
+        """The manifest of ``digest`` with ``novelty`` stamped in, as its own
+        record. The claim is inside the signed manifest, so stamping it is a
+        NEW digest (same code, schema, author and created_ts). The private
+        original is retired (grants migrate) unless another record depends
+        on it. Deterministic: re-stamping the same claim reuses the record.
+        Returns ``{"digest", "manifest", "replaced"}`` or raises ValueError.
+        """
+        from nodes.common.world_model_substrate.tool_manifest import (
+            normalize_novelty, validate_manifest,
+        )
+        record = self._records.get(digest)
+        if record is None:
+            raise ValueError(f"Unknown tool: {digest[:16]}")
+        if record.origin == "adopted":
+            raise ValueError("adopted tools cannot be re-published")
+        if record.published:
+            raise ValueError("a published manifest is immutable; register a "
+                             "successor (version_of) with the new claim")
+        manifest = {k: v for k, v in record.manifest.items()
+                    if k != "author_sig"}
+        manifest["novelty"] = normalize_novelty(novelty)
+        errors = validate_manifest(manifest)
+        if errors:
+            raise ValueError("invalid tool manifest: " + "; ".join(errors))
+        self._sign(record.local_author, manifest)
+        new_digest = self._blob_store().add_json(manifest)
+        if new_digest == digest:
+            return {"digest": digest, "manifest": record.manifest,
+                    "replaced": ""}
+        existing = self._records.get(new_digest)
+        if existing is None:
+            existing = ToolRecord(
+                digest=new_digest, manifest=manifest,
+                grants=set(record.grants), enabled=record.enabled,
+                local_author=record.local_author,
+                registered_ts=int(time.time()), origin=record.origin)
+            self._records[new_digest] = existing
+        referenced = any(digest in (r.manifest.get("dependencies") or [])
+                         for r in self._records.values())
+        replaced = ""
+        if not referenced:
+            existing.grants.update(record.grants)
+            self._records.pop(digest, None)
+            replaced = digest
+        self._persist()
+        log.info("stamped novelty claim on %r: %s -> %s", record.name,
+                 digest[:16], new_digest[:16])
+        return {"digest": new_digest, "manifest": existing.manifest,
+                "replaced": replaced}
 
     def reaches_connector(self, digest: str | None) -> bool:
         """True if ``digest`` is connector-backed or (transitively, bounded)
@@ -732,7 +826,21 @@ class ToolStore:
         was dispatched from a composite's sandbox call-rail (telemetry;
         mechanical receipts mint nothing). ``_depth`` is the composition
         nesting counter (``_COMPOSITE_MAX_DEPTH`` guard).
+
+        Run gate (Decision 2026-10-13): network tools (adopted, authored
+        elsewhere) run only while bonded on ToolBond and vetted, or opted
+        in by the owner for this digest. Every execution path (agents,
+        composite deps, service sales, evidence replay, core swaps) comes
+        through here. Own tools are not gated.
         """
+        from .tool_security import is_network_tool, run_clearance
+        if is_network_tool(record):
+            cleared, why = await run_clearance(self._runtime, record)
+            if not cleared:
+                return {"error": f"Tool {record.name!r} "
+                                 f"({record.digest[:16]}) is not cleared to "
+                                 f"run on this node: {why}",
+                        "run_gate": why}
         manifest = record.manifest
         if manifest.get("code_digest"):
             deps = manifest.get("dependencies") or []

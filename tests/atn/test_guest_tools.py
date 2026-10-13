@@ -396,7 +396,10 @@ async def test_require_uid_refuses_without_launcher(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_publish_author_only(tmp_path):
+async def test_publish_author_only(tmp_path, monkeypatch):
+    # Stake step skipped (dev override); tests/atn/test_tool_security.py
+    # covers it.
+    monkeypatch.setenv("ATN_TOOL_BOND_DEV_OVERRIDE", "1")
     rt = await _fleet(tmp_path, owner_wallet=_OWNER_WALLET)
     bridge = _bridge(rt)
     _, grec = bridge._integration_store.create("guest", "g")
@@ -412,9 +415,11 @@ async def test_publish_author_only(tmp_path):
     assert rt.tool_store.get(digest).published is False
     # The author can.
     yes = await bridge._handle_integration_message(
-        {"type": "publish_tool", "msg_id": "p2", "digest": digest}, gsess)
+        {"type": "publish_tool", "msg_id": "p2", "digest": digest,
+         "novelty": {"statement": "Nothing comparable exists.",
+                     "prior_art": []}}, gsess)
     assert yes["ok"] is True, yes
-    record = rt.tool_store.get(digest)
+    record = rt.tool_store.get(yes["result"]["digest"])
     assert record.published is True and record.origin == "integration"
     # Provenance stamp, signed with the manifest: adopters see a guest wrote it.
     assert record.manifest.get("authored_via") == "integration"

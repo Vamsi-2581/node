@@ -115,9 +115,13 @@ class TestRegistration:
         assert "Services" in res["error"]
 
     @pytest.mark.asyncio
-    async def test_private_by_default_publish_deliberate(self, tmp_path):
+    async def test_private_by_default_publish_deliberate(self, tmp_path,
+                                                         monkeypatch):
         """Three tiers (spec v2): private is the default — no substrate
         push; publish=true (or set_published) fires the manifest sink."""
+        # The ToolBond stake is covered in tests/atn/test_tool_security.py;
+        # here the dev override skips the chain step.
+        monkeypatch.setenv("ATN_TOOL_BOND_DEV_OVERRIDE", "1")
         rt = _make_runtime(tmp_path)
         # Publishing requires a claimable author (orphan-publish gate);
         # child is not registered on-chain, so its tools are authored by
@@ -145,9 +149,15 @@ class TestRegistration:
         # The author publishes its own tool via publish_tool; the sink
         # receives the CONSENSUS author (the claimable household wallet
         # — child holds a keypair but is not registered on-chain).
+        # Publishing needs a novelty claim; given here, it is stamped into
+        # the manifest, so the published digest is a new one.
         pub = await execute_tool(
-            "publish_tool", {"digest": res["digest"]}, rt, caller_id="child")
+            "publish_tool", {"digest": res["digest"], "novelty": {
+                "statement": "No comparable tool exists.", "prior_art": []}},
+            rt, caller_id="child")
         assert pub["published"] is True
+        assert pub["replaces_private"] == res["digest"]
+        res = {**res, "digest": pub["digest"]}
         assert pushed == [("echo_tool", wallet)]
 
         # A non-author agent cannot publish someone else's tool.
@@ -637,6 +647,12 @@ class TestAdoption:
     async def _adopter(self, tmp_path, source_blobs):
         rt = _make_runtime(tmp_path / "adopter_daemon")
         await _register_agent(rt, "worker")
+        # Run gate (Decision 2026-10-13): network tools run only bonded and
+        # vetted (or owner opt-in). These tests are about containment, so
+        # the fake chain says both; the gate has its own tests.
+        from atn.runtime.tool_bond import ToolBondGate
+        rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: True,
+                                         vetted_checker=lambda d: True)
 
         async def _fetch(digest: str) -> bytes | None:
             return source_blobs.get_bytes(digest)

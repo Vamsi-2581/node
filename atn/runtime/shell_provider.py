@@ -163,6 +163,14 @@ async def dispatch_shell(runtime: Any, agent_id: str, name: str,
     # Gate (b): bonded on ToolBond (fail closed).
     from .tool_bond import gate_for
     bonded, reason = await gate_for(runtime).is_bonded(record.digest)
+    if bonded:
+        # Network tools also need vetted or owner opt-in (Decision
+        # 2026-10-13); refuse here so the swap falls back to the built-in
+        # instead of surfacing ToolStore.call's run-gate error.
+        from ..tool_security import run_clearance
+        bonded, why = await run_clearance(runtime, record)
+        if not bonded:
+            reason = why
     await note_swap_state(runtime, agent_id, _bond_row(record, bonded, reason))
     if not bonded:
         log.debug("core provider %s for %r refused for agent %s (%s); "
@@ -223,7 +231,9 @@ def _row(record: Any, reason: str = "", detail: str = "",
 def _bond_row(record: Any, bonded: bool, reason: str) -> dict[str, Any]:
     if bonded:
         return _row(record, state="active", detail=reason)
-    code = "not_bonded" if reason.startswith("not bonded") else "bond_check_error"
+    code = ("not_bonded" if reason.startswith("not bonded")
+            else "not_vetted" if reason.startswith("not vetted")
+            else "bond_check_error")
     return _row(record, code, reason)
 
 
@@ -332,6 +342,11 @@ async def swap_status(runtime: Any, agent_id: str) -> list[dict[str, Any]]:
                     continue
                 record = runtime.tool_store.resolve(r["tool_digest"])
                 bonded, reason = await gate.is_bonded(r["tool_digest"])
+                if bonded and record is not None:
+                    from ..tool_security import run_clearance
+                    bonded, why = await run_clearance(runtime, record)
+                    if not bonded:
+                        reason = why
                 rows[i] = _bond_row(record, bonded, reason)
         for r in rows:
             await note_swap_state(runtime, agent_id, r)
