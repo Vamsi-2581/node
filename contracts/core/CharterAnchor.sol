@@ -59,9 +59,14 @@ contract CharterAnchor {
     error NoCharter();
     error BadVersion();
 
-    constructor(address governor_) {
+    /// @param genesisHash_ charter v1, anchored at deploy so a jurisdiction
+    ///        launches with its charter in place and no follow-up proposal.
+    ///        bytes32(0) deploys empty (v1 then comes from the governor).
+    /// @param genesisUri_ pointer to v1's canonical serialization.
+    constructor(address governor_, bytes32 genesisHash_, string memory genesisUri_) {
         require(governor_ != address(0), "governor=0");
         governor = governor_;
+        if (genesisHash_ != bytes32(0)) _anchor(genesisHash_, genesisUri_);
     }
 
     modifier onlyGovernor() {
@@ -77,6 +82,10 @@ contract CharterAnchor {
         external
         onlyGovernor
     {
+        _anchor(charterHash, uri);
+    }
+
+    function _anchor(bytes32 charterHash, string memory uri) private {
         if (charterHash == bytes32(0)) revert EmptyHash();
         uint256 prevVersion = versionCount;
         bytes32 prevHash = prevVersion == 0

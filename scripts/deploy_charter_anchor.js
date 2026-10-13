@@ -61,7 +61,8 @@ async function main() {
     path.join(__dirname, "..", "artifacts", "contracts", "core", "CharterAnchor.sol", "CharterAnchor.json"), "utf8"));
   const factory = new ethers.ContractFactory(art.abi, art.bytecode, wallet);
   console.log("Deploying CharterAnchor with governor =", NEW_TIMELOCK, "...");
-  const anchor = await factory.deploy(NEW_TIMELOCK);
+  // Fresh deploy carries v1 itself (constructor genesis charter).
+  const anchor = await factory.deploy(NEW_TIMELOCK, "0x" + EXPECT_HASH, oldCur[2]);
   const dtx = anchor.deploymentTransaction();
   console.log("DEPLOY tx:", dtx.hash);
   await anchor.waitForDeployment();
@@ -75,7 +76,7 @@ async function main() {
   const gov = await anchorR.governor();
   const vc = await anchorR.versionCount();
   console.log("  governor():", gov, "(expected", NEW_TIMELOCK + ")");
-  console.log("  versionCount():", vc.toString(), "(expected 0)");
+  console.log("  versionCount():", vc.toString(), "(expected 1)");
   if (gov.toLowerCase() !== NEW_TIMELOCK.toLowerCase())
     throw new Error("governor mismatch on deployed anchor");
 

@@ -325,7 +325,8 @@ def deploy(w3) -> Dict[str, str]:
         "substrate": sub,
         "service_registry": _deploy("ServiceRegistry", "ServiceMarket", sub),
         "payment_channel": _deploy("PaymentChannel", "ServiceMarket", sub, 3600),
-        "charter_anchor": _deploy("CharterAnchor", "CharterAnchor", acct.address),
+        "charter_anchor": _deploy("CharterAnchor", "CharterAnchor", acct.address,
+                                  bytes(32), ""),
         "venture_vault_factory": _deploy("VentureVaultFactory", "VentureVault",
                                          sub),
     }

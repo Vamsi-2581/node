@@ -930,7 +930,7 @@ async function main() {
   const substrateAddr = process.env.SUBSTRATE_ADDR;
 
   const CharterAnchor = await ethers.getContractFactory("CharterAnchor");
-  const anchor = await CharterAnchor.deploy(governor);
+  const anchor = await CharterAnchor.deploy(governor, ethers.ZeroHash, "");
   await anchor.waitForDeployment();
 
   const Factory = await ethers.getContractFactory("VentureVaultFactory");
