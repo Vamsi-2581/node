@@ -474,3 +474,17 @@ def test_registered_in_vetting_bundle():
     assert "flag_tool" in _AGENT_CALLABLE_TOOLS
     assert "flag_tool" in _TOOL_CATEGORIES["vetting"]
     assert get_tool_executor("flag_tool") is flag_tool
+
+
+def test_tool_trail_lands_in_transcript():
+    from types import SimpleNamespace
+    from atn.tool_flags import record_tool_call, _tool_trail, build_transcript
+    rt = SimpleNamespace()
+    record_tool_call(rt, "aud", "vet_tool", {"digest": "ab" * 32}, {"code": "x = 1"})
+    record_tool_call(rt, "aud", "flag_tool", {"digest": "ab" * 32}, {"ok": True})
+    trail = _tool_trail(rt, "aud")
+    assert [t["tool"] for t in trail] == ["vet_tool"]
+    raw = build_transcript(agent_id="aud", auditor="0xA", digest="ab" * 32, manifest={},
+                           color="green", report="r", rebuttal="", code_ref=None,
+                           conversation=[], ts=1, tool_trail=trail)
+    assert b'"vet_tool"' in raw and b"x = 1" in raw

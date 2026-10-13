@@ -321,10 +321,48 @@ def _conversation(runtime: Any, agent_id: str) -> list[dict[str, Any]]:
         return []
 
 
+_TRAIL_LEN = 200
+_TRAIL_RESULT_CHARS = 4000
+
+
+def record_tool_call(runtime: Any, agent_id: str, name: str,
+                     tool_input: Any, result: Any) -> None:
+    """Append one routed tool call to the agent's in-memory audit trail.
+
+    Bounded per agent; never raises (it sits on the dispatch hot path). The
+    flag_tool call itself is not recorded, so a transcript never contains
+    its own commit.
+    """
+    if runtime is None or not agent_id or name == "flag_tool":
+        return
+    try:
+        trails = getattr(runtime, "tool_trail", None)
+        if trails is None:
+            trails = {}
+            runtime.tool_trail = trails
+        from collections import deque
+        trail = trails.setdefault(str(agent_id), deque(maxlen=_TRAIL_LEN))
+        body = json.dumps(result, sort_keys=True, default=str)
+        trail.append({
+            "tool": str(name),
+            "input": json.loads(json.dumps(tool_input, sort_keys=True, default=str)),
+            "result_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "result": body[:_TRAIL_RESULT_CHARS],
+        })
+    except Exception:  # noqa: BLE001
+        log.debug("tool trail record failed", exc_info=True)
+
+
+def _tool_trail(runtime: Any, agent_id: str) -> list[dict[str, Any]]:
+    trails = getattr(runtime, "tool_trail", None) or {}
+    return list(trails.get(str(agent_id)) or [])
+
+
 def build_transcript(*, agent_id: str, auditor: str, digest: str,
                      manifest: dict[str, Any], color: str, report: str,
                      rebuttal: str, code_ref: Optional[dict[str, Any]],
-                     conversation: list[dict[str, Any]], ts: int) -> bytes:
+                     conversation: list[dict[str, Any]], ts: int,
+                     tool_trail: Optional[list[dict[str, Any]]] = None) -> bytes:
     """Canonical transcript bytes: what the flag's transcript hash covers."""
     return _canonical({
         "kind": "tool_flag_transcript", "v": 1,
@@ -333,7 +371,8 @@ def build_transcript(*, agent_id: str, auditor: str, digest: str,
         "code_digest": str(manifest.get("code_digest") or ""),
         "dependencies": sorted(_norm_digest(d) for d in manifest.get("dependencies") or []),
         "color": color, "report": report, "rebuttal": rebuttal or None,
-        "code_ref": code_ref, "conversation": conversation, "ts": int(ts),
+        "code_ref": code_ref, "conversation": conversation,
+        "tool_trail": tool_trail or [], "ts": int(ts),
     })
 
 
@@ -410,7 +449,8 @@ async def flag_tool(runtime: "Runtime", input: dict[str, Any]) -> dict[str, Any]
     body = build_transcript(
         agent_id=str(caller_id), auditor=auditor, digest=digest, manifest=manifest,
         color=color, report=report, rebuttal=rebuttal, code_ref=code_ref,
-        conversation=_conversation(runtime, str(caller_id)), ts=now)
+        conversation=_conversation(runtime, str(caller_id)), ts=now,
+        tool_trail=_tool_trail(runtime, str(caller_id)))
     transcript_hash, transcript_path = store.write_transcript(body)
     deps = [_norm_digest(d) for d in manifest.get("dependencies") or []]
     ev = evidence_hash(tool_digest=digest, transcript_hash=transcript_hash,
