@@ -501,6 +501,105 @@ close whose voice/pool snapshot was read at a different `anchorCount`.
 `windowBurned/mintPool/minted`) + mint scaling change. Fresh Substrate and
 all daemons on this build before the next close.
 
+## Decision (2026-10-13): staked tools, flagged audits, REP-settled verdicts
+
+User-ratified 2026-10-13, NOT BUILT. Addresses the open problem of
+malicious tools: someone else's code running on your machine. Design
+principle: never assume honest actors are the majority; the network may go
+through phases of being raided and must hold either way. Supersedes the
+v4.1 "no vet gate" stance in one respect: an unvetted tool is still
+published and discoverable, but nodes do not run it by default.
+
+1. **Every published tool carries an ATN stake, per tool.** ToolBond
+   evolves from the core-replacement gate into the stake contract for ALL
+   tools (the core/non-core distinction is dropped: any tool running
+   in-process has the daemon's full authority). Publishing stays a local
+   gossip action; nodes cross-check `isBonded` on-chain and ignore
+   unstaked tools. The stake amount is a jurisdiction parameter set at
+   origination and changed by DAO proposal (ToolBond `setParams`). The
+   stake persists across epochs, so there is always something behind a
+   tool, including malware nobody has run yet.
+2. **Novelty claim on every publish.** The author states what is new,
+   naming the closest existing tools found via `probe_tools`. Reviewers
+   score the claim on `correctness`; a copy with no real difference, or a
+   claim that omits an obvious neighbour, fails it. Performance claims
+   ("twice as fast") are part of the value proposition and checked the
+   same way.
+3. **Flags, not inferred audits.** A review does not imply a malware
+   check. Auditors raise an explicit flag:
+   - **green**: "I checked this for malware and it is clean";
+   - **red**: must cite the exact malicious code.
+   Flags are commit-reveal: a hash of the flag (the red flag's code
+   reference inside it) is committed, and flags reveal once the verdict
+   threshold is met, so nobody can copy a running tally. No green flag
+   while a red flag is open without explicitly rebutting it. A flag's
+   weight is the auditor's REP; auditors stake no ATN, and a zero-REP
+   flag weighs nothing. Auditors keep their audit transcript locally and
+   commit its hash (bound to the tool hash and pinned dependency hashes)
+   with the flag; the transcript is evidence on appeal (whether it reached
+   the payload separates an honest miss from complicity).
+4. **Verdict settles by REP, not by epoch.** A verdict settles when the
+   cumulative REP of the flagging auditors reaches a threshold (DAO
+   parameter, e.g. 5% of total REP, retuned as the network grows). No
+   arbiter: the REP-weighted crowd is the first court. Unsettled tools
+   stay unvetted.
+   - **Clean:** the majority auditors share the tool's earnings (DAO
+     parameter, default 40% auditors / 60% author), split by REP
+     (sybil-proof: splitting identities gains nothing). The auditor share
+     flows from mints at the first close after the cooling-off.
+   - **Malware:** the finder (first correct red commit) takes a fixed
+     share of the stake (DAO parameter, default 50%); the confirmers
+     (majority red flaggers) split the rest by REP, plus any slashed REP
+     (author's and the wrong green flaggers'), reassigned to them by REP.
+     The author's REP is slashed (full by default), per author. No new
+     REP is minted.
+   - **Minority** flaggers get their REP degraded by one DAO parameter,
+     symmetric for wrong red and wrong green.
+   - No standing security pool from burned fees ("vigilance always
+     pays"). Every payout is bounded by what was slashed, which keeps
+     plant-and-flag unprofitable.
+5. **Cooling-off and appeal.** Payouts wait out the jurisdiction's appeal
+   window (`economy.effectiveAppealPeriod()`, what ToolBond reads today).
+   Anyone holding enough REP to submit a DAO proposal can appeal, borrowing
+   the `ERC20Project` appeal model: the DAO is the higher court over the
+   5% crowd. New evidence can reopen a clean verdict, since the stake is
+   still there. Authors may unstake and unpublish behind the unbond delay,
+   but never while a red flag is open. Unstaked means `isBonded` false:
+   the tool leaves the network's economy (no search, flags or mint);
+   local copies run at the owner's own risk.
+6. **Versions.** No in-place updates: a new version is a new hash with its
+   own stake and verdict. Only the original author can publish a successor
+   that carries over the predecessor's reviews and ranking. Vetted status
+   never carries: the successor shows as unvetted and nodes keep the last
+   vetted version until it settles; auditors can review the diff. No fork
+   concept: other authors publish new tools with their own novelty claim,
+   and the original keeps its standing alongside them.
+7. **What vetted unlocks (launch).** Nodes run vetted tools only by
+   default; an unvetted tool needs explicit owner opt-in, per tool.
+   Process isolation becomes the default. Manifests declare capabilities
+   (network, file paths); reviewers check them on `correctness`; a real
+   OS sandbox enforces them later. Until then a missed payload is covered
+   economically (stake + slash), not by containment.
+8. **Author REP is context, not rank.** `probe_tools` shows author REP,
+   their other tools and past slashes next to each result; ranking stays
+   review-driven.
+9. **Composition credit.** The fixed `COMPOSITE_ROOT_SHARE = 0.7` is
+   replaced by a reviewed split: reviewers estimate how much of the value
+   is the composite's own logic versus its dependencies, REP-weighted.
+
+**Open / later:**
+- Bait attack: a zero-REP author baits honest auditors into green flags,
+  then red-flags its own tool from a sybil to harvest their partial
+  slashes. Bounded by small honest-miss slashes; needs an appeal path that
+  takes the transcript as evidence. No existing contract covers it
+  (`Economy`/`ERC20Project` is project escrow; ToolBond is arbiter + DAO
+  overrule).
+- Whether an unvetted tool mints for its author before its verdict
+  settles.
+- **Cross-repo:** REP slashing and reassignment need burn/move authority on
+  RepToken (trustless-contracts).
+- Parameter values: stake, threshold, split, finder share, degradation.
+
 ## Decision (2026-07-24): claimable authorship, never unclaimable rewards
 
 Ratified in discussion 2026-07-24; BUILT same day (`tool_store.py`).
