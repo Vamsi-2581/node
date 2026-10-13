@@ -497,6 +497,11 @@ class TestWsSurface:
         assert r["result"]["status"]["bonded"] is True
         assert r["result"]["optin"] is True and r["result"]["network_tool"] is True
         assert r["result"]["runnable"] is True
+        r = await srv._handle_message({"type": "tool_bond_status", "msg_id": "3b",
+                                       "digests": [rec.digest, "ab" * 32]}, _sess())
+        views = r["result"]["statuses"]
+        assert views[rec.digest]["status"]["bonded"] is True
+        assert views["ab" * 32]["network_tool"] is False
         r = await srv._handle_message({"type": "set_tool_run_optin", "msg_id": "4",
                                        "digest": rec.digest, "allowed": "yes"}, _sess())
         assert r["ok"] is False

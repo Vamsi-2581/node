@@ -2017,6 +2017,32 @@ class WebSocketBridge:
             if msg_type == "list_tool_run_optins":
                 return {"msg_id": msg_id, "ok": True,
                         "result": {"optins": optins.list()}}
+            from .tool_security import client_for
+            client = client_for(self.runtime)
+
+            async def _bond_view(d: str) -> dict:
+                rec = self.runtime.tool_store.resolve(d)
+                view = {"digest": d, "status": await client.status(d),
+                        "optin": optins.allows(d),
+                        "network_tool": bool(rec is not None and rec.origin == "adopted")}
+                if rec is not None:
+                    view["runnable"], view["reason"] = await run_clearance(self.runtime, rec)
+                return view
+
+            if msg_type == "tool_bond_status" and isinstance(msg.get("digests"), list):
+                # Bulk form for the Tools page: one call instead of one per card.
+                digests = [str(d or "").strip().lower().removeprefix("0x")
+                           for d in msg["digests"]][:100]
+                sem = asyncio.Semaphore(6)
+
+                async def _one(d: str) -> tuple:
+                    async with sem:
+                        return d, await _bond_view(d)
+                views = dict(await asyncio.gather(*(_one(d) for d in digests if d)))
+                min_stake = getattr(client, "min_stake", None)
+                return {"msg_id": msg_id, "ok": True,
+                        "result": {"statuses": views,
+                                   "min_stake": await min_stake() if min_stake else None}}
             digest = str(msg.get("digest") or "").strip().lower().removeprefix("0x")
             if not digest:
                 return {"msg_id": msg_id, "ok": False, "error": "Missing 'digest' field"}
@@ -2036,16 +2062,11 @@ class WebSocketBridge:
                     out["runnable"], out["reason"] = await run_clearance(
                         self.runtime, record)
                 return {"msg_id": msg_id, "ok": True, "result": out}
-            # tool_bond_status: chain state + this node's run decision.
-            from .tool_security import client_for
-            status = await client_for(self.runtime).status(digest)
-            out = {"digest": digest, "status": status,
-                   "optin": optins.allows(digest),
-                   "network_tool": bool(record is not None
-                                        and record.origin == "adopted")}
-            if record is not None:
-                out["runnable"], out["reason"] = await run_clearance(
-                    self.runtime, record)
+            # tool_bond_status: chain state + this node's run decision, plus the
+            # current minStake so a publish dialog can show the stake up front.
+            out = await _bond_view(digest)
+            min_stake = getattr(client, "min_stake", None)
+            out["min_stake"] = await min_stake() if min_stake else None
             return {"msg_id": msg_id, "ok": True, "result": out}
 
         if msg_type == "list_adoption_proposals":
