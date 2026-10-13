@@ -1039,6 +1039,12 @@ class WorldService:
                     # replication). Comma-joined: manifest_meta values
                     # are strings on the wire.
                     "deps": ",".join(manifest.get("dependencies") or []),
+                    # Successor merit carry (Decision 2026-10-13 §6): the
+                    # close needs the predecessor link as consensus data.
+                    # Only present when set, so manifests without a
+                    # predecessor keep their registration bytes.
+                    **({"version_of": str(manifest["version_of"])}
+                       if manifest.get("version_of") else {}),
                 },
                 # Registering a claim IS a claim: one unit-weight,
                 # CON-able self-post so a published tool has standing 1

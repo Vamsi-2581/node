@@ -24,6 +24,7 @@ This is the consensus input for:
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List
 
 _FEE_DECIMALS = 10
@@ -74,6 +75,12 @@ def tool_usage_from_events(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, 
           # ``axis_reviews_by_caller`` at drift time.
           "vet_axis_reviews_by_caller": {caller_id: {axis_id: {"sum": float,
                                                               "n": int}}},
+          # Decision 2026-10-13 §9: per attesting agent, sum + count of
+          # the ``own_share`` estimates ([0,1], clamped) its attested-ok
+          # reviews carried: how much of a composite's value is its own
+          # logic vs its declared deps. compute_tool_mint weights them
+          # like drift into the composite's reviewed root share.
+          "own_share_by_caller": {caller_id: {"sum": float, "n": int}},
       }}
 
     Deterministic: events are processed in (author_agent, seq,
@@ -103,6 +110,7 @@ def tool_usage_from_events(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, 
                 "vets_by_caller": {},
                 "vet_senders": {},
                 "vet_axis_reviews_by_caller": {},
+                "own_share_by_caller": {},
             }
         if ev.get("vet"):
             # Third flavor: a vet is a judgment about the CODE, not a
@@ -163,6 +171,19 @@ def tool_usage_from_events(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, 
                         str(axis_id), {"sum": 0.0, "n": 0})
                     cell["sum"] += value
                     cell["n"] += 1
+            # Reviewed composition split: optional own_share in [0,1].
+            raw_own = ev.get("own_share")
+            if raw_own is not None and not isinstance(raw_own, bool):
+                try:
+                    own = float(raw_own)
+                except (TypeError, ValueError):
+                    own = None
+                if own is not None and math.isfinite(own):
+                    own = max(0.0, min(1.0, own))
+                    cell = entry["own_share_by_caller"].setdefault(
+                        caller, {"sum": 0.0, "n": 0})
+                    cell["sum"] += own
+                    cell["n"] += 1
 
     for entry in usage.values():
         entry["fee_total"] = round(entry["fee_total"], _FEE_DECIMALS)
@@ -193,6 +214,10 @@ def tool_usage_from_events(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, 
             }
             for caller, axes in sorted(
                 entry["vet_axis_reviews_by_caller"].items())
+        }
+        entry["own_share_by_caller"] = {
+            caller: {"sum": round(cell["sum"], _FEE_DECIMALS), "n": cell["n"]}
+            for caller, cell in sorted(entry["own_share_by_caller"].items())
         }
     return dict(sorted(usage.items()))
 

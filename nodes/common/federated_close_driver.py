@@ -210,6 +210,11 @@ class FederatedCloseDriver:
         self.emission_pool: Optional[float] = None
         # anchorCount at the last successful voice/pool refresh.
         self.snapshot_anchor_count: Optional[int] = None
+        # ToolBond vetting snapshot (Decision 2026-10-13): vetted tools and
+        # their auditors, rebuilt from ToolBond logs pinned to the same
+        # snapshot anchor block, by the same voice_source refresh. None
+        # (no chain source / no ToolBond) = no auditor shares.
+        self.vetting_snapshot: Optional[Dict[str, Any]] = None
         # Optional zero-arg refresh hook returning
         # {"owner_map": {...}, "voice_weights": {...}} — wired by the
         # host when chain access exists (see AutonetService.
@@ -419,6 +424,9 @@ class FederatedCloseDriver:
             if state.get("snapshot_anchor_count") is not None:
                 self.snapshot_anchor_count = int(
                     state["snapshot_anchor_count"])
+            vetting = state.get("vetting_snapshot")
+            if isinstance(vetting, dict):
+                self.vetting_snapshot = vetting
         except Exception as e:
             logger.warning(
                 "voice-state refresh failed (keeping previous maps): %s", e)
@@ -491,6 +499,8 @@ class FederatedCloseDriver:
                             if self.rep_shares else None),
                 tool_credibility=dict(self._tool_credibility),
                 tool_review_book=dict(self._tool_review_book),
+                vetting_snapshot=(dict(self.vetting_snapshot)
+                                  if self.vetting_snapshot else None),
             )
         except Exception as e:
             logger.error(

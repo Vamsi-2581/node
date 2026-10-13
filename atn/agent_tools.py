@@ -893,6 +893,16 @@ _TOOLS: list[ToolDefinition] = [
                                 ),
                                 "additionalProperties": {"type": "number"},
                             },
+                            "own_share": {
+                                "type": "number",
+                                "description": (
+                                    "Optional, for a tool that calls other tools "
+                                    "(declared dependencies): your estimate 0..1 of "
+                                    "how much of its value is its own logic rather "
+                                    "than its dependencies. Sets how its usage "
+                                    "credit splits between it and them."
+                                ),
+                            },
                             "note": {"type": "string", "description": "Optional reviewable justification (blob-stored)."},
                         },
                         "required": ["tool", "ok"],
