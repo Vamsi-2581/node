@@ -600,6 +600,50 @@ published and discoverable, but nodes do not run it by default.
   RepToken (trustless-contracts).
 - Parameter values: stake, threshold, split, finder share, degradation.
 
+**BUILT 2026-10-13 (the close side: §4 Clean payout, §6 successor carry,
+§9 composition split).** `federated_epoch_close` / `compute_tool_mint`
+(`nodes/common/federated_reconcile.py`):
+
+- **Auditor share.** New close input `vetting_snapshot`: {auditor_share_bps,
+  tools: {digest: {round, auditors: {address: flag weight}}}}, listing only
+  vetted tools (bonded, latest finalized verdict Clean, no malware verdict
+  pending) with the revealed green flaggers of the round that vetted them.
+  Of such a tool's mint, `auditorShareBps` (ToolBond param, default 4000)
+  goes to those auditors split by flag weight; the author takes the exact
+  remainder. Redistribution only: the pool normalization and the base-unit
+  floor (`floor_mint_to_pool`) run on the redistributed map, so the sum
+  stays <= the on-chain pool (dust: at most one base unit per recipient).
+  Auditor addresses map onto an agent id the close already knows
+  (case-insensitive), else the lowercased address. Unvetted tools mint
+  exactly as before. `per_digest` gains `vetted` and `auditor_mint`.
+- **Pinned read.** `voice_state.read_tool_vetting_snapshot` rebuilds the
+  snapshot from ToolBond event logs up to the snapshot anchor's block (the
+  same block as the owner map), so no archive node is needed and every
+  daemon reads the same history; `auditorShareBps` comes from the last
+  `ParamsSet` (the constructor emits one), else 4000. Wired through
+  `read_voice_state(tool_bond_address=...)`, the driver's voice refresh,
+  and `blockchain.tool_bond_address` (env `AUTONET_TOOL_BOND_ADDRESS`,
+  seeded from registry.json `contracts.tool_bond`).
+- **Reviewed composition split.** `attest_tools` judgments take an optional
+  `own_share` in [0,1], gossiped on the `tool_used` event. A composite's
+  root share is the drift-weighted (log1p(n) x rep_share x credibility, no
+  ε floor, author and co-hosted reviewers excluded) running mean of those
+  estimates, carried as `tool_positions[digest].own_share = {sum, mass}`
+  (no new carry key; the bundle shape is unchanged). Updated before the
+  fan-out, so this close's reviews count; damp-then-split is unchanged.
+  No estimates: `COMPOSITE_ROOT_SHARE` (0.7).
+- **Successor merit carry.** `manifest_meta` carries `version_of` when set.
+  A manifest first appearing with `version_of` naming a registered
+  predecessor by the same author starts from the predecessor's carried
+  position (head, mass, own_share) and review book. A different author
+  inherits nothing. Vetted status never carries (it is per digest on
+  chain).
+
+**FLAG-DAY:** close outputs change (auditor leaves in `agent_mint`, root
+shares, inherited positions) and `manifest_meta` / `tool_used` gain
+optional fields. Every daemon must run this build and read the same
+ToolBond before the next close, or closes fork.
+
 ## Decision (2026-07-24): claimable authorship, never unclaimable rewards
 
 Ratified in discussion 2026-07-24; BUILT same day (`tool_store.py`).
