@@ -73,6 +73,21 @@ OUTPUT_DECIMALS = 10
 # share (total may be < 1, never > 1): conservation of attestation.
 COMPOSITE_ROOT_SHARE = 0.7
 COMPOSITE_MAX_DEPTH = 4
+# Reviewed composition split (Decision 2026-10-13 §9): COMPOSITE_ROOT_SHARE
+# is now only the DEFAULT. Reviews may carry ``own_share`` in [0,1] (how
+# much of a composite's value is its own logic vs its declared deps); a
+# composite's root share is the drift-weighted (rep_share x credibility)
+# running mean of those estimates, carried in its ``tool_positions`` entry
+# as ``own_share: {sum, mass}``. No own_share reviews => the default.
+
+# Auditor share of a vetted tool's mint (Decision 2026-10-13 §4, Clean):
+# the green flaggers of the round that vetted it split this share of the
+# tool's mint by flag weight (their snapshot REP); the author keeps the
+# rest. The live value is ToolBond ``auditorShareBps``, read pinned into
+# the vetting snapshot; this default applies when the snapshot omits it
+# (older ToolBond deployments).
+AUDITOR_SHARE_BPS_DEFAULT = 4000
+BPS = 10_000
 
 # Vetting pipeline (docs/tool_substrate.md, Vetting section). A published
 # manifest enters the CANDIDATE pool: visible, debatable, NOT mint-
@@ -182,25 +197,32 @@ def _composition_shares(
     *,
     root_share: float = COMPOSITE_ROOT_SHARE,
     max_depth: int = COMPOSITE_MAX_DEPTH,
+    root_shares: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """Split one unit of attestation weight over a declared-dep DAG.
+
+    ``root_shares`` (digest -> reviewed own share in [0,1]) overrides
+    ``root_share`` per composite at every level of the recursion: a
+    composite dep keeps ITS reviewed share of whatever reaches it.
 
     Pure + deterministic (sorted recursion over consensus-carried
     declarations). Returns {digest: weight} with sum <= 1.0.
     """
     shares: Dict[str, float] = {}
+    reviewed = root_shares or {}
 
     def _spread(digest: str, weight: float, depth: int, path: frozenset) -> None:
         declared = [d for d in deps_of.get(digest, []) if d]
         if not declared or depth >= max_depth:
             shares[digest] = shares.get(digest, 0.0) + weight
             return
-        shares[digest] = shares.get(digest, 0.0) + weight * root_share
+        own = max(0.0, min(1.0, float(reviewed.get(digest, root_share))))
+        shares[digest] = shares.get(digest, 0.0) + weight * own
         # Split by the FULL declared count; shares of cyclic or
         # unregistered deps are forfeited, never redistributed to
         # siblings (conservation: total <= 1, gaming by padding with
         # dead deps only burns the padder's own credit).
-        child_w = weight * (1.0 - root_share) / len(declared)
+        child_w = weight * (1.0 - own) / len(declared)
         for dep in sorted(declared):
             if dep in path or dep not in deps_of:
                 continue
@@ -208,6 +230,52 @@ def _composition_shares(
 
     _spread(root, 1.0, 0, frozenset({root}))
     return shares
+
+
+def _normalize_vetting_snapshot(
+    snapshot: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Canonicalize the ToolBond vetting snapshot (Decision 2026-10-13).
+
+    Shape: {"auditor_share_bps": int, "tools": {digest: {"round": int,
+    "auditors": {address: weight}}}}. Only VETTED tools appear (bonded,
+    latest finalized verdict Clean, no malware verdict pending), with the
+    revealed green flaggers of the round that vetted them and their flag
+    weights (``flags(digest, round, auditor).weight``, integer REP base
+    units). The CALLER reads it pinned to the previous anchor
+    (voice_state.read_tool_vetting_snapshot); the close only consumes it.
+    Digests lose any 0x prefix, addresses are lowercased, non-positive
+    weights are dropped, bps is clamped to [0, BPS].
+    """
+    out: Dict[str, Any] = {
+        "auditor_share_bps": AUDITOR_SHARE_BPS_DEFAULT, "tools": {}}
+    if not snapshot:
+        return out
+    try:
+        bps = int(snapshot.get("auditor_share_bps", AUDITOR_SHARE_BPS_DEFAULT))
+    except (TypeError, ValueError):
+        bps = AUDITOR_SHARE_BPS_DEFAULT
+    out["auditor_share_bps"] = max(0, min(BPS, bps))
+    tools: Dict[str, Any] = {}
+    for digest, entry in sorted((snapshot.get("tools") or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        auditors: Dict[str, int] = {}
+        for addr, w in sorted((entry.get("auditors") or {}).items()):
+            try:
+                weight = int(w)
+            except (TypeError, ValueError):
+                continue
+            if weight > 0:
+                key = str(addr).lower()
+                auditors[key] = auditors.get(key, 0) + weight
+        if auditors:
+            tools[str(digest).lower().removeprefix("0x")] = {
+                "round": int(entry.get("round") or 0),
+                "auditors": dict(sorted(auditors.items())),
+            }
+    out["tools"] = dict(sorted(tools.items()))
+    return out
 
 
 def _normalize_credibility(
@@ -284,6 +352,8 @@ def compute_tool_mint(
     rep_shares: Optional[Dict[str, float]] = None,
     credibility: Optional[Dict[str, float]] = None,
     tool_review_book: Optional[Dict[str, Any]] = None,
+    # Staked tools (Decision 2026-10-13): pinned ToolBond vetting snapshot.
+    vetting_snapshot: Optional[Dict[str, Any]] = None,
     vet_quorum: float = VET_QUORUM,
     vet_royalty_share: float = VET_ROYALTY_SHARE,
     vet_royalty_epochs: int = VET_ROYALTY_EPOCHS,
@@ -368,15 +438,40 @@ def compute_tool_mint(
     2026-07-10): REP is claimed DAO-side on ratified ATN earnings, never
     minted here.
 
+    Staked tools (Decision 2026-10-13), three close rules:
+
+      - ``vetting_snapshot`` (see ``_normalize_vetting_snapshot``): for a
+        VETTED tool, ``auditor_share_bps`` of its mint goes to the green
+        flaggers of the round that vetted it, split by flag weight; the
+        author keeps the rest. Redistribution only: the tool's total mint
+        is unchanged (auditor parts first, author gets the exact
+        remainder), and the pool normalization + base-unit floor run on
+        the redistributed map downstream as before. Auditor addresses map
+        onto an agent id already present in the close (case-insensitive,
+        sorted-first spelling), else the lowercased address. ``None`` or
+        an unlisted tool: author keeps 100% (unvetted tools mint as
+        before).
+      - Reviewed composition split: a composite's root share is the
+        drift-weighted mean of its reviews' ``own_share`` estimates
+        (carried as ``positions[digest]["own_share"] = {sum, mass}``),
+        default ``COMPOSITE_ROOT_SHARE``. Updated BEFORE the fan-out so
+        this close's reviews count; damp-then-split is unchanged.
+      - Successor merit carry: a manifest first appearing with
+        ``version_of`` naming a registered predecessor by the SAME author
+        inherits the predecessor's carried position (head, mass,
+        own_share) and review book. A different author inherits nothing.
+
     Returns (all maps key-sorted, pure function of canonical inputs):
       {
         "per_digest": {digest: {node_id, author, trust_class,
                                 ok_count, attesters, usage_term, mint,
-                                greenlit, validators, royalty_left}},
+                                greenlit, validators, royalty_left,
+                                vetted, auditor_mint}},
         "node_agent": {node_id: {author: mint}},   # gate-mergeable
         "registrations_next": {digest: manifest_meta},
         "vetting_next": {"manifests": {...}, "busts": {agent: n}},
-        "positions_next": {digest: {"head": [N_DIMS], "mass": [N_DIMS]}},
+        "positions_next": {digest: {"head": [N_DIMS], "mass": [N_DIMS],
+                                    "own_share"?: {"sum", "mass"}}},
         "credibility_next": {household: multiplier},
         "tool_review_book_next": {digest: {household: {axis: {sum,n}}}},
       }
@@ -477,8 +572,9 @@ def compute_tool_mint(
 
     # Composition fan-out (docs/tool_substrate.md — Composition rule 3):
     # each receipt digest's attested counts distribute over its declared
-    # dependency DAG with conserved total weight 1 (root keeps
-    # COMPOSITE_ROOT_SHARE, deps split the rest, recursively).
+    # dependency DAG with conserved total weight 1 (root keeps its
+    # reviewed root share, default COMPOSITE_ROOT_SHARE, deps split the
+    # rest, recursively; see the reviewed split below).
     #
     # ORDER OF OPERATIONS IS THE ANTI-AMPLIFICATION GUARANTEE: the
     # per-caller count is DAMPED FIRST (log1p once, at the composite the
@@ -499,13 +595,120 @@ def compute_tool_mint(
     def _household(agent_id: str) -> str:
         return owner_map_all.get(agent_id, "") or agent_id
 
+    rep_share_map = rep_shares or {}
+
+    def _rep_share(house: str) -> float:
+        return float(rep_share_map.get(house, 0.0))
+
+    # ------------------------------------------------------------------
+    # Carried review state, normalized once: position drift, credibility
+    # and the reviewed composition split all read it.
+    #
+    # SUCCESSOR MERIT CARRY (Decision 2026-10-13 §6): a manifest that
+    # first appears this close (no carried position) and declares
+    # ``version_of`` = a registered predecessor by the SAME author starts
+    # from the predecessor's carried position (head, mass, own_share) and
+    # review book instead of the zero prior. A different author's
+    # ``version_of`` inherits nothing (no forks: they compete on their own
+    # merit). Lookups read the ORIGINAL carried maps only, so a chain of
+    # same-close successors cannot cascade and the result is independent
+    # of iteration order. Vetted status never carries (it is chain state
+    # keyed by digest, read into the vetting snapshot).
+    # ------------------------------------------------------------------
+    import copy as _copy
+
+    orig_pos = positions or {}
+    cred_state = _normalize_credibility(credibility)
+    orig_book = _normalize_review_book(tool_review_book)
+    carried_pos: Dict[str, Dict[str, Any]] = dict(orig_pos)
+    review_book: Dict[str, Any] = dict(orig_book)
+    for digest in sorted(known_regs.keys()):
+        if digest in orig_pos:
+            continue
+        meta = known_regs[digest]
+        pred = str(meta.get("version_of") or "").lower().removeprefix("0x")
+        author = str(meta.get("author") or "")
+        if not pred or pred == digest or not author:
+            continue
+        pred_meta = known_regs.get(pred)
+        if pred_meta is None or str(pred_meta.get("author") or "") != author:
+            continue
+        if pred in orig_pos:
+            carried_pos[digest] = _copy.deepcopy(orig_pos[pred])
+        if pred in orig_book:
+            review_book[digest] = _copy.deepcopy(orig_book[pred])
+
+    # ------------------------------------------------------------------
+    # Reviewed composition split (Decision 2026-10-13 §9). Per composite
+    # (declared deps), the root share is the running weighted mean of the
+    # ``own_share`` estimates its reviews carried, weighted exactly like
+    # per-axis drift: log1p(n) x rep_share x credibility per household, no
+    # ε floor (zero-rep estimates move nothing), author household and
+    # co-hosted wire identities excluded; local regime (rep_shares None)
+    # weighs 1.0. Computed BEFORE the fan-out so this close's reviews
+    # count. No estimates yet => COMPOSITE_ROOT_SHARE.
+    # ------------------------------------------------------------------
+    root_share_of: Dict[str, float] = {}
+    own_share_next: Dict[str, Dict[str, float]] = {}
+    for digest in sorted(known_regs.keys()):
+        # A carried estimate survives on any tool (e.g. one inherited by a
+        # successor); new estimates only accumulate on composites.
+        prior_own = (carried_pos.get(digest) or {}).get("own_share") or {}
+        try:
+            o_sum = float(prior_own.get("sum") or 0.0)
+            o_mass = float(prior_own.get("mass") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            o_sum, o_mass = 0.0, 0.0
+        if not o_mass > 0.0:
+            o_sum, o_mass = 0.0, 0.0
+        entry = usage.get(digest) or {}
+        by_caller = (entry.get("own_share_by_caller") or {}
+                     if deps_of.get(digest) else {})
+        if by_caller:
+            meta = known_regs[digest]
+            author_house = _household(str(meta.get("author") or ""))
+            reg_sender = str(meta.get("sender") or "")
+            cells: Dict[str, Dict[str, float]] = {}
+            cell_senders: Dict[str, set] = {}
+            for caller in sorted(by_caller.keys()):
+                house = _household(caller)
+                agg = cells.setdefault(house, {"sum": 0.0, "n": 0})
+                agg["sum"] += float(by_caller[caller].get("sum") or 0.0)
+                agg["n"] += int(by_caller[caller].get("n") or 0)
+                cell_senders.setdefault(house, set()).update(
+                    entry.get("attester_senders", {}).get(caller, []))
+            for house in sorted(cells.keys()):
+                if house == author_house:
+                    continue
+                if reg_sender and reg_sender in cell_senders[house]:
+                    continue
+                n = int(cells[house]["n"])
+                if n <= 0:
+                    continue
+                if rep_shares is None:
+                    base_w = 1.0
+                else:
+                    base_w = _rep_share(house)
+                    if base_w <= 0.0:
+                        continue
+                w = math.log1p(n) * base_w * cred_state.get(house, 1.0)
+                o_sum += w * (cells[house]["sum"] / n)
+                o_mass += w
+        if o_mass > 0.0:
+            own = {"sum": round(o_sum, 10), "mass": round(o_mass, 10)}
+            if own["mass"] > 0.0:
+                own_share_next[digest] = own
+                root_share_of[digest] = round(
+                    max(0.0, min(1.0, own["sum"] / own["mass"])), 9)
+
     # eff buckets are keyed by HOUSEHOLD: counts sum across a
     # household's agents at each attested composite, then log1p damps
     # once — N co-owned agents are one voice, not N log1p terms.
     eff: Dict[str, Dict[str, float]] = {}
     house_senders: Dict[str, set] = {}
     for digest in sorted(set(usage) & set(known_regs)):
-        shares = _composition_shares(digest, deps_of)
+        shares = _composition_shares(digest, deps_of,
+                                     root_shares=root_share_of)
         entry = usage[digest]
         counts: Dict[str, int] = {}
         for caller in sorted(entry["attested_ok_by_caller"].keys()):
@@ -534,7 +737,8 @@ def compute_tool_mint(
     from .world_model_substrate.tool_usage import loadout_adoption_from_events
     adoption = loadout_adoption_from_events(events)
     for loadout in sorted(set(adoption) & set(known_regs)):
-        shares = _composition_shares(loadout, deps_of)
+        shares = _composition_shares(loadout, deps_of,
+                                     root_shares=root_share_of)
         entry = adoption[loadout]
         fleets: Dict[str, List[str]] = {}
         for caller in sorted(entry["by_caller"].keys()):
@@ -557,19 +761,34 @@ def compute_tool_mint(
     # over the ε-floored reputation-share weights). ``rep_shares`` survives
     # only for DRIFT weight (position section below). ``voice_weights``
     # carries the ε-floored share; None => local/no-chain regime, weight
-    # 1.0. ``rep_share_map`` is kept for the drift math.
+    # 1.0. ``rep_share_map`` (defined above) is kept for the drift math.
     # ------------------------------------------------------------------
-    rep_share_map = rep_shares or {}
-
-    def _rep_share(house: str) -> float:
-        return float(rep_share_map.get(house, 0.0))
-
     def _mint_weight(house: str) -> float:
         # ε-floored reputation share (voice_weights); local regime weighs
         # every household 1.0 (the pre-voice behavior).
         if voice_weights is not None:
             return round(float(voice_weights.get(house, VOICE_EPSILON)), 9)
         return 1.0
+
+    # Vetted tools' auditors (Decision 2026-10-13 §4). Auditor addresses
+    # resolve onto an agent id the close already knows (registered
+    # authors, owner-map agents, receipt callers), matched
+    # case-insensitively with the sorted-first spelling winning, so one
+    # address never becomes two mint leaves; unknown auditors key by the
+    # lowercased address (claimable once that agent is registered).
+    vet_snap = _normalize_vetting_snapshot(vetting_snapshot)
+    auditor_bps = int(vet_snap["auditor_share_bps"])
+    id_index: Dict[str, str] = {}
+    if vet_snap["tools"]:
+        known_ids: set = set(owner_map_all.keys())
+        for m in known_regs.values():
+            if m.get("author"):
+                known_ids.add(str(m["author"]))
+        for u in usage.values():
+            known_ids.update(str(c) for c in (u.get("callers") or {}))
+        for ident in sorted(known_ids):
+            if ident:
+                id_index.setdefault(ident.lower(), ident)
 
     per_digest: Dict[str, Dict[str, Any]] = {}
     node_agent: Dict[str, Dict[str, float]] = {}
@@ -615,6 +834,22 @@ def compute_tool_mint(
         node_id = (sorted({n.id for n in nodes})[0] if nodes
                    else f"tool:{digest}")
         validators = list(vm["validators"]) if vm else []
+        # Auditor share (vetted tools only): auditors' parts first, in
+        # sorted order, then the author takes the exact remainder, so the
+        # tool's total is redistributed, never changed. Flag weights are
+        # integer REP base units; the split is weight / total weight.
+        auditor_parts: Dict[str, float] = {}
+        audit = vet_snap["tools"].get(digest)
+        if audit and auditor_bps > 0:
+            weights = audit["auditors"]
+            total_w = sum(weights[a] for a in sorted(weights))
+            share_pool = mint * auditor_bps / BPS
+            for addr in sorted(weights):
+                agent = id_index.get(addr, addr)
+                auditor_parts[agent] = (auditor_parts.get(agent, 0.0)
+                                        + share_pool * weights[addr] / total_w)
+        auditor_total = sum(auditor_parts[a] for a in sorted(auditor_parts))
+        author_part = max(0.0, mint - auditor_total)
         per_digest[digest] = {
             "node_id": node_id,
             "author": author,
@@ -626,10 +861,15 @@ def compute_tool_mint(
             "greenlit": greenlit,
             "validators": len(validators),
             "royalty_left": int(vm.get("royalty_left") or 0) if vm else 0,
+            "vetted": bool(audit),
+            "auditor_mint": round(auditor_total, 10),
         }
-        # v4.1 [R1]: author keeps 100% of the mint (royalty split gone).
+        # v4.1 [R1]: no validator royalty. Unvetted tools: the author keeps
+        # 100%. Vetted tools: the auditor parts computed above.
         bucket = node_agent.setdefault(node_id, {})
-        bucket[author] = bucket.get(author, 0.0) + mint
+        bucket[author] = bucket.get(author, 0.0) + author_part
+        for agent in sorted(auditor_parts.keys()):
+            bucket[agent] = bucket.get(agent, 0.0) + auditor_parts[agent]
 
     # Royalty window ticks once per close for every greenlit manifest
     # (kept for the carried-state contract; no mint effect under v4.1).
@@ -655,9 +895,8 @@ def compute_tool_mint(
     from .world_model_substrate.adapter import CHARTER, N_DIMS
     axis_index = {str(e["id"]): int(e["axis_index"]) for e in CHARTER}
 
-    carried_pos = positions or {}
-    cred_state = _normalize_credibility(credibility)
-    review_book = _normalize_review_book(tool_review_book)
+    # carried_pos / review_book / cred_state: normalized above (with the
+    # successor merit carry applied).
     positions_next: Dict[str, Dict[str, Any]] = {}
     # v4.1 [R5]: the per-household review centroids we (re)assert this
     # close, carried forward so a later reversal retroactively re-scores
@@ -753,6 +992,8 @@ def compute_tool_mint(
             "head": [round(h, 9) for h in head],
             "mass": [round(m_val, 9) for m_val in mass],
         }
+        if digest in own_share_next:
+            positions_next[digest]["own_share"] = own_share_next[digest]
         if book_entry:
             review_book_next[digest] = book_entry
         # Review mass = total drifted mass minus the N_DIMS author prior.
@@ -1136,6 +1377,10 @@ def federated_epoch_close(
     rep_shares: Optional[Dict[str, float]] = None,
     tool_credibility: Optional[Dict[str, float]] = None,
     tool_review_book: Optional[Dict[str, Any]] = None,
+    # Staked tools (Decision 2026-10-13): the ToolBond vetting snapshot,
+    # read by the caller pinned to the previous anchor (same snapshot as
+    # voice_weights / rep_shares / emission_pool). None = no vetted tools.
+    vetting_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a full federated epoch close given a canonical sequence.
 
@@ -1282,6 +1527,7 @@ def federated_epoch_close(
         rep_shares=rep_shares,
         credibility=tool_credibility,
         tool_review_book=tool_review_book,
+        vetting_snapshot=vetting_snapshot,
     )
     # v3 position drift: write the reviewed charter heads onto the replay
     # world so the checkpoint (world_cid) and any world reader carry the
@@ -1309,7 +1555,9 @@ def federated_epoch_close(
     if _pool is not None and _raw_total > 0.0:
         _scale = float(_pool) / _raw_total
         per_digest = {
-            d: {**e, "mint": round(e["mint"] * _scale, output_decimals)}
+            d: {**e, "mint": round(e["mint"] * _scale, output_decimals),
+                "auditor_mint": round(e.get("auditor_mint", 0.0) * _scale,
+                                      output_decimals)}
             for d, e in sorted(per_digest.items())
         }
     result["tool_mint"] = per_digest
