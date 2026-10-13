@@ -563,13 +563,69 @@ def _fetch_registry(url: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+_REGISTRY_READ_ABI = [
+    {"name": "getAllKeys", "type": "function", "stateMutability": "view",
+     "inputs": [], "outputs": [{"name": "", "type": "string[]"}]},
+    {"name": "getAllValues", "type": "function", "stateMutability": "view",
+     "inputs": [], "outputs": [{"name": "", "type": "string[]"}]},
+]
+
+
+def _onchain_registry_target() -> tuple[str, str]:
+    """(DAO Registry address, rpc url) for a jurisdiction launched on chain,
+    from ATN_JURISDICTION_REGISTRY / ATN_JURISDICTION_RPC. The rpc falls back
+    to the packaged network's. ("", "") when unset."""
+    addr = os.environ.get("ATN_JURISDICTION_REGISTRY", "").strip()
+    if not addr:
+        return "", ""
+    rpc = os.environ.get("ATN_JURISDICTION_RPC", "").strip()
+    if not rpc:
+        from .jurisdiction import RPC_URL
+        rpc = RPC_URL
+    return addr, rpc
+
+
+def _fetch_onchain_registry(registry_address: str, rpc_url: str,
+                            jurisdiction_id: str) -> dict[str, Any] | None:
+    """Read a launched jurisdiction's contracts from its DAO Registry.
+
+    A jurisdiction launched in one transaction (the werule "Autonet
+    jurisdiction" type) writes its suite under ``jurisdiction.<id>.<name>``
+    keys, with the same names registry.json uses under ``contracts``. Returns
+    a registry document shaped like registry.json, or None on any failure.
+    """
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={
+            "timeout": _REGISTRY_FETCH_TIMEOUT}))
+        reg = w3.eth.contract(address=Web3.to_checksum_address(registry_address),
+                              abi=_REGISTRY_READ_ABI)
+        keys = reg.functions.getAllKeys().call()
+        values = reg.functions.getAllValues().call()
+        chain_id = int(w3.eth.chain_id)
+    except Exception as exc:
+        log.debug("On-chain registry read from %s failed: %s", registry_address, exc)
+        return None
+    prefix = f"jurisdiction.{jurisdiction_id}."
+    contracts = {k[len(prefix):]: v for k, v in zip(keys, values)
+                 if k.startswith(prefix) and v}
+    if not contracts.get("substrate"):
+        return None
+    contracts.setdefault("dao_registry", registry_address)
+    return {"jurisdictions": {jurisdiction_id: {
+        "network": {"rpc_url": rpc_url, "chain_id": chain_id},
+        "contracts": contracts}}}
+
+
 def _load_registry_seed(jurisdiction_id: str = "autonet") -> dict[str, Any]:
     """Resolve network + contract defaults for ``jurisdiction_id``.
 
     Called only when the daemon joins the network, never at boot:
       1. ATN_REGISTRY_URL, when the operator set it (fetched now);
-      2. else (or if that fetch fails) the packaged registry.json;
-      3. else {} with one warning.
+      2. else ATN_JURISDICTION_REGISTRY, a launched jurisdiction's DAO
+         Registry read on chain (jurisdiction.<id>.* keys);
+      3. else (or if those fail) the packaged registry.json;
+      4. else {} with one warning.
 
     Returns a flat dict suitable for merging into the RPBConfig builder.
     """
@@ -583,6 +639,15 @@ def _load_registry_seed(jurisdiction_id: str = "autonet") -> dict[str, Any]:
                         "registry", url)
         else:
             source = url
+    if data is None:
+        reg_addr, reg_rpc = _onchain_registry_target()
+        if reg_addr:
+            data = _fetch_onchain_registry(reg_addr, reg_rpc, jurisdiction_id)
+            if data is None:
+                log.warning("Jurisdiction registry %s unreadable on chain; using "
+                            "the packaged registry", reg_addr)
+            else:
+                source = f"chain:{reg_addr}"
     if data is None:
         path = _packaged_registry_path()
         try:
