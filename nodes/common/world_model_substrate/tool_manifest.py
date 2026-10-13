@@ -33,6 +33,7 @@ is the byte string both sides sign/verify over.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 TOOL_MANIFEST_KIND = "tool_manifest"
@@ -92,6 +93,11 @@ def build_tool_manifest(
     # signs it on the guest's behalf. Signed with the rest of the manifest,
     # so adopters see who really wrote it.
     authored_via: str = "",
+    # novelty claim (docs/tool_substrate.md, Decision 2026-10-13 item 2):
+    # {"statement": str, "prior_art": [digest, ...]}. Optional here (peers
+    # validate older manifests); REQUIRED to publish (publish_novelty_errors).
+    # Inside the signed manifest, so the claim is bound to the digest.
+    novelty: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble and validate a tool-manifest payload.
 
@@ -133,6 +139,8 @@ def build_tool_manifest(
         manifest["capabilities"] = dict(capabilities)
     if authored_via:
         manifest["authored_via"] = str(authored_via)
+    if novelty is not None:
+        manifest["novelty"] = normalize_novelty(novelty)
 
     errors = validate_manifest(manifest)
     if errors:
@@ -181,6 +189,9 @@ def validate_manifest(payload: Dict[str, Any]) -> List[str]:
     authored_via = payload.get("authored_via")
     if authored_via is not None and not isinstance(authored_via, str):
         errors.append("authored_via must be a string")
+
+    if payload.get("novelty") is not None:
+        errors.extend(novelty_errors(payload.get("novelty")))
 
     caps = payload.get("capabilities")
     if caps is not None:
@@ -243,6 +254,89 @@ def validate_manifest(payload: Dict[str, Any]) -> List[str]:
             errors.append("dependencies must be unique")
 
     return errors
+
+
+# ---------------------------------------------------------------------------
+# Novelty claim (Decision 2026-10-13 item 2). The author states what is new
+# and names the closest existing tools (found via probe_tools) by digest.
+# Reviewers score the claim on `correctness`; this layer checks structure
+# only. An empty prior_art list is allowed only when the statement says
+# outright that nothing comparable exists, so "no neighbours" is an explicit,
+# reviewable claim rather than an omission.
+# ---------------------------------------------------------------------------
+
+NOVELTY_MAX_STATEMENT = 4000
+NOVELTY_MAX_PRIOR_ART = 32
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_NOTHING_COMPARABLE = re.compile(
+    r"\b(no|nothing|none|not\s+any)\b[^.;:]{0,60}?"
+    r"\b(comparable|similar|equivalent|existing|prior|alternative|like\s+(this|it))\b"
+    r"|\b(comparable|similar|equivalent|existing)\b[^.;]{0,60}?"
+    r"\b(none|do(es)?\s*n[o']t\s+exist)\b",
+    re.IGNORECASE)
+
+
+def normalize_novelty(novelty: Any) -> Any:
+    """Canonical form: stripped statement, lowercase prior_art digests
+    (0x stripped, order kept), missing prior_art as []. Non-dicts pass
+    through for validation to reject."""
+    if not isinstance(novelty, dict):
+        return novelty
+    out = dict(novelty)
+    if isinstance(out.get("statement"), str):
+        out["statement"] = out["statement"].strip()
+    prior = out.get("prior_art")
+    if prior is None:
+        out["prior_art"] = []
+    elif isinstance(prior, list):
+        out["prior_art"] = [p.strip().lower().removeprefix("0x")
+                            if isinstance(p, str) else p for p in prior]
+    return out
+
+
+def states_nothing_comparable(statement: str) -> bool:
+    """True when ``statement`` asserts that no comparable tool exists."""
+    return bool(_NOTHING_COMPARABLE.search(str(statement or "")))
+
+
+def novelty_errors(novelty: Any) -> List[str]:
+    """Structural problems with a novelty claim (empty = well-formed)."""
+    if not isinstance(novelty, dict):
+        return ["novelty must be an object {statement, prior_art}"]
+    errors: List[str] = []
+    extra = set(novelty) - {"statement", "prior_art"}
+    if extra:
+        errors.append("novelty has unknown field(s): " + ", ".join(sorted(extra)))
+    statement = novelty.get("statement")
+    if not isinstance(statement, str) or not statement.strip():
+        errors.append("novelty.statement must be a non-empty string")
+    elif len(statement) > NOVELTY_MAX_STATEMENT:
+        errors.append(f"novelty.statement exceeds {NOVELTY_MAX_STATEMENT} chars")
+    prior = novelty.get("prior_art", [])
+    if not isinstance(prior, list) or not all(
+        isinstance(p, str) and _HEX64.match(p) for p in prior
+    ):
+        errors.append("novelty.prior_art must be a list of 64-hex manifest digests")
+    elif len(prior) != len(set(prior)):
+        errors.append("novelty.prior_art must be unique")
+    elif len(prior) > NOVELTY_MAX_PRIOR_ART:
+        errors.append(f"novelty.prior_art lists more than {NOVELTY_MAX_PRIOR_ART} tools")
+    elif (not prior and isinstance(statement, str) and statement.strip()
+          and not states_nothing_comparable(statement)):
+        errors.append("novelty.prior_art is empty: name the closest existing "
+                      "tools (probe_tools), or state explicitly that nothing "
+                      "comparable exists")
+    return errors
+
+
+def publish_novelty_errors(payload: Dict[str, Any]) -> List[str]:
+    """What blocks publishing ``payload`` on the novelty rule: the claim is
+    required to publish, and must be well-formed."""
+    novelty = payload.get("novelty") if isinstance(payload, dict) else None
+    if novelty is None:
+        return ["publishing requires a novelty claim {statement, prior_art}: "
+                "what is new, naming the closest existing tools by digest"]
+    return novelty_errors(novelty)
 
 
 def is_tool_manifest(payload: Any) -> bool:

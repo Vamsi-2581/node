@@ -38,6 +38,10 @@ TOOL_BOND_ABI = [{
     "name": "isBonded", "type": "function", "stateMutability": "view",
     "inputs": [{"name": "digest", "type": "bytes32"}],
     "outputs": [{"name": "", "type": "bool"}],
+}, {
+    "name": "isVetted", "type": "function", "stateMutability": "view",
+    "inputs": [{"name": "digest", "type": "bytes32"}],
+    "outputs": [{"name": "", "type": "bool"}],
 }]
 
 
@@ -56,17 +60,22 @@ def _registry_seed(runtime: Any) -> dict[str, Any]:
 
 
 class ToolBondGate:
-    """``await gate.is_bonded(digest) -> (bonded, reason)``. Never raises.
+    """``await gate.is_bonded(digest) -> (bonded, reason)`` and
+    ``await gate.is_vetted(digest) -> (vetted, reason)``. Never raise.
 
-    ``checker`` (tests / alternate transports): a sync callable
-    ``digest -> bool`` used instead of web3 when given.
+    ``checker`` / ``vetted_checker`` (tests / alternate transports): sync
+    callables ``digest -> bool`` used instead of web3 when given. A gate
+    built with only ``checker`` answers is_vetted False (fail closed).
     """
 
     def __init__(self, runtime: Any = None, *,
-                 checker: Optional[Callable[[str], bool]] = None) -> None:
+                 checker: Optional[Callable[[str], bool]] = None,
+                 vetted_checker: Optional[Callable[[str], bool]] = None) -> None:
         self._runtime = runtime
         self._checker = checker
+        self._vetted_checker = vetted_checker
         self._cache: dict[str, tuple[bool, float, str]] = {}
+        self._vetted_cache: dict[str, tuple[bool, float, str]] = {}
         self._address: Optional[str] = None
         self._rpc_url: Optional[str] = None
 
@@ -89,44 +98,59 @@ class ToolBondGate:
         return self._address or "", self._rpc_url or ""
 
     def configured(self) -> bool:
-        return bool(self._checker) or bool(self._resolve_target()[0])
+        return (bool(self._checker) or bool(self._vetted_checker)
+                or bool(self._resolve_target()[0]))
 
     # -- query ---------------------------------------------------------
-    def _query(self, digest: str) -> bool:
-        if self._checker is not None:
-            return bool(self._checker(digest))
+    def _query(self, digest: str, fn: str = "isBonded") -> bool:
+        checker = self._checker if fn == "isBonded" else self._vetted_checker
+        if checker is not None:
+            return bool(checker(digest))
+        if self._checker is not None or self._vetted_checker is not None:
+            return False  # test transport without this answer: fail closed
         addr, rpc = self._resolve_target()
         from web3 import Web3
         w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": _RPC_TIMEOUT_S}))
         c = w3.eth.contract(address=Web3.to_checksum_address(addr),
                             abi=TOOL_BOND_ABI)
-        return bool(c.functions.isBonded(bytes.fromhex(digest)).call())
+        return bool(getattr(c.functions, fn)(bytes.fromhex(digest)).call())
 
-    async def is_bonded(self, digest: str) -> tuple[bool, str]:
+    async def _ask(self, digest: str, fn: str,
+                   cache: dict[str, tuple[bool, float, str]]) -> tuple[bool, str]:
+        word = "bonded" if fn == "isBonded" else "vetted"
         digest = str(digest or "").lower().removeprefix("0x")
         if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             return False, "malformed manifest digest"
-        if self._checker is None and dev_override():
-            log.warning("ToolBond DEV OVERRIDE: treating %s as bonded "
+        if (self._checker is None and self._vetted_checker is None
+                and dev_override()):
+            log.warning("ToolBond DEV OVERRIDE: treating %s as %s "
                         "(%s=1; never set this outside local testing)",
-                        digest[:16], DEV_OVERRIDE_ENV)
+                        digest[:16], word, DEV_OVERRIDE_ENV)
             return True, "dev override"
         now = time.monotonic()
-        hit = self._cache.get(digest)
+        hit = cache.get(digest)
         if hit is not None and hit[1] > now:
             return hit[0], f"{hit[2]} (cached)"
         if not self.configured():
             return False, ("no ToolBond address configured (registry key "
-                           "'tool_bond'); core replacement fails closed")
+                           "'tool_bond'); fails closed")
         try:
-            bonded = await asyncio.to_thread(self._query, digest)
-            reason = "bonded" if bonded else "not bonded on ToolBond"
+            ok = await asyncio.to_thread(self._query, digest, fn)
+            reason = word if ok else f"not {word} on ToolBond"
         except Exception as exc:  # noqa: BLE001 — fail closed
-            log.warning("ToolBond isBonded(%s) failed: %s", digest[:16], exc)
-            bonded, reason = False, f"ToolBond query failed: {exc}"
-        ttl = _POSITIVE_TTL_S if bonded else _NEGATIVE_TTL_S
-        self._cache[digest] = (bonded, now + ttl, reason)
-        return bonded, reason
+            log.warning("ToolBond %s(%s) failed: %s", fn, digest[:16], exc)
+            ok, reason = False, f"ToolBond query failed: {exc}"
+        ttl = _POSITIVE_TTL_S if ok else _NEGATIVE_TTL_S
+        cache[digest] = (ok, now + ttl, reason)
+        return ok, reason
+
+    async def is_bonded(self, digest: str) -> tuple[bool, str]:
+        return await self._ask(digest, "isBonded", self._cache)
+
+    async def is_vetted(self, digest: str) -> tuple[bool, str]:
+        """``ToolBond.isVetted``: bonded AND found clean by a finalized
+        round with no malware verdict pending. What nodes run by default."""
+        return await self._ask(digest, "isVetted", self._vetted_cache)
 
 
 def gate_for(runtime: Any) -> ToolBondGate:
