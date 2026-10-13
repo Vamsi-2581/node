@@ -46,6 +46,10 @@ class BlockchainConfig:
     # vetted tools + their auditors from its logs, pinned to the previous
     # anchor. Empty => no auditor shares (seeded from registry.json).
     tool_bond_address: str = ""
+    # The jurisdiction's RepToken (Decision 2026-07-10): the close weights
+    # reviews and voice by REP read from it, pinned to the previous anchor.
+    # Empty => genesis regime (no REP weighting). Seeded from registry.json.
+    rep_token_address: str = ""
 
 
 @dataclass
@@ -253,6 +257,7 @@ def _apply_env_overrides(raw: dict) -> dict:
         "AUTONET_PRIVATE_KEY": ("blockchain.private_key", str),
         "AUTONET_SUBSTRATE_ADDRESS": ("blockchain.substrate_address", str),
         "AUTONET_TOOL_BOND_ADDRESS": ("blockchain.tool_bond_address", str),
+        "AUTONET_REP_TOKEN_ADDRESS": ("blockchain.rep_token_address", str),
         "AUTONET_BLOB_DIR": ("blob_store.data_dir", str),
         "AUTONET_DATA_DIR": ("data_dir", str),
         "AUTONET_LOG_LEVEL": ("log_level", str),
@@ -378,6 +383,9 @@ def load_config(path: Optional[str] = None) -> AutonetConfig:
     if not cfg.blockchain.tool_bond_address:
         cfg.blockchain.tool_bond_address = _registry_substrate_address(
             path, key="tool_bond")
+    if not cfg.blockchain.rep_token_address:
+        cfg.blockchain.rep_token_address = _registry_substrate_address(
+            path, key="rep_token")
 
     logger.info(
         f"Config: device={cfg.device}, arch={cfg.model.architecture}, "

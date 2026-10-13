@@ -804,9 +804,17 @@ class AutonetBridge:
                 self._autonet_config.blockchain.chain_id = self.config.chain_id
             if self.config.private_key:
                 self._autonet_config.blockchain.private_key = self.config.private_key
-            if (getattr(self.config, "substrate_address", "")
-                    and not self._autonet_config.blockchain.substrate_address):
-                self._autonet_config.blockchain.substrate_address =                     self.config.substrate_address
+            # Contract addresses: the atn side resolved them at join (packaged
+            # registry, ATN_REGISTRY_URL or a launched jurisdiction's DAO
+            # Registry), so its values win over the node's packaged seed.
+            # rep_token must reach the close or every review weighs the same.
+            bc = self._autonet_config.blockchain
+            for atn_key, node_key in (("substrate_address", "substrate_address"),
+                                      ("rep_token_address", "rep_token_address"),
+                                      ("tool_bond_address", "tool_bond_address")):
+                value = getattr(self.config, atn_key, "") or ""
+                if value:
+                    setattr(bc, node_key, value)
 
             # Create the service. Note: AutonetService.start() blocks,
             # so we create here and start in an executor below. We wire

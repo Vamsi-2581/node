@@ -35,3 +35,15 @@ def test_repo_root_registry_matches_packaged_copy():
     root = json.loads((REPO / "registry.json").read_text(encoding="utf-8"))
     packaged = json.loads((REPO / "atn" / "registry.json").read_text(encoding="utf-8"))
     assert root == packaged
+
+
+def test_rep_token_reaches_the_close_config(tmp_path):
+    # Without it the close runs in the genesis regime: every review weighs
+    # the same and voice weights are all epsilon.
+    from nodes.common.config import load_config
+    data = json.loads((REPO / "atn" / "registry.json").read_text(encoding="utf-8"))
+    rep = next(e["contracts"]["rep_token"] for e in data["jurisdictions"].values()
+               if e.get("contracts", {}).get("rep_token"))
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("", encoding="utf-8")
+    assert load_config(str(config_path)).blockchain.rep_token_address == rep
