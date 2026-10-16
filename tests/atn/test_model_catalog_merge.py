@@ -2,7 +2,8 @@
 
 Covers ProviderManager._fetch_provider_catalog / _merged_provider_models /
 get_available_models:
-  - union by id (curated entries keep order/metadata; fetched-only appended)
+  - a fetched catalog is authoritative; curated is the offline fallback
+  - claude_max lists through the subscription OAuth token
   - fallback to curated on fetch failure (no key, network error, non-200)
   - OpenAI noise filtering (embeddings/whisper/tts/... dropped)
   - new curated additions (claude-sonnet-5) present in both catalogs
@@ -26,6 +27,7 @@ def _make_manager() -> ProviderManager:
         events=MagicMock(),
     )
     mgr._resolve_api_key = MagicMock(return_value="")
+    mgr._claude_oauth_token = MagicMock(return_value="")
     return mgr
 
 
@@ -60,22 +62,18 @@ def test_openai_chat_capable_filter():
 # Merge semantics
 # ---------------------------------------------------------------------------
 
-def test_merge_union_appends_fetched_only():
+def test_fetched_catalog_is_authoritative():
     mgr = _make_manager()
-    curated_ids = [m["id"] for m in _PROVIDER_MODELS["anthropic"]]
-    # Cache a fetch result: one already-curated id + one brand-new id.
     mgr._catalog_cache["anthropic"] = [
-        {"id": curated_ids[0], "name": "SHOULD NOT OVERRIDE"},
-        {"id": "claude-future-9", "name": "claude-future-9"},
+        {"id": "claude-future-9", "name": "Claude Future 9"},
+        {"id": "claude-opus-4-8", "name": "Claude Opus 4.8"},
     ]
     merged = mgr._merged_provider_models("anthropic")
-    merged_ids = [m["id"] for m in merged]
-    # Curated entries keep their order + metadata (name not overridden).
-    assert merged_ids[: len(curated_ids)] == curated_ids
-    assert merged[0]["name"] != "SHOULD NOT OVERRIDE"
-    # Fetched-only id is appended once.
-    assert merged_ids.count("claude-future-9") == 1
-    assert merged_ids[-1] == "claude-future-9"
+    # Provider order and names; curated-only (retired) ids drop out.
+    assert merged == [
+        {"id": "claude-future-9", "name": "Claude Future 9"},
+        {"id": "claude-opus-4-8", "name": "Claude Opus 4.8"},
+    ]
 
 
 def test_merge_no_cache_returns_curated():
@@ -111,8 +109,43 @@ async def test_fetch_no_key_returns_empty():
 async def test_fetch_non_catalog_provider_returns_empty():
     mgr = _make_manager()
     mgr._resolve_api_key = MagicMock(return_value="sk-test")
-    out = await mgr._fetch_provider_catalog("claude_max")
+    out = await mgr._fetch_provider_catalog("codex_max")
     assert out == []
+
+
+@pytest.mark.asyncio
+async def test_claude_max_lists_with_oauth_token(monkeypatch):
+    mgr = _make_manager()
+    mgr._claude_oauth_token = MagicMock(return_value="oauth-tok")
+
+    import httpx
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"data": [
+                {"id": "claude-opus-9", "display_name": "Claude Opus 9"},
+            ]}
+
+    class _OkClient:
+        def __init__(self, *a, **k):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def get(self, url, **k):
+            seen.update(k["headers"])
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _OkClient)
+    out = await mgr._fetch_provider_catalog("claude_max")
+    assert out == [{"id": "claude-opus-9", "name": "Claude Opus 9"}]
+    assert seen["Authorization"] == "Bearer oauth-tok"
+    assert "oauth" in seen["anthropic-beta"]
+    ids = [m["id"] for m in mgr.get_available_models("claude_max")]
+    assert ids == ["claude-opus-9"]
 
 
 @pytest.mark.asyncio

@@ -126,6 +126,7 @@ class Runtime:
         self._connector_reaper: asyncio.Task | None = None
         # Bridge npm-dependency updater loop (providers.bridge_auto_update).
         self._bridge_update_task: asyncio.Task | None = None
+        self._model_catalog_task: asyncio.Task | None = None
         # ToolBond flag keeper (atn/tool_flags.py): reveal/settle/finalize/
         # claim for this daemon's auditor flags. None until start().
         self._tool_flag_keeper: asyncio.Task | None = None
@@ -731,6 +732,10 @@ class Runtime:
         if os.environ.get("ATN_DISABLE_PROVIDER_AUTODETECT", "").strip() != "1":
             self._bridge_update_task = asyncio.create_task(
                 self.providers.bridge_update_loop())
+            # Live model catalogs, so agent model pickers (fed by the
+            # snapshot) list new releases without opening provider settings.
+            self._model_catalog_task = asyncio.create_task(
+                self.providers.model_catalog_loop())
 
         # Auditor flags walk their ToolBond rounds in the background (reveal
         # once the REP threshold is met, settle, finalize, claim). Off under
@@ -896,6 +901,14 @@ class Runtime:
             except (asyncio.CancelledError, Exception):  # noqa: B014
                 pass
             self._bridge_update_task = None
+
+        if self._model_catalog_task is not None:
+            self._model_catalog_task.cancel()
+            try:
+                await self._model_catalog_task
+            except (asyncio.CancelledError, Exception):  # noqa: B014
+                pass
+            self._model_catalog_task = None
 
         if self._tool_flag_keeper is not None:
             self._tool_flag_keeper.cancel()

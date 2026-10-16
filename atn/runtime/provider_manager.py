@@ -1705,9 +1705,29 @@ class ProviderManager:
     # Live model-catalog fetch (anthropic / openai / gemini)
     # ------------------------------------------------------------------
 
-    # Providers whose catalog we fetch live. claude_max / codex_max are curated
-    # only (no catalog API); ollama has its own /api/tags probe.
-    _CATALOG_PROVIDERS = ("anthropic", "openai", "gemini")
+    # Providers whose catalog we fetch live. claude_max lists through the
+    # subscription's OAuth token; codex_max is curated only (no catalog API);
+    # ollama has its own /api/tags probe.
+    _CATALOG_PROVIDERS = ("anthropic", "claude_max", "openai", "gemini")
+
+    @staticmethod
+    def _claude_oauth_token() -> str:
+        """The Claude subscription's OAuth access token: the env var the
+        Agent SDK honours, else the Claude Code credentials file. "" if none."""
+        tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        if tok:
+            return tok
+        try:
+            path = Path.home() / ".claude" / ".credentials.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return str((data.get("claudeAiOauth") or {}).get("accessToken") or "")
+        except Exception:  # noqa: BLE001 — no subscription login → curated only
+            return ""
+
+    def _catalog_credential(self, provider_id: str) -> str:
+        if provider_id == "claude_max":
+            return self._claude_oauth_token()
+        return self._resolve_api_key(provider_id)
 
     @staticmethod
     def _openai_chat_capable(model_id: str) -> bool:
@@ -1741,28 +1761,40 @@ class ProviderManager:
         if cached is not None and (now - self._catalog_cache_ts.get(provider_id, 0.0)) < self._catalog_ttl:
             return cached
 
-        api_key = self._resolve_api_key(provider_id)
+        api_key = self._catalog_credential(provider_id)
         if not api_key:
             return []
 
         import httpx
         try:
             ids: list[str] = []
+            names: dict[str, str] = {}
             # 5s, not 15: this primes the provider-card UI; a slow catalog
             # endpoint must not stall the first provider_list open.
             async with httpx.AsyncClient(timeout=5) as client:
-                if provider_id == "anthropic":
-                    resp = await client.get(
-                        "https://api.anthropic.com/v1/models",
-                        headers={
+                if provider_id in ("anthropic", "claude_max"):
+                    if provider_id == "claude_max":
+                        headers = {
+                            "Authorization": f"Bearer {api_key}",
+                            "anthropic-version": "2023-06-01",
+                            "anthropic-beta": "oauth-2025-04-20",
+                        }
+                    else:
+                        headers = {
                             "x-api-key": api_key,
                             "anthropic-version": "2023-06-01",
-                        },
+                        }
+                    resp = await client.get(
+                        "https://api.anthropic.com/v1/models",
+                        params={"limit": 1000},
+                        headers=headers,
                     )
                     if resp.status_code != 200:
                         return self._catalog_cache.get(provider_id, [])
                     data = resp.json().get("data", [])
                     ids = [m.get("id", "") for m in data if m.get("id")]
+                    names = {m["id"]: m["display_name"] for m in data
+                             if m.get("id") and m.get("display_name")}
                 elif provider_id == "openai":
                     resp = await client.get(
                         "https://api.openai.com/v1/models",
@@ -1792,7 +1824,8 @@ class ProviderManager:
                         mid = mid.split("/", 1)[1] if mid.startswith("models/") else mid
                         if mid.startswith("gemini-"):
                             ids.append(mid)
-            catalog = [{"id": mid, "name": mid} for mid in dict.fromkeys(ids)]
+            catalog = [{"id": mid, "name": names.get(mid, mid)}
+                       for mid in dict.fromkeys(ids)]
             self._catalog_cache[provider_id] = catalog
             self._catalog_cache_ts[provider_id] = now
             return catalog
@@ -1808,26 +1841,30 @@ class ProviderManager:
         import asyncio as _asyncio
         tasks = []
         for pid in self._CATALOG_PROVIDERS:
-            if self._resolve_api_key(pid):
+            if self._catalog_credential(pid):
                 tasks.append(self._fetch_provider_catalog(pid))
         if tasks:
             await _asyncio.gather(*tasks, return_exceptions=True)
 
+    async def model_catalog_loop(self) -> None:
+        """Keep the live catalogs warm so model pickers that read the
+        snapshot (not provider_list) see newly released models."""
+        import asyncio as _asyncio
+        while True:
+            try:
+                await self.refresh_model_catalogs()
+            except Exception:  # noqa: BLE001 — best-effort
+                log.debug("model catalog refresh failed", exc_info=True)
+            await _asyncio.sleep(self._catalog_ttl)
+
     def _merged_provider_models(self, provider_id: str) -> list[dict[str, str]]:
-        """Curated list for ``provider_id`` unioned with any cached live-fetch
-        ids. Curated entries keep their order/metadata; fetched-only ids are
-        appended with the id as the display name. No cache → curated only."""
-        curated = list(_PROVIDER_MODELS.get(provider_id, []))
+        """The provider's live catalog when one has been fetched (it is the
+        authority: new releases appear, retired ids drop), else the curated
+        list as the offline fallback."""
         fetched = self._catalog_cache.get(provider_id)
-        if not fetched:
-            return curated
-        seen = {e["id"] for e in curated}
-        merged = list(curated)
-        for e in fetched:
-            if e["id"] not in seen:
-                merged.append({"id": e["id"], "name": e.get("name", e["id"])})
-                seen.add(e["id"])
-        return merged
+        if fetched:
+            return [{"id": e["id"], "name": e.get("name", e["id"])} for e in fetched]
+        return list(_PROVIDER_MODELS.get(provider_id, []))
 
     # ------------------------------------------------------------------
     # Bridge dependency install + auto-update (atn/providers/bridge_updater.py)
