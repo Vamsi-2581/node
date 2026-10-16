@@ -51,6 +51,7 @@ interface ISubstrate {
     function payForService(address recipient, uint256 amount, bytes32 requestId)
         external
         returns (bool);
+    function governor() external view returns (address);
 }
 
 // =============================================================================
@@ -224,8 +225,11 @@ contract PaymentChannel is ReentrancyGuard, EIP712 {
     ISubstrate public immutable substrate;
 
     /// @notice Seconds after close before the client's remainder can be
-    ///         withdrawn.
-    uint256 public immutable challengeWindow;
+    ///         withdrawn, for channels opened from now on. Governed: the
+    ///         Substrate's governor (the DAO timelock) sets it. Each channel
+    ///         keeps the window it opened with, so a change never moves an
+    ///         open channel's deadline.
+    uint256 public challengeWindow;
 
     enum Status { None, Open, Closing, Settled }
 
@@ -236,6 +240,7 @@ contract PaymentChannel is ReentrancyGuard, EIP712 {
         uint256 claimed;       // cumulative paid to provider at close (gross)
         uint256 closesAt;      // timestamp remainder becomes withdrawable
         Status status;
+        uint256 window;        // challengeWindow when the channel opened
     }
 
     uint256 public channelCount;
@@ -258,6 +263,7 @@ contract PaymentChannel is ReentrancyGuard, EIP712 {
         uint256 closesAt
     );
     event RemainderWithdrawn(uint256 indexed channelId, address indexed client, uint256 amount);
+    event ChallengeWindowSet(uint256 previous, uint256 current);
 
     error ProviderRequired();
     error ZeroDeposit();
@@ -267,6 +273,8 @@ contract PaymentChannel is ReentrancyGuard, EIP712 {
     error BadVoucherSignature();
     error WindowNotElapsed();
     error DepositTransferFailed();
+    error NotGovernor();
+    error ZeroWindow();
 
     constructor(address substrateAddr, uint256 challengeWindow_)
         EIP712("AutonetPaymentChannel", "1")
@@ -275,6 +283,15 @@ contract PaymentChannel is ReentrancyGuard, EIP712 {
         require(challengeWindow_ > 0, "window=0");
         substrate = ISubstrate(substrateAddr);
         challengeWindow = challengeWindow_;
+    }
+
+    /// @notice Set the challenge window for channels opened from now on.
+    ///         Only the Substrate's governor (the DAO timelock).
+    function setChallengeWindow(uint256 newWindow) external {
+        if (msg.sender != substrate.governor()) revert NotGovernor();
+        if (newWindow == 0) revert ZeroWindow();
+        emit ChallengeWindowSet(challengeWindow, newWindow);
+        challengeWindow = newWindow;
     }
 
     /// @notice Client opens a unidirectional channel to a provider, escrowing
@@ -292,7 +309,8 @@ contract PaymentChannel is ReentrancyGuard, EIP712 {
             deposit: deposit,
             claimed: 0,
             closesAt: 0,
-            status: Status.Open
+            status: Status.Open,
+            window: challengeWindow
         });
         // Substrate reverts on insufficient allowance/balance; the bool is
         // defensive (it never returns false).
@@ -336,7 +354,7 @@ contract PaymentChannel is ReentrancyGuard, EIP712 {
         uint256 pay = cumulativeAmount > c.deposit ? c.deposit : cumulativeAmount;
         c.claimed = pay;
         c.status = Status.Closing;
-        c.closesAt = block.timestamp + challengeWindow;
+        c.closesAt = block.timestamp + c.window;
 
         uint256 remainder = c.deposit - pay;
         // Provider is paid immediately at close (it produced a valid voucher).

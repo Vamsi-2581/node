@@ -491,6 +491,7 @@ PAYMENT_CHANNEL_ABI = [
             {"internalType": "uint256", "name": "claimed",  "type": "uint256"},
             {"internalType": "uint256", "name": "closesAt", "type": "uint256"},
             {"internalType": "uint8",   "name": "status",   "type": "uint8"},
+            {"internalType": "uint256", "name": "window",   "type": "uint256"},
         ],
         "stateMutability": "view",
         "type": "function",
@@ -507,6 +508,7 @@ PAYMENT_CHANNEL_ABI = [
                     {"internalType": "uint256", "name": "claimed",  "type": "uint256"},
                     {"internalType": "uint256", "name": "closesAt", "type": "uint256"},
                     {"internalType": "uint8",   "name": "status",   "type": "uint8"},
+                    {"internalType": "uint256", "name": "window",   "type": "uint256"},
                 ],
                 "internalType": "struct PaymentChannel.Channel",
                 "name": "",
@@ -2108,7 +2110,7 @@ class ServiceMarketClient:
 
             channel = self._channel_contract(w3)
             ch = channel.functions.getChannel(int(channel_id)).call()
-            client, provider, deposit, claimed, closes_at, status = ch
+            client, provider, deposit, claimed, closes_at, status = ch[:6]
             result.update({
                 "client": Web3.to_checksum_address(client),
                 "provider": Web3.to_checksum_address(provider),
@@ -2204,14 +2206,14 @@ class ServiceMarketClient:
 
         Returns None if the channel doesn't exist (status == 0 / None) or on
         a read failure. Fields: ``{channel_id, client, provider, deposit,
-        claimed, closes_at, status}`` (status: 0 None, 1 Open, 2 Closing,
+        claimed, closes_at, status, window}`` (status: 0 None, 1 Open, 2 Closing,
         3 Settled).
         """
         try:
             w3 = self._get_web3()
             channel = self._channel_contract(w3)
             ch = channel.functions.getChannel(int(channel_id)).call()
-            client, provider, deposit, claimed, closes_at, status = ch
+            client, provider, deposit, claimed, closes_at, status = ch[:6]
             if int(status) == 0:
                 return None
             return {
@@ -2222,6 +2224,8 @@ class ServiceMarketClient:
                 "claimed": str(claimed),
                 "closes_at": int(closes_at),
                 "status": int(status),
+                # The challenge window this channel opened with (governed).
+                "window": int(ch[6]) if len(ch) > 6 else None,
             }
         except Exception as e:
             log.debug("get_channel(%s) failed: %s", channel_id, e)

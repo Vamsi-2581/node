@@ -7,6 +7,7 @@ const {
   registerAgent,
   signVoucher,
   fundATN,
+  SLOT_GOVERNOR,
 } = require("./helpers");
 
 const CHALLENGE_WINDOW = 3600;
@@ -62,6 +63,33 @@ describe("PaymentChannel (v1.5 prepaid credits, ATN-only + fee at settlement)", 
     await expect(
       channel.connect(client).openChannel(provider.address, 0n)
     ).to.be.revertedWithCustomError(channel, "ZeroDeposit");
+  });
+
+  it("governor sets the challenge window; open channels keep theirs", async function () {
+    const governor = (await ethers.getSigners())[SLOT_GOVERNOR];
+    expect(await substrate.governor()).to.equal(governor.address);
+    const oldId = await openChannel(1000n);
+
+    await expect(channel.connect(other).setChallengeWindow(60))
+      .to.be.revertedWithCustomError(channel, "NotGovernor");
+    await expect(channel.connect(governor).setChallengeWindow(0))
+      .to.be.revertedWithCustomError(channel, "ZeroWindow");
+    await expect(channel.connect(governor).setChallengeWindow(60))
+      .to.emit(channel, "ChallengeWindowSet").withArgs(CHALLENGE_WINDOW, 60);
+    expect(await channel.challengeWindow()).to.equal(60n);
+
+    const newId = await openChannel(1000n);
+    const t0 = BigInt(await time.latest());
+    await channel.connect(provider).closeChannel(
+      oldId, 0n, await signVoucher(channel, client, oldId, 0n));
+    await channel.connect(provider).closeChannel(
+      newId, 0n, await signVoucher(channel, client, newId, 0n));
+    const oldCh = await channel.getChannel(oldId);
+    const newCh = await channel.getChannel(newId);
+    expect(oldCh.window).to.equal(BigInt(CHALLENGE_WINDOW));
+    expect(newCh.window).to.equal(60n);
+    expect(oldCh.closesAt - t0).to.be.gte(BigInt(CHALLENGE_WINDOW));
+    expect(newCh.closesAt - t0).to.be.lte(70n);
   });
 
   it("constructor rejects zero substrate", async function () {

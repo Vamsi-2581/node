@@ -412,7 +412,10 @@ The postpaid escrow was deleted (2026-07-04), so its griefing/dispute
 rules are moot: the channel's griefing analysis lives inline in
 `PaymentChannel` (`contracts/core/ServiceMarket.sol`). Remaining knobs:
 
-1. Channel challenge-window sizing (the `challengeWindow` constructor
-   arg: the settle-delay before a client's remainder refund).
+1. Channel challenge-window sizing: the settle-delay before a client's
+   remainder refund. Governed since 2026-10-16: the constructor sets the
+   initial value and the DAO timelock (the Substrate's governor) changes
+   it with `setChallengeWindow`. Each channel records the window it
+   opened with, so a change never moves an open channel's deadline.
 2. Whether reviews live as chain events (costly, permanent) or gossip
    + indexer (cheap, replayable): lean gossip.

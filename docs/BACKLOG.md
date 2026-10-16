@@ -126,7 +126,9 @@ Recursive Principial Body") now serving both app whitepaper surfaces.
    defense against covert harm (see sybil trade above). Note the
    tool-economy sim memo is quarantined (models v2 mint); re-run the
    sweep against usage-only mint before citing absolute numbers.
-4. Channel challengeWindow (E2E uses 3600s).
+4. Channel challengeWindow (E2E uses 3600s). Governed since 2026-10-16
+   (setChallengeWindow by the DAO timelock), so the launch value is a
+   starting point the DAO can change.
 5. ~~Push master to origin~~: DONE 2026-07-08 (no tag, no release).
    atn_web commits remain local-only.
 6. CLAUDE.md is gitignored, so the machine-onboarding contract doesn't
