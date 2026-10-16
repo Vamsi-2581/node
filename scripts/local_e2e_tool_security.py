@@ -4,7 +4,8 @@
 docs/tool_substrate.md, "Decision (2026-10-13): staked tools, flagged
 audits, REP-settled verdicts". Stands up a LOCAL hardhat node with the
 autonet Substrate plus the jurisdiction contracts the rail needs (RepToken
-with slasher rights, ToolBond v2, an appeal-window economy stub), then
+with slasher rights, ToolBond v2 (appeal window = one proposal lifecycle
++ 2 days; the governor and timelock here are EOAs, so 2 days)), then
 drives the DAEMON code paths against them:
 
   - publish: ``register_tool`` + ``publish_tool`` -> ``publish_with_stake``
@@ -60,27 +61,19 @@ HH_GENESIS_PK = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d40
 
 E18 = 10 ** 18
 MIN_STAKE = 1000 * E18
-APPEAL_S = 30
+APPEAL_S = 2 * 86400  # ProposalLifecycle floor with EOA governor/timelock
 PARAMS = {  # ToolBond.Params, short windows for a local run
     "minStake": MIN_STAKE, "thresholdBps": 8000, "reviewWindow": 120,
     "revealWindow": 30, "finderBps": 5000, "degradeBps": 1000,
     "authorSlashBps": 10_000, "unbondDelay": 120, "auditorShareBps": 4000,
+    "appealPeriod": 0,
 }
 SERVICE_FEE_BPS = 250  # Substrate default
 
 REP_GRANTS = {"author-1": 100, "aud-1": 300, "aud-2": 200, "aud-3": 100}
 
-DAO_SOURCES = ["ToolBond.sol", "IGovernedEconomy.sol", "RepToken.sol",
+DAO_SOURCES = ["ToolBond.sol", "ProposalLifecycle.sol", "RepToken.sol",
                "Registry.sol", "IAdminToken.sol", "IJurisdictionData.sol"]
-
-ECONOMY_STUB = """// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
-/// Local e2e stand-in for the jurisdiction Economy: ToolBond reads only this.
-contract EconomyStub {
-    uint256 public effectiveAppealPeriod;
-    constructor(uint256 p) { effectiveAppealPeriod = p; }
-}
-"""
 
 HARDHAT_CONFIG = """module.exports = {
   solidity: { version: "0.8.26", settings: { evmVersion: "cancun",
@@ -177,7 +170,6 @@ def build_scratch_project() -> Path:
     for name in DAO_SOURCES:
         shutil.copy2(DAO_DIR / "contracts" / name, src / name)
     shutil.copy2(REPO / "contracts" / "core" / "Substrate.sol", src / "Substrate.sol")
-    (src / "EconomyStub.sol").write_text(ECONOMY_STUB, encoding="utf-8")
     (SCRATCH / "hardhat.config.js").write_text(HARDHAT_CONFIG, encoding="utf-8")
     pkg = SCRATCH / "package.json"
     if not pkg.exists():
@@ -392,9 +384,8 @@ async def amain() -> int:
                                       [], [], False])
         substrate = deploy(w3, "Substrate", [treasury, deployer, "0x" + "00" * 20,
                                              rep.address, 5000, [genesis], 1])
-        economy = deploy(w3, "EconomyStub", [APPEAL_S])
         bond = deploy(w3, "ToolBond", [substrate.address, rep.address,
-                                       economy.address, timelock,
+                                       deployer, timelock,
                                        tuple(PARAMS.values())])
         send(w3, rep.functions.setSlasher(bond.address, True), HH_DEPLOYER_PK)
         addrs = {"substrate": substrate.address, "rep": rep.address,
@@ -402,7 +393,7 @@ async def amain() -> int:
         os.environ["ATN_TOOL_BOND_ADDRESS"] = bond.address
         check(rep.functions.slashers(bond.address).call(), "ToolBond is a RepToken slasher")
         check(bond.functions.appealWindow().call() == APPEAL_S,
-              f"ToolBond appeal window reads the economy ({APPEAL_S}s)")
+              f"ToolBond appeal window = lifecycle floor ({APPEAL_S}s)")
         check(bond.functions.auditorShareBps().call() == 4000, "auditorShareBps = 4000")
         for k, v in addrs.items():
             s1.note(k, v)
