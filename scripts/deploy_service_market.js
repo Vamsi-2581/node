@@ -1,8 +1,7 @@
 /**
  * Deploy the ServiceMarket rail (ServiceRegistry + PaymentChannel) around a
  * deployed Substrate. Separate from deploy_economy.js because the flag-day
- * rotation KEEPS the existing CharterAnchor (charter content unchanged) and
- * only needs the two market contracts on the new Substrate ABI.
+ * rotation only needs the two market contracts on the new Substrate ABI.
  *
  *   ServiceRegistry(substrate)
  *   PaymentChannel(substrate, challengeWindow)   // 2-arg, ATN-only build

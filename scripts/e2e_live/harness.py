@@ -11,7 +11,7 @@ One command up, one down, one status:
 ``<state dir>/state.json``:
 
   1. a hardhat node on 127.0.0.1:E2E_LIVE_RPC_PORT (default 18545, chain 1337)
-     with Substrate, ServiceRegistry, PaymentChannel, CharterAnchor and
+     with Substrate, ServiceRegistry, PaymentChannel and
      VentureVaultFactory deployed from the compiled artifacts (web3.py, signed
      by hardhat account 0 — no ``hardhat run``, no deployments/*.json written);
   2. the deterministic stub (``stub_server.py``) on E2E_LIVE_STUB_PORT (default
@@ -58,6 +58,7 @@ for p in (str(REPO), str(HERE.parent)):
 # Reuse the cross-daemon E2E's proven pieces (isolated config writer, home
 # redirect env, the WS client, owner-bound registration) rather than fork them.
 import local_e2e_cross_daemon_inference as xd  # noqa: E402
+from nodes.common.world_model_substrate.charter_version import charter_hash  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -325,8 +326,6 @@ def deploy(w3) -> Dict[str, str]:
         "substrate": sub,
         "service_registry": _deploy("ServiceRegistry", "ServiceMarket", sub),
         "payment_channel": _deploy("PaymentChannel", "ServiceMarket", sub, 3600),
-        "charter_anchor": _deploy("CharterAnchor", "CharterAnchor", acct.address,
-                                  bytes(32), ""),
         "venture_vault_factory": _deploy("VentureVaultFactory", "VentureVault",
                                          sub),
     }
@@ -349,7 +348,7 @@ def write_registry(contracts: Dict[str, str]) -> Path:
                 "substrate": contracts["substrate"],
                 "service_registry": contracts["service_registry"],
                 "payment_channel": contracts["payment_channel"],
-                "charter_anchor": contracts["charter_anchor"],
+                "charter": "0x" + charter_hash(),
             },
         }},
     }, indent=2), encoding="utf-8")
@@ -395,7 +394,7 @@ def daemon_config(contracts: Dict[str, str]) -> Dict[str, Any]:
             "substrate_address": contracts["substrate"],
             "service_registry_address": contracts["service_registry"],
             "payment_channel_address": contracts["payment_channel"],
-            "charter_anchor_address": contracts["charter_anchor"],
+            "charter_hash": "0x" + charter_hash(),
         },
         "voice": {"enabled": False},
         "auto_update": {"enabled": False},

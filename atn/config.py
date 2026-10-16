@@ -246,10 +246,13 @@ class RPBConfig:
                                         # from its ERC20Votes checkpoints, pinned to
                                         # the prev anchor timestamp (Decision
                                         # 2026-07-10). Empty => genesis regime.
-    charter_anchor_address: str = ""    # Optional: deployed CharterAnchor.sol
-                                        # address. When set, the daemon can
-                                        # compare its local charter_hash against
-                                        # the anchored version and warn on drift.
+    charter_hash: str = ""              # The jurisdiction's governed charter
+                                        # version: registry key
+                                        # jurisdiction.<id>.charter (0x + sha256
+                                        # hex), changed by DAO proposal. The
+                                        # daemon compares its local charter_hash
+                                        # against it and warns on drift.
+    charter_uri: str = ""               # jurisdiction.<id>.charter_uri
     registry_address: str = ""          # Discovered from RepToken.registryAddress()
                                         # — the DAO governance Registry, populated
                                         # at runtime by _discover_jurisdiction().
@@ -528,8 +531,10 @@ def _parse_registry_data(data: dict[str, Any], jurisdiction_id: str) -> dict[str
         seed["substrate_address"] = contracts["substrate"]
     if contracts.get("rep_token"):
         seed["rep_token_address"] = contracts["rep_token"]
-    if contracts.get("charter_anchor"):
-        seed["charter_anchor_address"] = contracts["charter_anchor"]
+    if contracts.get("charter"):
+        seed["charter_hash"] = contracts["charter"]
+    if contracts.get("charter_uri"):
+        seed["charter_uri"] = contracts["charter_uri"]
     if contracts.get("service_registry"):
         # Populate the clearly-named field AND the legacy shared name, so
         # existing consumers of ``registry_address`` (the audit noted this
@@ -860,7 +865,8 @@ def _load_autonet_config(raw: dict[str, Any]) -> RPBConfig:
         rpb_contract_address=resolved.get("rpb_contract_address", ""),
         substrate_address=resolved.get("substrate_address", ""),
         rep_token_address=resolved.get("rep_token_address", ""),
-        charter_anchor_address=resolved.get("charter_anchor_address", ""),
+        charter_hash=resolved.get("charter_hash", ""),
+        charter_uri=resolved.get("charter_uri", ""),
         registry_address=resolved.get("registry_address", ""),
         service_registry_address=resolved.get("service_registry_address", ""),
         payment_channel_address=resolved.get("payment_channel_address", ""),

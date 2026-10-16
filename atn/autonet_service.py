@@ -86,6 +86,9 @@ class AutonetState:
     token_address: str = ""
     economy_address: str = ""
     timelock_address: str = ""
+    # Local charter vs the jurisdiction's governed charter (registry key
+    # jurisdiction.<id>.charter): True / False, None = none published.
+    charter_match: bool | None = None
     # Constitution CID loaded from registry
     constitution_cid: str = ""
     # Full constitution text (loaded from RPB.constitution() or local file)
@@ -130,6 +133,7 @@ class AutonetState:
             "token_address": self.token_address,
             "economy_address": self.economy_address,
             "timelock_address": self.timelock_address,
+            "charter_match": self.charter_match,
             "constitution_cid": self.constitution_cid,
             "constitution_text": self.constitution_text,
         }
@@ -277,6 +281,14 @@ class AutonetBridge:
         except Exception as e:
             log.warning("Failed to discover jurisdiction from %s: %s",
                         self.config.dao_address, e)
+        try:
+            from .on_chain import verify_charter
+            self.state.charter_match = verify_charter(
+                getattr(self.config, "charter_hash", ""),
+                getattr(self.config, "charter_uri", ""),
+            )["match"]
+        except Exception:
+            log.debug("charter check skipped", exc_info=True)
 
     # ------------------------------------------------------------------
     # P2P agent advertisement

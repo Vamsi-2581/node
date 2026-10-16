@@ -76,7 +76,6 @@ In a new terminal:
 ```bash
 npx hardhat run scripts/deploy_substrate.js       --network localhost   # Substrate.sol (core)
 npx hardhat run scripts/deploy_service_market.js  --network localhost   # ServiceMarket.sol
-npx hardhat run scripts/deploy_charter_anchor.js  --network localhost   # CharterAnchor.sol
 npx hardhat run scripts/deploy_economy.js         --network localhost   # economy wiring
 ```
 

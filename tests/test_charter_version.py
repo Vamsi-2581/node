@@ -5,7 +5,7 @@ Covers:
   - charter_hash determinism (same constant -> same hash; key order irrelevant)
   - charter_payload includes all 6 roots
   - the federated close authoritative payload carries charter_hash
-  - verify_charter_against_anchor against a fake on-chain reader (match / drift)
+  - verify_charter against the registry value (match / drift / none)
 """
 
 from __future__ import annotations
@@ -104,92 +104,40 @@ def test_close_payload_carries_charter_hash():
 
 
 # ---------------------------------------------------------------------------
-# verify_charter_against_anchor against a fake reader
+# verify_charter against the jurisdiction's registry value
 # ---------------------------------------------------------------------------
 
 
-class _FakeFunction:
-    def __init__(self, value):
-        self._value = value
-
-    def call(self):
-        if isinstance(self._value, Exception):
-            raise self._value
-        return self._value
-
-
-class _FakeFunctions:
-    def __init__(self, current):
-        self._current = current
-
-    def currentCharter(self):
-        return _FakeFunction(self._current)
-
-
-class _FakeContract:
-    def __init__(self, current):
-        self.functions = _FakeFunctions(current)
-
-
-class _FakeEth:
-    def __init__(self, current):
-        self._current = current
-
-    def contract(self, address=None, abi=None):
-        return _FakeContract(self._current)
-
-
-class _FakeW3:
-    """Minimal stand-in for a connected Web3 instance."""
-
-    def __init__(self, current):
-        self.eth = _FakeEth(current)
-
-
-def _bytes32_from_hex(hexstr: str) -> bytes:
-    return bytes.fromhex(hexstr)
-
-
-# A valid EIP-55 checksummed address (Web3.to_checksum_address accepts it).
-_ANCHOR_ADDR = "0x000000000000000000000000000000000000dEaD"
-
-
 def test_verify_match():
-    from atn.on_chain import verify_charter_against_anchor
+    from atn.on_chain import verify_charter
 
     local = charter_hash()
-    # currentCharter returns (version, hash, uri, prevHash, timestamp)
-    current = (3, _bytes32_from_hex(local), "ipfs://v3", b"\x00" * 32, 123)
-    w3 = _FakeW3(current)
-    out = verify_charter_against_anchor(w3, _ANCHOR_ADDR)
+    # Registry values are 0x-prefixed; case must not matter.
+    out = verify_charter("0x" + local.upper(), "sha256://v3")
     assert out["match"] is True
-    assert out["chain_version"] == 3
     assert out["local_hash"] == local
     assert out["chain_hash"] == local
+    assert out["uri"] == "sha256://v3"
 
 
 def test_verify_mismatch(caplog):
     import logging
 
-    from atn.on_chain import verify_charter_against_anchor
+    from atn.on_chain import verify_charter
 
     wrong = hashlib.sha256(b"a different charter").hexdigest()
-    current = (5, _bytes32_from_hex(wrong), "ipfs://v5", b"\x00" * 32, 999)
-    w3 = _FakeW3(current)
     with caplog.at_level(logging.WARNING):
-        out = verify_charter_against_anchor(w3, _ANCHOR_ADDR)
+        out = verify_charter("0x" + wrong)
     assert out["match"] is False
     assert out["chain_hash"] == wrong
     assert out["local_hash"] == charter_hash()
     assert any("CHARTER DIVERGENCE" in r.message for r in caplog.records)
 
 
-def test_verify_no_anchor():
-    from atn.on_chain import verify_charter_against_anchor
+def test_verify_no_charter_published():
+    from atn.on_chain import verify_charter
 
-    # A revert (NoCharter) surfaces as an exception from .call()
-    w3 = _FakeW3(RuntimeError("execution reverted: NoCharter"))
-    out = verify_charter_against_anchor(w3, _ANCHOR_ADDR)
+    out = verify_charter("")
     assert out["match"] is None
     assert out["chain_hash"] is None
     assert out["local_hash"] == charter_hash()

@@ -38,7 +38,8 @@ _SAMPLE = {
             "contracts": {
                 "dao": "0xDA0000000000000000000000000000000000dead",
                 "substrate": "0x5UB000000000000000000000000000000000beef",
-                "charter_anchor": "0xC4A000000000000000000000000000000000face",
+                "charter": "0x" + "ab" * 32,
+                "charter_uri": "sha256://charter-v1",
                 "service_registry": "0x5E4000000000000000000000000000000000cafe",
             },
         }
@@ -100,7 +101,8 @@ def test_seed_reads_packaged_copy(_isolate_registry):
     assert seed["chain_id"] == 424242
     assert seed["dao_address"] == "0xDA0000000000000000000000000000000000dead"
     assert seed["substrate_address"] == "0x5UB000000000000000000000000000000000beef"
-    assert seed["charter_anchor_address"] == "0xC4A000000000000000000000000000000000face"
+    assert seed["charter_hash"] == "0x" + "ab" * 32
+    assert seed["charter_uri"] == "sha256://charter-v1"
     assert seed["registry_address"] == "0x5E4000000000000000000000000000000000cafe"
     assert _isolate_registry["fetched"] == []
 

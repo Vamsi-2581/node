@@ -7,8 +7,7 @@ Quick reference for common operations.
 > task / commit-reveal / verification / dispute contract calls, the role
 > stake table, and the task-status flow) describes contracts **deleted in
 > Phase 5.6a** and is kept only for history. The live on-chain surface is
-> `Substrate.sol` + `ServiceMarket.sol` + `VentureVault.sol` +
-> `CharterAnchor.sol`; see `docs/tool_substrate.md` and `docs/README.md`.
+> `Substrate.sol` + `ServiceMarket.sol` + `VentureVault.sol`; see `docs/tool_substrate.md` and `docs/README.md`.
 
 ## Current Operations
 
@@ -26,7 +25,6 @@ In the console: `agents`, `run <id>`, `msg <id> <text>`, `activate <id>`,
 npx hardhat node                                                       # local chain :8545
 npx hardhat run scripts/deploy_substrate.js       --network localhost  # Substrate.sol
 npx hardhat run scripts/deploy_service_market.js  --network localhost  # ServiceMarket.sol
-npx hardhat run scripts/deploy_charter_anchor.js  --network localhost  # CharterAnchor.sol
 npx hardhat run scripts/deploy_economy.js         --network localhost  # economy wiring
 npx hardhat compile
 ```
@@ -50,7 +48,6 @@ python tests/test_world_model_substrate_e2e.py
 | `contracts/core/Substrate.sol` | Epoch anchoring, agent registry, money-only training records, ATN token, service payments |
 | `contracts/core/ServiceMarket.sol` | Remote-API market rail (registry + EIP-712 channels) |
 | `contracts/core/VentureVault.sol` | Agent-as-venture funding |
-| `contracts/core/CharterAnchor.sol` | Governed charter-version anchor |
 | `registry.json` | Network + contract addresses of record (jurisdiction resolution) |
 | `atn/cli.py` | Daemon CLI entry point (`atn`) |
 | `nodes/common/world_model_substrate/` | Substrate protocol layer (reconcile / mint, infer) |

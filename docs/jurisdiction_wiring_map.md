@@ -198,13 +198,12 @@ revenue share (`demoDividends.js:64,95-102`).
 
 ### B.1 Governance changing CORE VALUES (the 6-root charter)
 
-**BUILT since this survey.** The "design, not built" anchor below shipped as
-`contracts/core/CharterAnchor.sol`, a standalone governed anchor (NOT the
-Registry-key option this report leaned toward, and NOT a governed slot on
-Substrate.sol, which stays ungoverned). It is deployed on the live jurisdiction
-with charter v1 anchored on-chain (governor = the DAO timelock); the daemon
-verifies its local `charter_hash()` against `currentCharter()` and warns on
-drift. See `docs/charter_anchor.md`. The forward-only / migration-deferred
+**BUILT since this survey, as the Registry-key option this report leaned
+toward.** A short-lived standalone `CharterAnchor.sol` shipped first and was
+retired 2026-10-16: the charter version now lives in the DAO Registry keys
+`jurisdiction.<id>.charter` and `jurisdiction.<id>.charter_uri`, and the daemon
+verifies its local `charter_hash()` against the key and warns on drift. See
+`docs/charter_anchor.md`. The forward-only / migration-deferred
 reasoning below still holds. The rest is the historical design survey.
 
 **Where the charter lives today.** The charter axes are a Python constant in the
@@ -419,7 +418,7 @@ a code fact (see D).
 | CoinOffering router (mint-to-buyer, cash-to-treasury, saleCap goal) | `CoinOffering.sol` (whole) | The boats raise; vault generalizes it (tranches instead of single cap). |
 | Governance kill-switch (forward refund halt) | `NativeProject.sol:534-540` (`daoVeto`) | Survives arbiter deletion: future-facing, not a ruling. |
 | RepToken as IVotes direction weight | `Dao.sol:23`, `RepToken.sol:31` | Stays the direction-vote instrument. |
-| Charter-anchor pattern (governed version key in Registry) | `EvolutionProposal.sol:552-565` (`updateRPBPrompt`) | Exact template for a `charter.version` anchor. |
+| Charter-anchor pattern (governed version key in Registry) | `EvolutionProposal.sol:552-565` (`updateRPBPrompt`) | Template for the `jurisdiction.<id>.charter` key. |
 
 ### Needs rewriting
 
@@ -445,7 +444,7 @@ a code fact (see D).
 
 ## D. Open decisions (user only)
 
-1. **Charter anchor placement.** On Substrate.sol (introduces the first governed
+1. **Charter anchor placement (DECIDED 2026-10-16: Registry keys).** On Substrate.sol (introduces the first governed
    slot on a deliberately ungoverned contract, no timelock wired) vs. in the
    jurisdiction Registry (reuses `updateRPBPrompt`, keeps Substrate pure).
    Report leans Registry; the user decides, since this is "constitutional prompt

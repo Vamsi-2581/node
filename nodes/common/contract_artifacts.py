@@ -37,7 +37,6 @@ _CONTRACT_SOURCES = {
     "Substrate": "core",
     "ServiceMarket": "core",
     "VentureVault": "core",
-    "CharterAnchor": "core",
 }
 
 

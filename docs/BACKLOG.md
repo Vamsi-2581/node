@@ -131,9 +131,9 @@ Recursive Principial Body") now serving both app whitepaper surfaces.
    atn_web commits remain local-only.
 6. CLAUDE.md is gitignored, so the machine-onboarding contract doesn't
    travel with clones. Commit / genericize / keep local?
-7. ~~Charter-anchor governor handoff~~: DONE 2026-07-08 (genesis v2),
-   CharterAnchor governor = jurisdiction timelock; charter v1 ANCHORED
-   on-chain via executed DAO proposal.
+7. ~~Charter-anchor governor handoff~~: MOOT 2026-10-16. CharterAnchor
+   retired; the charter version is the DAO Registry keys
+   `jurisdiction.<id>.charter` / `.charter_uri`, changed by DAO proposal.
 8. Admin agent: merged but placeholder budget (100k tokens/day);
    tune + enable; it starts spending on a 30m schedule once live.
 9. Microsoft Store: pay $19, fill the two msix identity placeholders;
@@ -166,7 +166,7 @@ Recursive Principial Body") now serving both app whitepaper surfaces.
   genesis via sacrificial smoke instance). BLOCKED on user: make the
   trustless-contracts DAO factory deploy a jurisdiction WITH a
   coin-offering-shaped satellite slot; then the genesis event chains
-  #7 (CharterAnchor governor handoff) + #10 (ReputationMirror
+  #7 (charter anchor, now registry keys) + #10 (ReputationMirror
   activation) + the ParityVault minter grant.
 - Tokenized vault shares (2026-07-06): ERC20 per vault, book-value
   redemption (burn → unvested principal + accrued revenue),
@@ -212,7 +212,7 @@ Recursive Principial Body") now serving both app whitepaper surfaces.
 - Adopted tools: OS-level isolated runner (vault track) as the wall
   behind tool_guard's audit-hook tripwire; macOS isolation untested.
 - Indexer: mirror the new events (ToolRegistered, VentureCreated,
-  CharterAnchored, service registry) into Firestore collections
+  service registry) into Firestore collections
   (`tools`/`services` collections are documented as future, not
   implemented).
 - MCP server quirk: any Claude Code session with the atn MCP
@@ -224,9 +224,7 @@ Recursive Principial Body") now serving both app whitepaper surfaces.
   epochs, re-registration re-admits. Not a design item.
 - ~~Shadownet redeploy~~: DONE 2026-07-08 (user-gated, user said go),
   Substrate `0x112F617De881ef0e94B010d9756aa8aef2794208` (checkpointed
-  ATN + owner binding + endpoint surface), CharterAnchor
-  `0x2B239bBE...c47C` (governor = deployer pending #7 handoff; charter
-  v1 anchored, hash 5756ed3a...), ServiceRegistry `0x080346d2...6400`.
+  ATN + owner binding + endpoint surface), ServiceRegistry `0x080346d2...6400`.
   PaymentChannel NOT deployed (challengeWindow = decision #4).
   registry.json + Firestore settings/network updated, indexer@shadownet
   restarted, testnet smoke green (anchor + dual mint verified on-chain),

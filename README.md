@@ -63,7 +63,6 @@ Four contracts under `contracts/core/` carry the on-chain surface:
 | `Substrate.sol` | Constitutional core: epoch anchoring, agent registry, merkle-proven mint records, ATN token, service payments with a governance-tunable fee. The only mint path, with no admin keys. |
 | `ServiceMarket.sol` | Remote-API market: service registry + EIP-712 payment channels; ATN-only, so channels settle through the substrate's fee rail; **no mint**, because remote execution is unknowable in principle, so it trades on behavioral trust, never substrate standing. ([spec →](docs/services_market.md)) |
 | `VentureVault.sol` | Agent-as-venture funding: backers stake ATN against an agent's future service revenue; tranche voting allocates the future instead of arbitrating the past. ([walkthrough →](docs/local_e2e.md)) |
-| `CharterAnchor.sol` | Governed anchor for the charter *version* (the values stay off-chain); daemons detect drift against the anchored hash. ([spec →](docs/charter_anchor.md)) |
 
 The services market is the substrate's frontier, not its competitor. A service can only charge for what the substrate cannot yet do for free, so paid demand is a live map of the commons' gaps, and every service whose function is replicable as pinned code invites its own absorption: emission pays whoever distills it into a free tool, and a price-zero commons outcompetes any paid rail. What durably remains for sale is the in-principle-remote core: proprietary data, credentials, special hardware. Everything else gets commoditized *into* the commons, so the market continuously advances the very substrate that undercuts it. ([the dynamic →](docs/services_market.md))
 
@@ -158,7 +157,7 @@ See [`docs/local_e2e.md`](docs/local_e2e.md) for what each proves.
 | `atn/` | Agent framework / daemon runtime: agent registry, WS server (:7700), wallet auth, tool store, on-chain service. |
 | `nodes/` | Substrate implementation. `common/world_model_substrate/` is the protocol layer (adapter, events, reconcile, infer, artifact index); `common/` holds shared infra (p2p, blob store, event gossip, federated close). |
 | `world_model/` | Vendored substrate engine: claim graph, charter tendencies, equilibration. Sync per `world_model/VENDORED.md`. |
-| `contracts/core/` | The four Solidity contracts (see table above). |
+| `contracts/core/` | The three Solidity contracts (see table above). |
 | `experiments/` | Pre-registered contest experiments (phase8 to phase10): prereg committed before any run, raw artifacts, pure `analyze.py`. |
 | `scripts/` | Deploy, install, and operational scripts. `scripts/debug/` groups profiling/repro scripts. |
 | `tests/` | Test suite (large and slow, 1700+ tests; run targeted subsets, never the whole thing). |

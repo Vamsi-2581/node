@@ -15,7 +15,7 @@
 > - **`ServiceMarket.sol`**: remote-API market (registry + EIP-712 payment
 >   channels), ATN-only, settling through `Substrate.payForService`.
 > - **`VentureVault.sol`**: agent-as-venture funding.
-> - **`CharterAnchor.sol`**: governed anchor for the charter version.
+> - The charter version has no contract: it is two DAO Registry keys.
 > - **Read instead:** `docs/README.md`, `docs/tool_substrate.md`,
 >   `docs/services_market.md`, `docs/charter_anchor.md`, and the contract
 >   NatSpec. The body below is kept only for history.

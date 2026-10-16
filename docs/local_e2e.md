@@ -199,12 +199,12 @@ is a real observation about where the pieces don't yet click cleanly.
 # Local end-to-end: the venture loop composes
 
 `scripts/local_e2e_venture_loop.py` is the sibling capstone for the
-venture-loop contracts + rails (VentureVault + factory, CharterAnchor,
+venture-loop contracts + rails (VentureVault + factory,
 TrialRunner, the evidence CON rail). It **reuses the tool-economy
 harness** wholesale (`start_hardhat`, `deploy_contracts`,
 `resolve_binding_shape`/`sponsored_register`, `send_agent_tx`,
 `make_runtime`, `register_local_agent`, the `Board` scoreboard and
-`_fake_embedder`) and bolts CharterAnchor + VentureVaultFactory onto the
+`_fake_embedder`) and bolts VentureVaultFactory onto the
 base deploy. It stands up ONE daemon runtime, registers a fleet of
 owner-bound agents against a live Hardhat chain, and drives the whole
 venture lifecycle end-to-end.
@@ -226,13 +226,11 @@ Eight stages (0 bootstrap + A-G), each verified:
 
 - **0 chain up**: base deploy (Substrate + ServiceMarket; ATN-only
   settlement, no MockERC20) plus a second inline deployer for
-  `CharterAnchor` (governor =
-  `account[0]`) and `VentureVaultFactory`.
-- **A CharterAnchor**: anchor the live `charter_hash()` (v1), assert the
-  daemon's `verify_charter_against_anchor` MATCHES; anchor a bogus hash
-  (v2, append-only) and assert the drift-warning path fires
-  (`match=False`); re-anchor the real hash (v3) and assert current
-  matches again.
+  `VentureVaultFactory`.
+- **A charter check**: assert the daemon's pure `verify_charter`
+  MATCHES `"0x" + charter_hash()` (the registry-key value), detects
+  drift against a bogus hash (`match=False`), and reports `match=None`
+  for an empty hash. No contract involved.
 - **B venture**: the venture agent publishes a `venture_prospectus` blob
   (echo battery, `pass_threshold=1.0`); a VentureVault is deployed via the
   factory bound to that agent (`termsBps=6000`, the 60% backer split).
@@ -289,14 +287,7 @@ Additional to the tool-economy seams above:
     the manifest for you; hand-building one for a direct
     `submit_tool_manifest` call must satisfy `_REQUIRED_FIELDS`.
 
-11. **CharterAnchor is append-only, so "fix the drift" is a NEW version.**
-    Re-anchoring the correct charter hash after a bogus anchor does not
-    edit v2: it appends v3. `currentCharter()` then tracks v3, and
-    `versionCount` is 3. The forward-only doctrine (no rollback) is
-    load-bearing: the test asserts `chain_version == 3` after the
-    realignment, not a return to v1.
-
-12. **The scoreboard's arrow/box glyphs crash a cp1252 Windows console.**
+11. **The scoreboard's arrow/box glyphs crash a cp1252 Windows console.**
     The final `print(board.render())` carries `→` and `═`; on a stock
     Windows console (`cp1252`) that raises `UnicodeEncodeError`. The
     script reconfigures `sys.stdout`/`sys.stderr` to utf-8 before running.

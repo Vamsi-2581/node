@@ -3,9 +3,9 @@
 The charter (the 6-root alignment vocabulary in ``adapter.CHARTER``) is a
 hardcoded Python constant. Governance changing it is a forward-only fork
 boundary (re-basing history breaks bit-identical replay — every historical
-claim is embedded in the charter's coordinate basis). ``CharterAnchor.sol``
-anchors WHICH version is canonical by committing the sha256 of the blob this
-module produces; daemons compare their local hash against the on-chain anchor
+claim is embedded in the charter's coordinate basis). The DAO Registry key
+``jurisdiction.<id>.charter`` holds WHICH version is canonical (0x + the sha256
+of the blob this module produces); daemons compare their local hash against it
 and warn loudly on divergence.
 
 This module is the single source of truth for that hash on the daemon side. It

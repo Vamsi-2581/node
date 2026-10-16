@@ -6,11 +6,10 @@ script's Hardhat/harness utilities (chain up, owner-bound registration,
 scoreboard, fake embedder, per-agent tx senders) and drives the merged
 venture-loop contracts + rails end-to-end against a real deployment:
 
-  A. CharterAnchor — deploy (governor = a hardhat account), anchor the
-     live ``charter_hash()``, verify the daemon's
-     ``verify_charter_against_anchor`` MATCHES; anchor a BOGUS hash (v2)
-     and assert the drift-warning path fires (match=False); re-anchor the
-     REAL hash (v3, append-only) and assert current matches again.
+  A. Charter version check: the charter hash lives in the DAO Registry
+     key ``jurisdiction.<id>.charter`` (no contract). Assert the daemon's
+     pure ``verify_charter`` MATCHES ``"0x" + charter_hash()``, detects
+     drift against a BOGUS hash, and reports match=None for an empty hash.
 
   B. Venture — the venture agent publishes a ``venture_prospectus`` blob
      (battery of echo-service cases, pre-committed pass_threshold), then a
@@ -290,7 +289,7 @@ async def amain(from_stage: str = "A", to_stage: str = "G") -> int:
      BACKER1, BACKER2, CUSTOMER) = accts
 
     # ------------------------------------------------------------------
-    # Bootstrap: chain up + deploy Substrate/ServiceMarket + Charter/Venture
+    # Bootstrap: chain up + deploy Substrate/ServiceMarket + VentureVaultFactory
     # ------------------------------------------------------------------
     s_boot = board.stage(0, "chain up (hardhat node + core deploys)")
     addresses: Dict[str, Optional[str]] = {}
@@ -299,14 +298,13 @@ async def amain(from_stage: str = "A", to_stage: str = "G") -> int:
         if not wait_rpc(45.0):
             raise RuntimeError("hardhat RPC never came up")
         addresses = deploy_contracts(REPO)
-        # Deploy CharterAnchor + VentureVaultFactory on top (the tool-economy
+        # Deploy VentureVaultFactory on top (the tool-economy
         # deployer covers Substrate + ServiceMarket only; settlement is
         # ATN-only, no MockERC20).
         addresses.update(
             _deploy_venture_contracts(REPO, addresses["substrate"],
                                       DEPLOYER.address))
         s_boot.note("substrate", addresses["substrate"])
-        s_boot.note("charterAnchor", addresses["charterAnchor"])
         s_boot.note("ventureFactory", addresses["ventureFactory"])
         s_boot.status = "PASS"
     except Exception as e:
@@ -325,53 +323,31 @@ async def amain(from_stage: str = "A", to_stage: str = "G") -> int:
     binding_shape = resolve_binding_shape(substrate_abi)
 
     # ==================================================================
-    # Stage A — CharterAnchor: anchor, verify match, drift, re-anchor
+    # Stage A: charter version check (registry-key design, no contract)
     # ==================================================================
-    sA = board.stage(1, "A: charter anchor (match → drift → re-anchor)")
+    sA = board.stage(1, "A: charter check (match → drift → empty)")
     try:
-        from atn.on_chain import verify_charter_against_anchor
+        from atn.on_chain import verify_charter
         from nodes.common.world_model_substrate.charter_version import (
             charter_hash)
 
-        anchor_abi = load_abi("CharterAnchor")
-        anchor = w3.eth.contract(
-            address=Web3.to_checksum_address(addresses["charterAnchor"]),
-            abi=anchor_abi)
-
         local_hash = charter_hash()
+        registry_hash = "0x" + local_hash
 
-        def _anchor(hash_hex: str, uri: str) -> None:
-            call = anchor.functions.anchorCharter(
-                bytes.fromhex(hash_hex), uri)
-            _owner_tx(w3, call, HH_KEYS[0], DEPLOYER.address, gas=300_000)
-
-        # v1: the REAL charter hash → daemon must MATCH.
-        _anchor(local_hash, "sha256://charter-v1")
-        v1 = verify_charter_against_anchor(w3, addresses["charterAnchor"])
+        v1 = verify_charter(registry_hash)
         assert v1["match"] is True, v1
-        assert v1["chain_version"] == 1, v1
-        assert v1["local_hash"] == local_hash
-        sA.note("v1_match", v1["match"])
+        assert v1["local_hash"] == local_hash, v1
+        sA.note("match", v1["match"])
 
-        # v2: a BOGUS hash (append-only, so it becomes the new current) →
-        # the drift-warning path must fire (match=False).
-        bogus = _result_digest({"bogus": "charter", "nonce": 42})
-        _anchor(bogus, "sha256://charter-bogus")
-        v2 = verify_charter_against_anchor(w3, addresses["charterAnchor"])
+        bogus = "0x" + _result_digest({"bogus": "charter", "nonce": 42})
+        v2 = verify_charter(bogus)
         assert v2["match"] is False, v2
-        assert v2["chain_version"] == 2, v2
-        assert v2["chain_hash"] == bogus
-        sA.note("v2_drift_detected", v2["match"] is False)
+        assert v2["chain_hash"] == bogus.lower().removeprefix("0x"), v2
+        sA.note("drift_detected", v2["match"] is False)
 
-        # v3: re-anchor the REAL hash (forward-only fix) → current matches
-        # again.
-        _anchor(local_hash, "sha256://charter-v3-realigned")
-        v3 = verify_charter_against_anchor(w3, addresses["charterAnchor"])
-        assert v3["match"] is True, v3
-        assert v3["chain_version"] == 3, v3
-        assert anchor.functions.versionCount().call() == 3
-        sA.note("v3_rematch", v3["match"])
-        sA.note("versions", anchor.functions.versionCount().call())
+        v3 = verify_charter("")
+        assert v3["match"] is None, v3
+        sA.note("empty_is_none", True)
         sA.status = "PASS"
     except Exception as e:
         sA.status = "FAIL"
@@ -919,26 +895,20 @@ async def amain(from_stage: str = "A", to_stage: str = "G") -> int:
 
 
 # ---------------------------------------------------------------------------
-# Deploy CharterAnchor + VentureVaultFactory (bolt onto the base deploy)
+# Deploy VentureVaultFactory (bolt onto the base deploy)
 # ---------------------------------------------------------------------------
 
 VENTURE_DEPLOY_JS = r"""
 const { ethers } = require("hardhat");
 const fs = require("fs");
 async function main() {
-  const governor = process.env.GOVERNOR;
   const substrateAddr = process.env.SUBSTRATE_ADDR;
-
-  const CharterAnchor = await ethers.getContractFactory("CharterAnchor");
-  const anchor = await CharterAnchor.deploy(governor, ethers.ZeroHash, "");
-  await anchor.waitForDeployment();
 
   const Factory = await ethers.getContractFactory("VentureVaultFactory");
   const factory = await Factory.deploy(substrateAddr);
   await factory.waitForDeployment();
 
   const out = {
-    charterAnchor: await anchor.getAddress(),
     ventureFactory: await factory.getAddress(),
   };
   fs.writeFileSync(process.env.VDEPLOY_OUT, JSON.stringify(out, null, 2));
@@ -962,7 +932,7 @@ def _deploy_venture_contracts(cwd: Path, substrate_addr: str,
         env["VDEPLOY_OUT"] = str(out_json)
         env["GOVERNOR"] = governor
         env["SUBSTRATE_ADDR"] = substrate_addr
-        log("deploying CharterAnchor + VentureVaultFactory…")
+        log("deploying VentureVaultFactory…")
         proc = subprocess.run(
             [_npx(), "hardhat", "run", str(tmp_js), "--network", "localhost"],
             cwd=str(cwd), capture_output=True, text=True, timeout=300,
