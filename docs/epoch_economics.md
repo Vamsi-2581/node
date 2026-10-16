@@ -189,7 +189,8 @@ Implementation state (2026-06-11):
 
 ## Merkle mint proofs (implemented 2026-06-11; 2-field leaf as of 2026-07-10)
 
-Mint amounts are no longer self-reported. `submitAnchor` commits
+Mint amounts are no longer self-reported. `anchor` (governor-only since
+2026-10-16) commits
 `agentMintRoot`, a merkle root over the epoch's `(agent address,
 scaled amount)` map (sorted-pair hashing, double-hashed leaves,
 OZ-compatible), and `recordTrainingForEpoch(amount, epochIdHash,

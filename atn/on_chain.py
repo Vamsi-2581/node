@@ -1127,7 +1127,7 @@ class OnChainService:
         ratified ATN earnings.
 
         Per-(agent, epoch) idempotent on-chain; the epoch must already be
-        anchored via ``submitAnchor``.
+        anchored via ``anchor`` (governor-only).
         """
         try:
             from eth_account import Account

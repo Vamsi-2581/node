@@ -52,12 +52,12 @@ CHAIN_ID = 1337
 MINT_SCALE = 1_000_000
 
 # Hardhat's deterministic mnemonic accounts (well-known, safe: local only).
-# account[0] = OWNER_A (author's human wallet, also the deployer/anchorer)
+# account[0] = OWNER_A (author's human wallet, also the deployer)
 # account[1] = OWNER_B (caller's human wallet)
 HH_ACCT0_PK = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-# Hardhat account #9: genesis anchor signer + test vaultMinter (2026-10-12
-# anchor authority). Registered as an agent by the deploy script.
-HH_GENESIS_PK = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
+# Hardhat account #9: Substrate's governor (the only anchoring account,
+# Decision 2026-10-16; production uses the DAO timelock) + test vaultMinter.
+HH_GOVERNOR_PK = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
 HH_ACCT1_PK = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 
 
@@ -224,20 +224,16 @@ const fs = require("fs");
 async function main() {
   const signers = await ethers.getSigners();
   const [deployer] = signers;
-  const genesis = signers[9];
+  const governor = signers[9];
   const Substrate = await ethers.getContractFactory("Substrate");
-  const zero = "0x0000000000000000000000000000000000000000";
-  // Substrate(treasury, vaultMinter, governor, repToken, anchorQuorumBps,
-  // genesisSigners, genesisQuorum). REP-less local network: account #9 is
-  // the single genesis anchor signer and the test vaultMinter (faucet for
+  // Substrate(treasury, vaultMinter, governor), Decision 2026-10-16. Local
+  // network: account #9 is the governor (the only account that may anchor;
+  // production uses the DAO timelock) and the test vaultMinter (faucet for
   // the purchased ATN that pays the fees which fund the mint pool).
   const substrate = await Substrate.deploy(
-    deployer.address, genesis.address, zero, zero, 5000, [genesis.address], 1);
+    deployer.address, governor.address, governor.address);
   await substrate.waitForDeployment();
   const substrateAddr = await substrate.getAddress();
-  await (await substrate.connect(genesis).registerAgent(
-    ethers.keccak256(ethers.toUtf8Bytes("genesis-signer")),
-    ethers.toUtf8Bytes("genesis-peer"))).wait();
 
   // ServiceMarket.sol declares two contracts. Deploy the registry
   // (constructor takes the substrate address); the payment channel takes the
@@ -929,9 +925,15 @@ async def amain() -> int:
         earn_before = substrate.functions.agentMintTotal(author_addr).call()
         atn_before = substrate.functions.balanceOf(author_addr).call()
 
-        # Anchor as OWNER A (the deployer/human wallet acting as the
-        # rotating submitter). Uses the production private-key path.
+        # Anchor as Substrate's governor (account #9; a DAO timelock in
+        # production, where the anchor is a DAO proposal). Uses the
+        # production private-key path.
         anchorer = EpochAnchorer(EpochAnchorerConfig(
+            epoch_anchor_address=addresses["substrate"],
+            rpc_url=RPC_URL, chain_id=CHAIN_ID,
+            private_key=HH_GOVERNOR_PK))
+        # OWNER A (the deployer) is not the governor.
+        outsider_anchorer = EpochAnchorer(EpochAnchorerConfig(
             epoch_anchor_address=addresses["substrate"],
             rpc_url=RPC_URL, chain_id=CHAIN_ID,
             private_key=HH_ACCT0_PK))
@@ -940,13 +942,13 @@ async def amain() -> int:
         # fees burned in the PREVIOUS anchor window. Buy ATN (vault faucet),
         # burn real service fees, and anchor a seed epoch to close that
         # window, so the real anchor below carries a pool covering the mint.
-        genesis_acct = Account.from_key(HH_GENESIS_PK)
+        gov_acct = Account.from_key(HH_GOVERNOR_PK)
         SEED_GROSS = 10 ** 13
         send_agent_tx(w3, substrate.functions.mintFromVault(
-            genesis_acct.address, SEED_GROSS), HH_GENESIS_PK, genesis_acct.address)
+            gov_acct.address, SEED_GROSS), HH_GOVERNOR_PK, gov_acct.address)
         send_agent_tx(w3, substrate.functions.payForService(
             owner_b.address, SEED_GROSS, b"\x5e" * 32),
-            HH_GENESIS_PK, genesis_acct.address)
+            HH_GOVERNOR_PK, gov_acct.address)
         seed_res = anchorer.anchor_close_result(
             {"epoch_id": "e2e-seed-pool",
              "authoritative_payload": {
@@ -954,21 +956,18 @@ async def amain() -> int:
                  "agent_novelty": {}, "total_mint": 0.0,
                  "total_novelty": 0.0, "output_decimals": 10,
                  "gate_applied": False, "n_batches": 0, "n_events": 0},
-             "agent_mint": {}},
-            signer_keys=[HH_GENESIS_PK])
+             "agent_mint": {}})
         if not seed_res.success:
             raise RuntimeError(f"seed anchor failed: {seed_res.error}")
         pool = substrate.functions.nextMintPool().call()
         s6.note("mint_pool", pool)
 
-        # Anchor authority: an outsider (owner A, not the genesis signer)
-        # cannot anchor; the genesis signer's signature is required.
-        outsider = anchorer.anchor_close_result(
-            close_result, signer_keys=[HH_ACCT0_PK])
-        assert not outsider.success, "outsider-signed anchor was accepted"
+        # Anchor authority: an outsider (owner A, not the governor) cannot
+        # anchor (NotGovernor); only the governor's anchor lands.
+        outsider = outsider_anchorer.anchor_close_result(close_result)
+        assert not outsider.success, "non-governor anchor was accepted"
         s6.note("outsider_anchor", "rejected")
-        anchor_res = anchorer.anchor_close_result(
-            close_result, signer_keys=[HH_GENESIS_PK])
+        anchor_res = anchorer.anchor_close_result(close_result)
         if not anchor_res.success:
             raise RuntimeError(f"anchor failed: {anchor_res.error}")
         s6.note("anchor_tx", anchor_res.tx_hash[:14] + "…")

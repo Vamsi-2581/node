@@ -823,7 +823,8 @@ class AutonetBridge:
             bc = self._autonet_config.blockchain
             for atn_key, node_key in (("substrate_address", "substrate_address"),
                                       ("rep_token_address", "rep_token_address"),
-                                      ("tool_bond_address", "tool_bond_address")):
+                                      ("tool_bond_address", "tool_bond_address"),
+                                      ("dao_address", "governor_address")):
                 value = getattr(self.config, atn_key, "") or ""
                 if value:
                     setattr(bc, node_key, value)

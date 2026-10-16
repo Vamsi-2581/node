@@ -446,6 +446,10 @@ next close, same drill as v4.1.
 
 ## Decision (2026-10-12): anchor authority + on-chain conservation
 
+**Layers 2 and 3 below (REP signatures, genesis set) are SUPERSEDED by
+Decision (2026-10-16): governed anchors.** Layer 1 (on-chain conservation)
+stands.
+
 User-approved breaking change, BUILT 2026-10-12. Closes a critical hole:
 `submitAnchor` had no caller check and `recordTrainingForEpoch` only
 checked the proof against whatever root was anchored, so anyone could
@@ -500,6 +504,40 @@ close whose voice/pool snapshot was read at a different `anchorCount`.
 **FLAG-DAY:** ABI change (constructor, `submitAnchor`, Anchor struct gains
 `windowBurned/mintPool/minted`) + mint scaling change. Fresh Substrate and
 all daemons on this build before the next close.
+
+## Decision (2026-10-16): governed anchors
+
+Replaces the REP-signature quorum and the genesis signer set of
+2026-10-12. An anchor is an ordinary DAO proposal:
+
+- `Substrate.anchor(epochId, epochRoot, prevEpochRoot, prevAnchorHash,
+  agentMintCid, payloadHash, agentMintRoot)` is callable only by
+  `governor` (the DAO timelock; reverts `NotGovernor`). Constructor is
+  `(treasury, vaultMinter, governor)`, governor non-zero. The hash chain,
+  one-anchor-per-epoch and the fees-only `mintPool` cap stay in Substrate.
+- The DAO Governor decides early once the outcome cannot change: For above
+  half of total REP at the snapshot with For >= quorum, or Against at
+  half. Otherwise it runs to the deadline under the DAO's ordinary rules.
+  Admin's call: no anchor-specific quorum, because the DAO can rally
+  against a bad anchor during the voting period and cancel it in the
+  timelock.
+- Daemon side (`nodes/common/governed_anchor.py`,
+  `chain_submission_driver.py`): every daemon derives the identical
+  proposal from the bit-identical close (target Substrate, value 0,
+  `anchor(...)` calldata, description
+  `Anchor epoch <epochId> 0x<epochRoot hex>`), so the proposal id is the
+  same everywhere. The rotating winner proposes (other daemons may after
+  one tick; a duplicate propose just reverts), every daemon votes For with
+  its agents' delegated REP, anyone queues and executes. Agent mints are
+  submitted once the anchor lands. `ChainSubmissionConfig.governor_address`
+  is the DAO Governor.
+- Dev networks may deploy Substrate with an EOA governor; a daemon whose
+  key is that governor anchors directly (no proposal).
+
+Latency: one voting delay plus one timelock delay after the close when the
+anchoring agents hold a REP majority; up to the full voting period
+otherwise. **FLAG-DAY:** constructor and anchor ABI change; fresh Substrate
+with the timelock as governor.
 
 ## Decision (2026-10-13): staked tools, flagged audits, REP-settled verdicts
 

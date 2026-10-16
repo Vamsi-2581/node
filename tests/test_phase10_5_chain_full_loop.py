@@ -54,7 +54,6 @@ from nodes.common.mint_merkle import scale_mint
 from tests.substrate_chain_helpers import (
     account_key,
     deploy_substrate,
-    genesis_address,
     seed_pool,
 )
 
@@ -70,19 +69,9 @@ def _load_substrate() -> Tuple[list, str]:
 
 
 def _deploy(w3: Web3, deployer: str, abi: list, bytecode: str) -> str:
-    # Genesis anchor authority: the three test agents (accounts 1..3,
-    # registered by the fixture) plus the helper's seed signer (account
-    # 9), quorum 1. The driver's signing round signs with the agents'
-    # real keys; seed_pool signs with account 9.
-    accts = w3.eth.accounts
-    addr = deploy_substrate(
-        w3, abi, bytecode, deployer,
-        genesis=list(accts[1:4]) + [genesis_address(w3)],
-        genesis_quorum=1, register_genesis=False,
-    )
-    c = w3.eth.contract(address=addr, abi=abi)
-    _register_agent(w3, c, genesis_address(w3), "genesis-seed-signer")
-    return addr
+    # Governor = deployer: a dev network whose Substrate governor is the
+    # daemon's own key, so the winner anchors directly.
+    return deploy_substrate(w3, abi, bytecode, deployer)
 
 
 def _register_agent(w3: Web3, contract, agent_addr: str, lineage_seed: str) -> None:
@@ -267,7 +256,8 @@ def test_winner_drives_anchor_and_each_agent_mint_lands(chain):
             substrate_address=chain["addr"],
             rpc_url="",
             chain_id=0,
-            daemon_private_key="dummy",  # only needed for non-test path
+            # The governor's key: direct-anchor mode (dev network).
+            daemon_private_key=account_key(w3, deployer),
         ),
         agent_chain_resolver=lambda: [
             AgentChainIdentity(address=a, private_key=account_key(w3, a))

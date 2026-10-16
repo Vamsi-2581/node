@@ -41,7 +41,7 @@ from nodes.common.state_sync import (
 )
 from nodes.common.world_persistence import PersistenceConfig, WorldPersistence
 from world_model.generalized import worlds_equal
-from tests.substrate_chain_helpers import deploy_substrate, genesis_keys
+from tests.substrate_chain_helpers import deploy_substrate
 
 ARTIFACT = Path("C:/code/autonet/artifacts/contracts/core/Substrate.sol/Substrate.json")
 EMBED_DIM = 8
@@ -95,7 +95,7 @@ def _batches(kp: Keypair, agent_id: str, n: int, start_seq: int = 1) -> List[Eve
     return out
 
 
-def _close_one_epoch(tracker, anchorer, resolver, kp, epoch_id, keys,
+def _close_one_epoch(tracker, anchorer, resolver, kp, epoch_id,
                      start_seq=1):
     """Replicate the FederatedCloseDriver + ChainSubmissionDriver flow
     for one epoch: canonical order -> federated close -> tracker ->
@@ -112,7 +112,7 @@ def _close_one_epoch(tracker, anchorer, resolver, kp, epoch_id, keys,
     )
     close_result["authoritative_payload"]["world_cid"] = ckpt.cid
 
-    anchor = anchorer.anchor_close_result(close_result, signer_keys=keys)
+    anchor = anchorer.anchor_close_result(close_result)
     assert anchor.success, anchor.error
     resolver.put(anchor.payload_bytes)   # cid == on-chain payloadHash
     resolver.put(ckpt.blob)
@@ -131,11 +131,10 @@ def synced_network(chain):
     tracker = CanonicalWorldTracker(embedding_dim=EMBED_DIM)
     kp = Keypair.generate()
 
-    keys = genesis_keys(chain["w3"])
     ckpt1, _ = _close_one_epoch(tracker, anchorer, resolver, kp, "e_sync_1",
-                                keys, start_seq=1)
+                                start_seq=1)
     ckpt2, _ = _close_one_epoch(tracker, anchorer, resolver, kp, "e_sync_2",
-                                keys, start_seq=10)
+                                start_seq=10)
     return {
         "chain": chain,
         "resolver": resolver,
@@ -261,7 +260,7 @@ def test_catch_up_none_for_pre_state_sync_anchor(chain):
     close_result["epoch_id"] = "e_old"
     # No world_cid injected -> encodes as "".
     anchor = anchorer.anchor_close_result(
-        close_result, signer_keys=genesis_keys(chain["w3"]))
+        close_result)
     assert anchor.success, anchor.error
     resolver = InMemoryBlobResolver()
     resolver.put(anchor.payload_bytes)

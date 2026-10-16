@@ -57,7 +57,6 @@ CHAIN_ID = 1337
 HH_DEPLOYER_PK = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"  # #0
 HH_TIMELOCK_PK = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"  # #1
 HH_TREASURY_PK = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"  # #2
-HH_GENESIS_PK = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"   # #9
 
 E18 = 10 ** 18
 MIN_STAKE = 1000 * E18
@@ -379,11 +378,11 @@ async def amain() -> int:
         deployer = Account.from_key(HH_DEPLOYER_PK).address
         timelock = Account.from_key(HH_TIMELOCK_PK).address
         treasury = Account.from_key(HH_TREASURY_PK).address
-        genesis = Account.from_key(HH_GENESIS_PK).address
         rep = deploy(w3, "RepToken", ["Autonet REP", "REP", deployer, timelock,
                                       [], [], False])
-        substrate = deploy(w3, "Substrate", [treasury, deployer, "0x" + "00" * 20,
-                                             rep.address, 5000, [genesis], 1])
+        # (treasury, vaultMinter, governor): the deployer anchors directly
+        # (Decision 2026-10-16; this run never anchors).
+        substrate = deploy(w3, "Substrate", [treasury, deployer, deployer])
         bond = deploy(w3, "ToolBond", [substrate.address, rep.address,
                                        deployer, timelock,
                                        tuple(PARAMS.values())])

@@ -163,10 +163,8 @@ def _anchor_with_mint(chain, mint: Dict[str, float], epoch_id: str):
         config=EpochAnchorerConfig(epoch_anchor_address=chain["addr"]),
         web3=chain["w3"], contract_abi=chain["abi"],
     )
-    from tests.substrate_chain_helpers import genesis_keys
     s = anchorer.anchor_close_result(
-        result, from_address=chain["deployer"],
-        signer_keys=genesis_keys(chain["w3"]))
+        result, from_address=chain["deployer"])
     assert s.success, s.error
     return s
 

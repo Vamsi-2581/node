@@ -42,7 +42,6 @@ from nodes.common.federated_reconcile import (
 from nodes.common.voice_state import read_voice_state
 from tests.substrate_chain_helpers import (
     deploy_substrate,
-    genesis_keys,
     seed_pool,
 )
 
@@ -70,8 +69,7 @@ def _load_rep() -> Tuple[list, str]:
 
 def _deploy(w3: Web3, deployer: str, abi: list, bytecode: str,
             vault_minter=None) -> str:
-    # governor=zero => frozen. Substrate's repToken stays zero (genesis
-    # anchor authority: account 9, registered); the RepToken mock below is
+    # governor = deployer (anchors directly); the RepToken mock below is
     # passed only to read_voice_state. vault_minter None => the helper's
     # faucet (account 8), which seed_pool uses to buy ATN.
     return deploy_substrate(
@@ -161,8 +159,7 @@ def _anchor_epoch(fx, agent_ids, epoch_id: str, rpb: str):
         web3=fx["w3"], contract_abi=fx["abi"],
     )
     anchor_result = anchorer.anchor_close_result(
-        result, from_address=fx["deployer"],
-        signer_keys=genesis_keys(fx["w3"]))
+        result, from_address=fx["deployer"])
     assert anchor_result.success
     resolver = InMemoryBlobResolver()
     resolver.put(anchor_result.agent_mint_blob)

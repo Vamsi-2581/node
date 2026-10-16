@@ -65,7 +65,6 @@ from nodes.common.event_gossip import EventBatch, Keypair
 from nodes.common.federated_reconcile import federated_epoch_close
 from tests.substrate_chain_helpers import (
     deploy_substrate,
-    genesis_keys,
     seed_pool,
 )
 
@@ -214,7 +213,7 @@ def _build_close_and_anchor(
         contract_abi=chain_fixture["abi"],
     )
     anchor_result = anchorer.anchor_close_result(
-        result, from_address=deployer, signer_keys=genesis_keys(w3))
+        result, from_address=deployer)
     assert anchor_result.success, anchor_result.error
 
     # Populate the resolver with the blob.

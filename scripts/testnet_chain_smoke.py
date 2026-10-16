@@ -18,8 +18,14 @@ What it does:
 Usage:
   PRIVATE_KEY_A=<funded hex> python scripts/testnet_chain_smoke.py
 
-Where PRIVATE_KEY_A is the deployer/funder wallet (signs the anchor).
-The second wallet is read from the smoke-wallet JSON.
+Where PRIVATE_KEY_A is the deployer/funder wallet. Substrate.anchor is
+governor-only (Decision 2026-10-16): when Wallet A is Substrate's governor
+(a dev deploy with an EOA governor) the driver anchors directly. Otherwise
+set GOVERNOR_ADDRESS=<DAO Governor> and the anchor goes through a DAO
+proposal (Wallet A and B vote with their delegated REP); the script then
+ticks the driver until the timelock executes it (SMOKE_ANCHOR_TIMEOUT
+seconds, default 900). The second wallet is read from the smoke-wallet
+JSON.
 """
 
 from __future__ import annotations
@@ -223,11 +229,22 @@ def main():
     )
 
     # 4. Build chain submission driver, prepopulate per-agent submitters.
+    on_chain_governor = contract.functions.governor().call()
+    dao_governor = os.environ.get("GOVERNOR_ADDRESS", "").strip()
+    direct = on_chain_governor.lower() == addr_a.lower()
+    print(f"[anchor] Substrate governor: {on_chain_governor} "
+          f"({'direct: Wallet A' if direct else 'governed'})")
+    if not direct and not dao_governor:
+        print("ERROR: Wallet A is not Substrate's governor; set "
+              "GOVERNOR_ADDRESS=<DAO Governor> to anchor via a proposal",
+              file=sys.stderr)
+        sys.exit(1)
     config = ChainSubmissionConfig(
         substrate_address=substrate_address,
         rpc_url=rpc_url,
         chain_id=chain_id,
-        daemon_private_key=pk_a,  # Wallet A signs the anchor
+        daemon_private_key=pk_a,  # Wallet A anchors (direct) or proposes
+        governor_address="" if direct else dao_governor,
     )
     resolver = InMemoryBlobResolver()
     driver = ChainSubmissionDriver(
@@ -247,6 +264,16 @@ def main():
     print(f"[driver] handle_federated_close...")
     out = driver.handle_federated_close(fed)
     print(f"[driver] anchored={out['anchored']} tx={out['anchor_tx']}")
+    if not direct and out.get("anchor_proposal"):
+        print(f"[driver] proposal {out['anchor_proposal']} is "
+              f"{out.get('anchor_state')}; ticking until executed")
+        deadline = time.time() + float(os.environ.get("SMOKE_ANCHOR_TIMEOUT", "900"))
+        while driver.pending_proposals and time.time() < deadline:
+            time.sleep(15)
+            driver.tick()
+            print(f"[driver] pending: {driver.pending_proposals}")
+        driver.stop()
+        out["anchored"] = contract.functions.isAnchored(epoch_id).call()
     if not out["anchored"]:
         print(f"ERROR: anchor failed: {out.get('anchor_error')}", file=sys.stderr)
         sys.exit(1)

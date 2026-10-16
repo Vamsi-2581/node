@@ -70,8 +70,9 @@ Seven stages, each verified:
    inspection-review vets earn nothing. Also a **control case**: setting
    the caller's owner equal to the author's in the map drops the mint to
    zero, proving the chain-fed same-owner exclusion.
-6. **Settlement**: the rotating submitter anchors the epoch
-   (`submitAnchor` via `EpochAnchorer`), `author-1` records its own mint
+6. **Settlement**: Substrate's governor (hardhat #9 here; the DAO
+   timelock in production) anchors the epoch (`anchor` via
+   `EpochAnchorer`; a non-governor anchor is checked to revert), `author-1` records its own mint
    (`recordTrainingForEpoch` via `AuthoritativeChainSubmitter`, mint-merkle
    proof against the anchored root). Money only (Decision 2026-07-10):
    Substrate has no reputation surface: the mint is a 2-field
@@ -529,7 +530,7 @@ is reachable from such a session.
     probe, which is what produced the other spelling, and what a real
     attacker would do.
 
-12. **`submitAnchor` hash-chains, so the second box's anchor must read the
+12. **`anchor` hash-chains, so the second box's anchor must read the
     head.** `fund_agent_atn` passed zero `prevEpochRoot`/`prevAnchorHash`,
     which is correct only for the very first anchor. In a split run the
     provider box anchors first, so the consumer's own funding anchor
@@ -571,8 +572,8 @@ minute once compiled.
 ## What it proves
 
 1. **Chain up**: RepToken (deployer is admin, a hardhat account is the
-   timelock), Substrate (with that RepToken, genesis signer #9, deployer as
-   vaultMinter for test ATN), EconomyStub (30s appeal window), ToolBond
+   timelock), Substrate (deployer as governor and vaultMinter for test
+   ATN), EconomyStub (30s appeal window), ToolBond
    (minStake 1000 ATN, threshold 80% of REP, review 120s, reveal 30s,
    finder 50%, degrade 10%, author slash 100%, auditor share 40%), and
    `setSlasher(ToolBond)`.

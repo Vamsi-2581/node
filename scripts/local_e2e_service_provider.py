@@ -204,15 +204,13 @@ const { ethers } = require("hardhat");
 const fs = require("fs");
 async function main() {
   const [deployer] = await ethers.getSigners();
-  const zero = "0x0000000000000000000000000000000000000000";
-  // Substrate(treasury, vaultMinter, governor). governor=zero => the service
-  // fee is frozen at its 2.5% default, which is what this script asserts.
+  // Substrate(treasury, vaultMinter, governor), Decision 2026-10-16:
+  // deployer = treasury + test vaultMinter (purchased-ATN faucet) + governor
+  // (the only anchoring account). Nobody retunes the fee here, so it stays
+  // at its 2.5% default, which is what this script asserts.
   const Substrate = await ethers.getContractFactory("Substrate");
-  // Substrate(treasury, vaultMinter, governor, repToken, anchorQuorumBps,
-  // genesisSigners, genesisQuorum): deployer = treasury + test vaultMinter
-  // (purchased-ATN faucet) + sole genesis anchor signer (2026-10-12).
   const substrate = await Substrate.deploy(
-    deployer.address, deployer.address, zero, zero, 5000, [deployer.address], 1);
+    deployer.address, deployer.address, deployer.address);
   await substrate.waitForDeployment();
   const substrateAddr = await substrate.getAddress();
 
@@ -762,8 +760,8 @@ async def amain() -> int:  # noqa: C901 — a linear E2E script, staged for read
     try:
         if provider is None:
             raise RuntimeError("no ServiceProvider from stage 5")
-        # Fund the child's wallet. Since 2026-10-12 a training mint needs a
-        # quorum-signed anchor and a fee-backed pool, so local float comes
+        # Fund the child's wallet. A training mint needs a governor anchor
+        # (2026-10-16) and a fee-backed pool, so local float comes
         # from the purchased-money rail: the deploy wires vaultMinter to the
         # deployer (hardhat account 0).
         from eth_account import Account as _Acct

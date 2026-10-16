@@ -46,14 +46,10 @@ from nodes.common.epoch_anchorer import (
     EpochAnchorer,
     EpochAnchorerConfig,
 )
+from nodes.common.epoch_anchorer import AnchorFields
 from nodes.common.event_gossip import EventBatch, Keypair
 from nodes.common.federated_reconcile import federated_epoch_close
-from nodes.common.anchor_auth import AnchorFields
-from tests.substrate_chain_helpers import (
-    deploy_substrate,
-    genesis_keys,
-    sign_anchor_fields,
-)
+from tests.substrate_chain_helpers import deploy_substrate
 
 
 ARTIFACTS_DIR = Path("C:/code/autonet/artifacts/contracts")
@@ -73,8 +69,8 @@ def chain():
     abi, bytecode = _load_artifact(EPOCH_ANCHOR_JSON)
     w3 = Web3(EthereumTesterProvider())
     deployer = w3.eth.accounts[0]
-    # Genesis-mode anchor authority (account 9, registered); no seed
-    # anchor: these tests pin the very first anchor's linkage.
+    # Governor = deployer (anchors directly); no seed anchor: these tests
+    # pin the very first anchor's linkage.
     addr = deploy_substrate(w3, abi, bytecode, deployer)
     contract = w3.eth.contract(address=addr, abi=abi)
     return {
@@ -83,7 +79,6 @@ def chain():
         "addr": addr,
         "contract": contract,
         "deployer": deployer,
-        "keys": genesis_keys(w3),
     }
 
 
@@ -227,7 +222,7 @@ def test_first_anchor_lands_with_zero_prev_root_and_zero_prev_anchor(chain):
 
     result = _make_close_result(epoch_id="e_first")
     submission = anchorer.anchor_close_result(
-        result, from_address=deployer, signer_keys=chain["keys"])
+        result, from_address=deployer)
     assert submission.success, submission.error
     assert submission.epoch_id == "e_first"
 
@@ -258,12 +253,12 @@ def test_anchor_chain_rejects_wrong_prev_epoch_root(chain):
     # First anchor lands cleanly.
     res1 = _make_close_result(epoch_id="e_legit")
     s1 = anchorer.anchor_close_result(
-        res1, from_address=deployer, signer_keys=chain["keys"])
+        res1, from_address=deployer)
     assert s1.success
 
     # Now an attacker tries to submit a second anchor with
     # prev_epoch_root != latestEpochRoot. We bypass the anchorer's
-    # automatic linkage and call submitAnchor directly with a
+    # automatic linkage and call anchor directly with a
     # bogus prev_epoch_root.
     res2 = _make_close_result(epoch_id="e_attacker")
     payload = res2["authoritative_payload"]
@@ -281,14 +276,13 @@ def test_anchor_chain_rejects_wrong_prev_epoch_root(chain):
     # exception OR a status=0 receipt. Both count as "rejected".
     rejected = False
     try:
-        # Validly signed by the genesis quorum: the revert must come
-        # from the linkage check, not from missing authority.
+        # Sent by the governor: the revert must come from the linkage
+        # check, not from missing authority.
         fields = AnchorFields(
             "e_attacker", bytes.fromhex(payload["epoch_root"]),
             bogus_prev_root, bogus_prev_anchor, "0" * 64, ph, b"\x00" * 32)
-        sigs = sign_anchor_fields(w3, contract, fields, chain["keys"])
-        tx = contract.functions.submitAnchor(
-            *fields.as_args(), sigs,
+        tx = contract.functions.anchor(
+            *fields.as_args(),
         ).transact({"from": deployer, "gas": 600_000})
         receipt = w3.eth.wait_for_transaction_receipt(tx)
         if receipt.status != 1:
@@ -312,7 +306,7 @@ def test_anchor_chain_rejects_wrong_prev_anchor_hash(chain):
     )
     res1 = _make_close_result(epoch_id="e_legit_2")
     s1 = anchorer.anchor_close_result(
-        res1, from_address=deployer, signer_keys=chain["keys"])
+        res1, from_address=deployer)
     assert s1.success
 
     res2 = _make_close_result(epoch_id="e_bad_anchor")
@@ -329,14 +323,13 @@ def test_anchor_chain_rejects_wrong_prev_anchor_hash(chain):
 
     rejected = False
     try:
-        # Validly signed by the genesis quorum: the revert must come
-        # from the linkage check, not from missing authority.
+        # Sent by the governor: the revert must come from the linkage
+        # check, not from missing authority.
         fields = AnchorFields(
             "e_bad_anchor", bytes.fromhex(payload["epoch_root"]),
             real_prev_root, bogus_prev_anchor, "0" * 64, ph, b"\x00" * 32)
-        sigs = sign_anchor_fields(w3, contract, fields, chain["keys"])
-        tx = contract.functions.submitAnchor(
-            *fields.as_args(), sigs,
+        tx = contract.functions.anchor(
+            *fields.as_args(),
         ).transact({"from": deployer, "gas": 600_000})
         receipt = w3.eth.wait_for_transaction_receipt(tx)
         if receipt.status != 1:
@@ -361,12 +354,12 @@ def test_duplicate_epoch_id_reverts(chain):
 
     res = _make_close_result(epoch_id="e_dup")
     s1 = anchorer.anchor_close_result(
-        res, from_address=deployer, signer_keys=chain["keys"])
+        res, from_address=deployer)
     assert s1.success
 
     s2 = anchorer.anchor_close_result(
 
-        res, from_address=deployer, signer_keys=chain["keys"])
+        res, from_address=deployer)
     assert not s2.success
     # Error string mentions the revert.
     assert "EpochAlreadyAnchored" in s2.error or "revert" in s2.error.lower()
@@ -397,7 +390,7 @@ def test_empty_epoch_can_be_anchored(chain):
 
     submission = anchorer.anchor_close_result(
 
-        result, from_address=deployer, signer_keys=chain["keys"])
+        result, from_address=deployer)
     assert submission.success, submission.error
     # The chain reader can distinguish "empty epoch" from
     # "uninitialized": EMPTY_EPOCH_ROOT != b"\x00" * 32.
@@ -469,8 +462,9 @@ def test_three_daemons_compute_same_payload_first_anchor_wins(chain):
         == cid_for_blob(blobs[2])
     )
 
-    # Now actually submit. Three different submitter addresses.
-    submitters = w3.eth.accounts[:3]
+    # Now actually submit, three times from the governor (the only
+    # account that may anchor).
+    submitters = [chain["deployer"]] * 3
     anchorer = EpochAnchorer(
         config=EpochAnchorerConfig(epoch_anchor_address=chain["addr"]),
         web3=w3,
@@ -480,7 +474,7 @@ def test_three_daemons_compute_same_payload_first_anchor_wins(chain):
     for sub_addr, r in zip(submitters, results):
         submissions.append(
             anchorer.anchor_close_result(
-                r, from_address=sub_addr, signer_keys=chain["keys"])
+                r, from_address=sub_addr)
         )
 
     # First wins; rest get EpochAlreadyAnchored.
@@ -509,7 +503,7 @@ def test_agent_reads_mint_from_cid_blob(chain):
     )
     result = _make_close_result(epoch_id="e_lookup")
     submission = anchorer.anchor_close_result(
-        result, from_address=deployer, signer_keys=chain["keys"])
+        result, from_address=deployer)
     assert submission.success
 
     # Agent reads the anchor for "e_lookup".

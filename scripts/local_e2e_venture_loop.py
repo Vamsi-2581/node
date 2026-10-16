@@ -76,7 +76,7 @@ if str(REPO) not in sys.path:
 # scoreboard, runtime + agent builders, the fake embedder.
 from scripts.local_e2e_tool_economy import (  # noqa: E402
     CHAIN_ID,
-    HH_GENESIS_PK,
+    HH_GOVERNOR_PK,
     RPC_URL,
     Board,
     _fake_embedder,
@@ -133,10 +133,10 @@ def _mint_leaf(agent_addr: str, amount: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# ATN faucet. Since 2026-10-12 a training mint needs a quorum-signed anchor
+# ATN faucet. A training mint needs a governor anchor (Decision 2026-10-16)
 # AND a fees-only pool funded by burned service fees, so test money comes
 # from the purchased-money rail instead: the local deploy wires
-# Substrate.vaultMinter to hardhat account #9 (HH_GENESIS_PK), which
+# Substrate.vaultMinter to hardhat account #9 (HH_GOVERNOR_PK), which
 # mintFromVault's ATN to the faucet agent, which then transfers.
 # ---------------------------------------------------------------------------
 
@@ -386,7 +386,7 @@ async def amain(from_stage: str = "A", to_stage: str = "G") -> int:
         send_agent_tx(w3, reg_call, faucet_key, faucet_addr, gas=800_000)
 
         faucet = ATNFaucet(w3, substrate, faucet_addr, faucet_key,
-                           HH_GENESIS_PK)
+                           HH_GOVERNOR_PK)
 
         # Owner-bound registrations: venture agent (owner VOWNER), verifiers
         # (distinct owners V1OWNER / V2OWNER, both != VOWNER).

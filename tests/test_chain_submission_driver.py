@@ -1,17 +1,20 @@
-"""Phase 10.3b/c: chain submission driver glue tests.
+"""Chain submission driver glue tests (governed anchors, 2026-10-16).
 
-The pieces this driver depends on (EpochAnchorer, AuthoritativeChainSubmitter)
-have their own end-to-end eth_tester coverage in test_phase5_5_anchor.py
-and test_phase5_6_authoritative_submission.py. This file tests the
-glue layer only:
+The pieces this driver depends on (EpochAnchorer, GovernedAnchorer,
+AuthoritativeChainSubmitter) have their own eth_tester coverage in
+test_phase5_5_anchor.py, test_governed_anchor.py and
+test_phase5_6_authoritative_submission.py. This file tests the glue only:
 
-  - Winner daemons call anchor; non-winners skip it.
-  - Per-agent submission walks the agent list and constructs one
-    submitter per address (cached).
-  - Blob from a successful anchor is written to the resolver so
-    per-agent submitters can read it.
-  - Disabled mode (no substrate_address / no key) is a no-op,
-    not a crash.
+  - Direct mode (Substrate's governor is this daemon's key): the winner
+    anchors, then every daemon submits its agents' mints; non-winners do
+    not anchor.
+  - Governed mode: the close builds the DAO proposal, steps it once
+    (winner may propose, non-winners may not) and parks it; ``tick()``
+    keeps stepping and submits the agents' mints once the epoch is
+    anchored; terminal proposals are dropped.
+  - Per-agent submission walks the agent list and caches one submitter
+    per address; blobs are published to the resolver.
+  - Disabled mode, no-authority mode and stale snapshots are no-ops.
 """
 
 from __future__ import annotations
@@ -19,15 +22,20 @@ from __future__ import annotations
 from typing import List
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from nodes.common.blob_resolver import InMemoryBlobResolver
 from nodes.common.chain_submission_driver import (
     AgentChainIdentity,
     ChainSubmissionConfig,
     ChainSubmissionDriver,
 )
-from nodes.common.anchor_auth import AnchorFields
-from nodes.common.epoch_anchorer import AnchorResult, PreparedAnchor
+from nodes.common.epoch_anchorer import AnchorFields, AnchorResult, PreparedAnchor
 from nodes.common.federated_close_driver import FederatedCloseResult
+from nodes.common.governed_anchor import AnchorProposal
+
+SUBMIT = ("nodes.common.chain_submission_driver."
+          "AuthoritativeChainSubmitter.submit_for_epoch")
 
 
 def _fed(epoch_id: str, is_winner: bool, payload=None) -> FederatedCloseResult:
@@ -49,39 +57,7 @@ def _fed(epoch_id: str, is_winner: bool, payload=None) -> FederatedCloseResult:
     )
 
 
-def _make_driver(
-    *,
-    enabled: bool = True,
-    agents: List[AgentChainIdentity] = None,
-    gossip=None,
-    timeout: float = 0.2,
-):
-    """Build a ChainSubmissionDriver with a mocked anchorer so we
-    don't touch a real chain."""
-    cfg = ChainSubmissionConfig(
-        substrate_address="0x" + "1" * 40 if enabled else "",
-        rpc_url="http://localhost:8545",
-        chain_id=31337,
-        daemon_private_key="0x" + "2" * 64 if enabled else "",
-    )
-    anchorer = _mock_anchorer() if enabled else None
-    return ChainSubmissionDriver(
-        config=cfg,
-        agent_chain_resolver=lambda: list(agents or []),
-        blob_resolver=InMemoryBlobResolver(),
-        anchorer=anchorer,
-        gossip=gossip,
-        signature_timeout=timeout,
-        poll_interval=0.05,
-    )
-
-
-DIGEST = bytes.fromhex("11" * 32)
-
-
-def _mock_anchorer(quorum=None, anchor_count=None):
-    """Mock anchorer with a fixed digest. ``quorum(signers) -> bool``
-    decides the anchorQuorum view (default: always reached)."""
+def _mock_anchorer(anchor_count=None):
     anchorer = MagicMock()
     anchorer.is_anchored.return_value = False
     if anchor_count is not None:
@@ -90,26 +66,83 @@ def _mock_anchorer(quorum=None, anchor_count=None):
     def _prepare(close_result):
         fields = AnchorFields("e1", b"\x01" * 32, b"\x00" * 32, b"\x00" * 32,
                               "cid_xyz", b"\x02" * 32, b"\x03" * 32)
-        return PreparedAnchor(fields=fields, digest=DIGEST, result=AnchorResult(
+        return PreparedAnchor(fields=fields, result=AnchorResult(
             success=False, epoch_id="e1", agent_mint_cid="cid_xyz",
             agent_mint_blob=b"blob-bytes-here"))
 
-    anchorer.prepare_anchor.side_effect = _prepare
-    anchorer.are_registered.side_effect = lambda addrs: [True] * len(addrs)
-    decide = quorum or (lambda signers: True)
-    anchorer.anchor_quorum.side_effect = lambda signers: {
-        "weight": len(signers), "total": 2, "genesis": True,
-        "reached": decide(signers)}
-
-    def _submit(prepared, signatures, **kw):
+    def _submit(prepared, **kw):
         r = prepared.result
         r.success = True
         r.tx_hash = "0xtx"
-        r.signers = list(signatures)
         return r
 
+    anchorer.prepare_anchor.side_effect = _prepare
     anchorer.submit_prepared.side_effect = _submit
     return anchorer
+
+
+def _mock_governed(*, direct: bool, available: bool = True, states=("active",)):
+    """GovernedAnchorer stand-in. ``states`` are returned by successive
+    step() calls (the last one repeats)."""
+    ga = MagicMock()
+    ga.direct = direct
+    ga.available = direct or available
+
+    def _build(epoch_id, args):
+        return AnchorProposal(epoch_id=epoch_id, targets=["0x" + "1" * 40],
+                              values=[0], calldatas=[b"\x00"],
+                              description=f"Anchor epoch {epoch_id} 0x01",
+                              description_hash=b"\x00" * 32, proposal_id=42)
+
+    seq = list(states)
+
+    def _step(p, voters, *, may_propose=True):
+        st = seq.pop(0) if len(seq) > 1 else seq[0]
+        p.last_state = st
+        return st
+
+    ga.build.side_effect = _build
+    ga.step.side_effect = _step
+    return ga
+
+
+def _make_driver(*, enabled: bool = True,
+                 agents: List[AgentChainIdentity] = None,
+                 governed=None):
+    cfg = ChainSubmissionConfig(
+        substrate_address="0x" + "1" * 40 if enabled else "",
+        rpc_url="http://localhost:8545",
+        chain_id=31337,
+        daemon_private_key="0x" + "2" * 64 if enabled else "",
+    )
+    if governed is None and enabled:
+        governed = _mock_governed(direct=True)
+    return ChainSubmissionDriver(
+        config=cfg,
+        agent_chain_resolver=lambda: list(agents or []),
+        blob_resolver=InMemoryBlobResolver(),
+        anchorer=_mock_anchorer() if enabled else None,
+        governed=governed,
+        tick_interval=3600.0,   # the background ticker never fires in tests
+    )
+
+
+@pytest.fixture
+def fake_submit():
+    r = MagicMock(success=True, tx_hash="0xagent_tx", raw_mint=1.0, error="")
+    with patch(SUBMIT, return_value=r) as m:
+        yield m
+
+
+AGENTS = [
+    AgentChainIdentity(address="0xAAA", private_key="0x" + "a" * 64),
+    AgentChainIdentity(address="0xBBB", private_key="0x" + "b" * 64),
+]
+
+
+# ---------------------------------------------------------------------------
+# Disabled / direct mode
+# ---------------------------------------------------------------------------
 
 
 def test_disabled_mode_is_no_op():
@@ -120,156 +153,164 @@ def test_disabled_mode_is_no_op():
     assert out["agent_submissions"] == []
 
 
-def test_winner_anchors_and_writes_blob():
-    driver = _make_driver()
+def test_direct_winner_anchors_writes_blob_then_submits_agents(fake_submit):
+    driver = _make_driver(agents=AGENTS)
     out = driver.handle_federated_close(_fed("e1", is_winner=True))
     assert out["anchored"] is True
     assert out["anchor_tx"] == "0xtx"
-    # Blob from anchor result should now be in the resolver.
     assert driver.blob_resolver.has("cid_xyz") or len(driver.blob_resolver) > 0
+    assert {r["agent_address"] for r in out["agent_submissions"]} == {"0xAAA", "0xBBB"}
+    driver._governed.build.assert_not_called()
 
 
-def test_non_winner_skips_anchor():
-    driver = _make_driver()
-    # Make sure anchorer is NOT called when not the winner.
+def test_direct_non_winner_skips_anchor_but_submits(fake_submit):
+    driver = _make_driver(agents=AGENTS)
     out = driver.handle_federated_close(_fed("e1", is_winner=False))
     assert out["anchored"] is False
     driver._anchorer.submit_prepared.assert_not_called()
+    assert len(out["agent_submissions"]) == 2
 
 
-def test_per_agent_submitter_cache():
-    """Two close events => same submitter instance reused per agent
-    address."""
-    agents = [
-        AgentChainIdentity(address="0xAAA", private_key="0x" + "a" * 64),
-        AgentChainIdentity(address="0xBBB", private_key="0x" + "b" * 64),
-    ]
-    driver = _make_driver(agents=agents)
-
-    # Mock submit_for_epoch on each cached submitter so we don't
-    # hit a real chain.
-    fake_result = MagicMock()
-    fake_result.success = True
-    fake_result.tx_hash = "0xagent_tx"
-    fake_result.raw_mint = 1.0
-    fake_result.error = ""
-
-    with patch(
-        "nodes.common.chain_submission_driver.AuthoritativeChainSubmitter.submit_for_epoch",
-        return_value=fake_result,
-    ):
-        out1 = driver.handle_federated_close(_fed("e1", is_winner=True))
-        out2 = driver.handle_federated_close(_fed("e2", is_winner=False))
-
+def test_per_agent_submitter_cache(fake_submit):
+    driver = _make_driver(agents=AGENTS)
+    out1 = driver.handle_federated_close(_fed("e1", is_winner=True))
+    out2 = driver.handle_federated_close(_fed("e2", is_winner=False))
     assert len(out1["agent_submissions"]) == 2
     assert len(out2["agent_submissions"]) == 2
-    # Both calls returned for both agents.
-    addrs = {r["agent_address"] for r in out1["agent_submissions"]}
-    assert addrs == {"0xAAA", "0xBBB"}
-
-    # Cache should hold one submitter per agent address.
     assert set(driver._submitter_cache.keys()) == {"0xAAA", "0xBBB"}
 
 
-def test_agent_resolver_filtering():
-    """Agents missing address or private_key are silently skipped."""
+def test_agent_resolver_filtering(fake_submit):
     agents = [
         AgentChainIdentity(address="0xAAA", private_key="0x" + "a" * 64),
-        AgentChainIdentity(address="", private_key="0x" + "b" * 64),  # no addr
-        AgentChainIdentity(address="0xCCC", private_key=""),           # no key
+        AgentChainIdentity(address="", private_key="0x" + "b" * 64),
+        AgentChainIdentity(address="0xCCC", private_key=""),
     ]
     driver = _make_driver(agents=agents)
-
-    fake_result = MagicMock()
-    fake_result.success = True
-    fake_result.tx_hash = "0xagent_tx"
-    fake_result.raw_mint = 0.5
-    fake_result.error = ""
-
-    with patch(
-        "nodes.common.chain_submission_driver.AuthoritativeChainSubmitter.submit_for_epoch",
-        return_value=fake_result,
-    ):
-        out = driver.handle_federated_close(_fed("e1", is_winner=True))
-
+    out = driver.handle_federated_close(_fed("e1", is_winner=True))
     assert len(out["agent_submissions"]) == 1
     assert out["agent_submissions"][0]["agent_address"] == "0xAAA"
 
 
-# ---------------------------------------------------------------------------
-# Anchor signing round (2026-10-12)
-# ---------------------------------------------------------------------------
-
-from types import SimpleNamespace
-
-from eth_account import Account
-
-from nodes.common.event_gossip import InMemoryHub, InMemoryTransport
-
-
-def _ident(seed: str) -> AgentChainIdentity:
-    key = "0x" + seed * 64
-    return AgentChainIdentity(address=Account.from_key(key).address,
-                              private_key=key)
-
-
-def _gossip(hub):
-    return SimpleNamespace(transport=InMemoryTransport(hub), topic="t/events")
-
-
-def test_signing_round_publishes_and_winner_collects_peer_signature():
-    hub = InMemoryHub()
-    a, b = _ident("a"), _ident("b")
-    need = {a.address, b.address}
-    winner = _make_driver(agents=[a], gossip=_gossip(hub), timeout=2.0)
-    winner._anchorer = _mock_anchorer(quorum=lambda s: set(s) >= need)
-    peer = _make_driver(agents=[b], gossip=_gossip(hub))
-
-    # The peer closes first: its signature is cached by the winner.
-    out_peer = peer.handle_federated_close(_fed("e1", is_winner=False))
-    assert out_peer["signatures_published"] == 1
-    assert len(winner.signatures_for(DIGEST.hex())) == 1
-
-    out = winner.handle_federated_close(_fed("e1", is_winner=True))
-    assert out["anchored"] is True
-    sigs = winner._anchorer.submit_prepared.call_args[0][1]
-    assert len(sigs) == 2
-
-
-def test_single_daemon_own_signatures_reach_quorum_without_waiting():
-    a = _ident("c")
-    driver = _make_driver(agents=[a], timeout=30.0)
-    out = driver.handle_federated_close(_fed("e1", is_winner=True))
-    assert out["anchored"] is True
-
-
-def test_quorum_timeout_reports_error_and_does_not_submit():
-    a = _ident("d")
-    driver = _make_driver(agents=[a], timeout=0.2)
-    driver._anchorer = _mock_anchorer(quorum=lambda s: False)
-    out = driver.handle_federated_close(_fed("e1", is_winner=True))
-    assert out["anchored"] is False
-    assert "quorum not reached" in out["anchor_error"]
-    driver._anchorer.submit_prepared.assert_not_called()
-
-
-def test_stale_snapshot_is_never_signed():
-    a = _ident("e")
-    driver = _make_driver(agents=[a])
+def test_stale_snapshot_is_never_anchored():
+    driver = _make_driver()
     driver._anchorer = _mock_anchorer(anchor_count=5)
     fed = _fed("e1", is_winner=True)
     fed.snapshot_anchor_count = 4
     out = driver.handle_federated_close(fed)
-    assert "stale snapshot" in out["sign_skipped"]
+    assert "stale snapshot" in out["anchor_skipped"]
     assert out["anchored"] is False
     driver._anchorer.prepare_anchor.assert_not_called()
 
 
-def test_garbage_signature_messages_are_ignored():
-    hub = InMemoryHub()
-    driver = _make_driver(gossip=_gossip(hub))
-    other = InMemoryTransport(hub)
-    other.publish("t/events/anchor-sig/1", b"not json")
-    other.publish("t/events/anchor-sig/1",
-                  b'{"digest": "' + DIGEST.hex().encode() + b'", "sig": "00"}')
-    assert driver.signatures_for(DIGEST.hex()) == []
+def test_already_anchored_skips_prepare(fake_submit):
+    driver = _make_driver(agents=AGENTS)
+    driver._anchorer.is_anchored.return_value = True
+    out = driver.handle_federated_close(_fed("e1", is_winner=True))
+    assert out["anchor_skipped"] == "already anchored"
+    driver._anchorer.prepare_anchor.assert_not_called()
+    assert len(out["agent_submissions"]) == 2
+
+
+def test_no_authority_reports_error():
+    ga = _mock_governed(direct=False, available=False)
+    driver = _make_driver(governed=ga)
+    out = driver.handle_federated_close(_fed("e1", is_winner=True))
+    assert out["anchored"] is False
+    assert "no DAO governor" in out["anchor_error"]
+    driver._anchorer.submit_prepared.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Governed mode
+# ---------------------------------------------------------------------------
+
+
+def test_governed_winner_parks_proposal_and_tick_submits_once_anchored(fake_submit):
+    ga = _mock_governed(direct=False, states=("active",))
+    driver = _make_driver(agents=AGENTS, governed=ga)
+    try:
+        out = driver.handle_federated_close(_fed("e1", is_winner=True))
+        assert out["anchored"] is False
+        assert out["anchor_state"] == "active"
+        assert out["anchor_proposal"] == hex(42)
+        assert out["agent_submissions"] == []
+        assert ga.step.call_args.kwargs["may_propose"] is True
+        assert driver.pending_proposals == {"e1": "active"}
+        driver._anchorer.submit_prepared.assert_not_called()
+        fake_submit.assert_not_called()
+
+        # Not anchored yet: tick steps again, still parked.
+        driver.tick()
+        assert ga.step.call_count == 2
+        assert driver.pending_proposals == {"e1": "active"}
+        fake_submit.assert_not_called()
+
+        # The timelock executed it: the next tick submits the mints.
+        driver._anchorer.is_anchored.return_value = True
+        driver.tick()
+        assert fake_submit.call_count == 2
+        assert driver.pending_proposals == {}
+        assert ga.step.call_count == 2   # no step once anchored
+    finally:
+        driver.stop()
+
+
+def test_governed_non_winner_does_not_propose_on_close():
+    ga = _mock_governed(direct=False, states=("nonexistent",))
+    driver = _make_driver(governed=ga)
+    try:
+        out = driver.handle_federated_close(_fed("e1", is_winner=False))
+        assert ga.step.call_args.kwargs["may_propose"] is False
+        assert out["anchor_state"] == "nonexistent"
+        # Within one tick interval of the close it still may not propose.
+        driver.tick()
+        assert ga.step.call_args.kwargs["may_propose"] is False
+        # After a tick interval, a non-winner proposes too.
+        driver._pending["e1"].created -= 2 * driver.tick_interval
+        driver.tick()
+        assert ga.step.call_args.kwargs["may_propose"] is True
+    finally:
+        driver.stop()
+
+
+def test_governed_executed_in_one_step_submits_immediately(fake_submit):
+    ga = _mock_governed(direct=False, states=("executed",))
+    driver = _make_driver(agents=AGENTS, governed=ga)
+    out = driver.handle_federated_close(_fed("e1", is_winner=True))
+    assert out["anchored"] is True
+    assert len(out["agent_submissions"]) == 2
+    assert driver.pending_proposals == {}
+
+
+def test_governed_tick_executed_state_submits(fake_submit):
+    ga = _mock_governed(direct=False, states=("active", "executed"))
+    driver = _make_driver(agents=AGENTS, governed=ga)
+    try:
+        driver.handle_federated_close(_fed("e1", is_winner=True))
+        driver.tick()
+        assert fake_submit.call_count == 2
+        assert driver.pending_proposals == {}
+    finally:
+        driver.stop()
+
+
+def test_governed_defeated_proposal_is_dropped(fake_submit):
+    ga = _mock_governed(direct=False, states=("active", "defeated"))
+    driver = _make_driver(agents=AGENTS, governed=ga)
+    try:
+        driver.handle_federated_close(_fed("e1", is_winner=True))
+        driver.tick()
+        assert driver.pending_proposals == {}
+        fake_submit.assert_not_called()
+    finally:
+        driver.stop()
+
+
+def test_governed_build_failure_reports_error():
+    ga = _mock_governed(direct=False)
+    ga.build.side_effect = RuntimeError("rpc down")
+    driver = _make_driver(governed=ga)
+    out = driver.handle_federated_close(_fed("e1", is_winner=True))
+    assert "proposal build failed" in out["anchor_error"]
+    assert driver.pending_proposals == {}

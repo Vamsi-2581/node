@@ -1043,15 +1043,13 @@ class AutonetService:
             rpc_url=bc.rpc_url,
             chain_id=bc.chain_id,
             daemon_private_key=bc.private_key or "",
+            governor_address=getattr(bc, "governor_address", "") or "",
         )
         try:
             driver = ChainSubmissionDriver(
                 config=cfg,
                 agent_chain_resolver=agent_chain_resolver,
                 blob_resolver=blob_resolver,
-                # Anchor signatures ride the same gossip transport as the
-                # event batches (topic <event topic>/anchor-sig/1).
-                gossip=getattr(self._federated_close_driver, "gossip", None),
             )
         except Exception as e:
             logger.warning("ChainSubmissionDriver build failed: %s", e)

@@ -5,14 +5,6 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {Checkpoints} from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 
-/// @notice Minimal read surface of the DAO-side RepToken (ERC20Votes,
-///         CLOCK_MODE "mode=timestamp"). Anchor authority weighs signers by
-///         their DELEGATED votes at the previous anchor's timestamp.
-interface IRepVotes {
-    function getPastVotes(address account, uint256 timepoint) external view returns (uint256);
-    function getPastTotalSupply(uint256 timepoint) external view returns (uint256);
-}
-
 /// @title Substrate — chain surface for the world-model substrate.
 ///
 /// Substrate-native replacement for the pre-substrate RPB / Registry /
@@ -92,63 +84,23 @@ contract Substrate is EIP712 {
     ///        mintFromVault. Immutable — no admin key to repoint it.
     ///        Zero address = no vault: mintFromVault always reverts and the
     ///        purchased-money feature is off.
-    /// @param governor_ The single address (expected: the DAO timelock)
-    ///        allowed to retune the service fee via setServiceFeeBps.
-    ///        Immutable. Zero address = knob frozen: the fee stays at its
-    ///        default and setServiceFeeBps always reverts.
-    /// @param repToken_ The DAO-side RepToken (ERC20Votes, timestamp clock)
-    ///        whose delegated votes weigh anchor signers. Immutable. Zero
-    ///        address = REP-less network: anchoring is authorized by the
-    ///        genesis signer set forever (local dev / test networks only).
-    /// @param anchorQuorumBps_ Anchor quorum: the signers' combined REP
-    ///        votes must STRICTLY EXCEED this share (bps) of the REP total
-    ///        supply at the snapshot. 1..9999. ECONOMIC PARAMETER (5000 =
-    ///        strict majority is the proposed default, pending user call).
-    /// @param genesisSigners_ Deployer-specified bootstrap signer set, used
-    ///        ONLY while the REP total supply at the snapshot is zero (or
-    ///        repToken_ is zero). Unique, non-zero.
-    /// @param genesisQuorum_ How many distinct genesis signers (each a
-    ///        registered, active agent) must sign a genesis-mode anchor.
-    ///        0 disables genesis anchoring (then REP must exist at deploy).
+    /// @param governor_ The DAO timelock. The only address that may anchor
+    ///        an epoch (anchor) and retune the service fee
+    ///        (setServiceFeeBps). Anchors arrive as ordinary DAO proposals
+    ///        (Decision 2026-10-16), so the DAO's REP vote is the anchor
+    ///        authority and the DAO can cancel a bad anchor in the timelock.
+    ///        Immutable and non-zero.
     constructor(
         address treasury_,
         address vaultMinter_,
-        address governor_,
-        address repToken_,
-        uint16 anchorQuorumBps_,
-        address[] memory genesisSigners_,
-        uint256 genesisQuorum_
+        address governor_
     )
         EIP712("AutonetSubstrate", "1")
     {
+        if (governor_ == address(0)) revert NoAnchorAuthority();
         treasury = treasury_;
         vaultMinter = vaultMinter_;
         governor = governor_;
-
-        if (anchorQuorumBps_ == 0 || anchorQuorumBps_ >= BPS_DENOM) {
-            revert BadAnchorQuorum(anchorQuorumBps_);
-        }
-        if (
-            genesisQuorum_ > genesisSigners_.length
-                || genesisQuorum_ > MAX_ANCHOR_SIGNERS
-        ) {
-            revert BadGenesisQuorum(genesisQuorum_);
-        }
-        // A REP-less network with no genesis set could never anchor.
-        if (repToken_ == address(0) && genesisQuorum_ == 0) {
-            revert NoAnchorAuthority();
-        }
-        for (uint256 i = 0; i < genesisSigners_.length; i++) {
-            address g = genesisSigners_[i];
-            if (g == address(0) || isGenesisSigner[g]) {
-                revert BadGenesisSigner(g);
-            }
-            isGenesisSigner[g] = true;
-            _genesisSigners.push(g);
-        }
-        repToken = IRepVotes(repToken_);
-        anchorQuorumBps = anchorQuorumBps_;
-        genesisQuorum = genesisQuorum_;
         deployedAt = block.timestamp;
     }
 
@@ -208,73 +160,27 @@ contract Substrate is EIP712 {
     error EpochAlreadyAnchored(string epochId);
     error PrevEpochRootMismatch(bytes32 expected, bytes32 got);
     error PrevAnchorHashMismatch(bytes32 expected, bytes32 got);
-    error BadAnchorQuorum(uint16 bps);
-    error BadGenesisQuorum(uint256 quorum);
-    error BadGenesisSigner(address signer);
     error NoAnchorAuthority();
-    error TooManySigners(uint256 count);
-    error SignersNotSorted(address prev, address next);
-    error AnchorSnapshotNotFinal(uint256 snapshot, uint256 nowTs);
-    error AnchorQuorumNotMet(uint256 weight, uint256 total, bool genesis);
 
     // =========================================================================
-    // Anchor authority (2026-10-12)
+    // Anchor authority (Decision 2026-10-16)
     //
-    // An anchor is accepted only with EIP-712 signatures over its full
-    // content (AnchorApproval; domain AutonetSubstrate/1 + chainId + this
-    // address) from registered, active agents whose combined DELEGATED REP
-    // votes (RepToken.getPastVotes) at the snapshot STRICTLY EXCEED
-    // anchorQuorumBps of RepToken.getPastTotalSupply at the snapshot. The
-    // snapshot is the previous anchor's timestamp (deployedAt for the first
-    // anchor), the same pin the daemon's voice weights use.
-    //
-    // Genesis bootstrap: while REP total supply at the snapshot is zero (or
-    // no RepToken is wired), weight is a COUNT of distinct genesis signers
-    // (deployer-fixed, immutable) and must reach genesisQuorum. Registration
-    // is permissionless, so a registered-agent-count rule would be sybilable;
-    // the fixed set is not. The set loses all power once REP exists.
-    // msg.sender carries no authority: anyone may relay a signed anchor.
+    // Only the governor (the DAO timelock) anchors. Each anchor is an
+    // ordinary DAO proposal calling anchor(...): REP holders vote, the DAO
+    // Governor decides it early once the outcome cannot change (For above
+    // half of REP at the snapshot, or Against at half), and the timelock
+    // executes it. The REP-signature quorum and the genesis signer set this
+    // replaces are gone; the hash chain and the fees-only mint cap stay here.
     // =========================================================================
 
-    bytes32 public constant ANCHOR_APPROVAL_TYPEHASH = keccak256(
-        "AnchorApproval(string epochId,bytes32 epochRoot,bytes32 prevEpochRoot,"
-        "bytes32 prevAnchorHash,string agentMintCid,bytes32 payloadHash,"
-        "bytes32 agentMintRoot)"
-    );
-
-    /// @notice Hard cap on signatures per anchor (gas bound).
-    uint256 public constant MAX_ANCHOR_SIGNERS = 64;
-
-    /// @notice DAO RepToken whose delegated votes weigh anchor signers.
-    IRepVotes public immutable repToken;
-    /// @notice Signed REP weight must strictly exceed this share (bps) of
-    ///         REP total supply at the snapshot. ECONOMIC PARAMETER.
-    uint16 public immutable anchorQuorumBps;
-    /// @notice Distinct genesis signers required while REP supply is zero.
-    uint256 public immutable genesisQuorum;
     /// @notice Deployment timestamp: the REP snapshot for the first anchor.
     uint256 public immutable deployedAt;
-    mapping(address => bool) public isGenesisSigner;
-    address[] private _genesisSigners;
 
     /// @notice ATN burned by payForService fees since the last anchor.
     uint256 public burnedSinceAnchor;
 
-    event AnchorAuthorized(
-        bytes32 indexed epochIdHash,
-        uint256 signerCount,
-        uint256 weight,
-        uint256 total,
-        bool genesis,
-        uint256 mintPool,
-        uint256 windowBurned
-    );
-
-    function genesisSigners() external view returns (address[] memory) {
-        return _genesisSigners;
-    }
-
-    /// @notice The REP timepoint the NEXT anchor is weighed at.
+    /// @notice The REP timepoint the close weighs the NEXT epoch at (the
+    ///         previous anchor's timestamp; deployedAt before any anchor).
     function anchorSnapshotTime() public view returns (uint256) {
         uint256 n = anchors.length;
         return n == 0 ? deployedAt : anchors[n - 1].timestamp;
@@ -287,8 +193,12 @@ contract Substrate is EIP712 {
         return n == 0 ? 0 : anchors[n - 1].windowBurned;
     }
 
-    /// @notice EIP-712 digest every anchor signer signs.
-    function anchorDigest(
+    /// @notice Anchor a network epoch close. Governor only: the call
+    ///         arrives through a DAO proposal executed by the timelock.
+    /// @param agentMintRoot Merkle root over the epoch's
+    ///        (agent, scaledAmount) mint map; sorted-pair hashing,
+    ///        double-hashed leaves (see recordTrainingForEpoch).
+    function anchor(
         string calldata epochId,
         bytes32 epochRoot,
         bytes32 prevEpochRoot,
@@ -296,90 +206,8 @@ contract Substrate is EIP712 {
         string calldata agentMintCid,
         bytes32 payloadHash,
         bytes32 agentMintRoot
-    ) public view returns (bytes32) {
-        return _hashTypedDataV4(keccak256(abi.encode(
-            ANCHOR_APPROVAL_TYPEHASH,
-            keccak256(bytes(epochId)),
-            epochRoot,
-            prevEpochRoot,
-            prevAnchorHash,
-            keccak256(bytes(agentMintCid)),
-            payloadHash,
-            agentMintRoot
-        )));
-    }
-
-    /// @notice Quorum status of a candidate signer set for the NEXT anchor.
-    ///         `signers` must be strictly ascending (unique) and at most
-    ///         MAX_ANCHOR_SIGNERS long. Unregistered / inactive addresses
-    ///         contribute zero. REP mode: weight/total are RepToken votes /
-    ///         past total supply at anchorSnapshotTime(). Genesis mode:
-    ///         weight = distinct genesis signers, total = genesisQuorum.
-    function anchorQuorum(address[] calldata signers)
-        external
-        view
-        returns (uint256 weight, uint256 total, bool genesis, bool reached)
-    {
-        return _anchorQuorum(signers);
-    }
-
-    function _anchorQuorum(address[] memory signers)
-        private
-        view
-        returns (uint256 weight, uint256 total, bool genesis, bool reached)
-    {
-        if (signers.length > MAX_ANCHOR_SIGNERS) {
-            revert TooManySigners(signers.length);
-        }
-        for (uint256 i = 1; i < signers.length; i++) {
-            if (signers[i] <= signers[i - 1]) {
-                revert SignersNotSorted(signers[i - 1], signers[i]);
-            }
-        }
-        uint256 ts = anchorSnapshotTime();
-        if (address(repToken) != address(0)) {
-            // ERC20Votes rejects lookups at/after the current clock.
-            if (ts >= block.timestamp) {
-                revert AnchorSnapshotNotFinal(ts, block.timestamp);
-            }
-            total = repToken.getPastTotalSupply(ts);
-        }
-        genesis = total == 0;
-        if (genesis) {
-            for (uint256 i = 0; i < signers.length; i++) {
-                address a = signers[i];
-                if (isGenesisSigner[a] && agents[a].active) weight += 1;
-            }
-            total = genesisQuorum;
-            reached = genesisQuorum > 0 && weight >= genesisQuorum;
-        } else {
-            for (uint256 i = 0; i < signers.length; i++) {
-                address a = signers[i];
-                if (agents[a].active) {
-                    weight += repToken.getPastVotes(a, ts);
-                }
-            }
-            reached = weight * BPS_DENOM > total * anchorQuorumBps;
-        }
-    }
-
-    /// @notice Submit an anchor for a network epoch close.
-    /// @param agentMintRoot Merkle root over the epoch's
-    ///        (agent, scaledAmount) mint map; sorted-pair hashing,
-    ///        double-hashed leaves (see recordTrainingForEpoch).
-    /// @param signatures EIP-712 AnchorApproval signatures (anchorDigest)
-    ///        whose RECOVERED signer addresses are strictly ascending. The
-    ///        set must meet the anchor quorum (see anchorQuorum).
-    function submitAnchor(
-        string calldata epochId,
-        bytes32 epochRoot,
-        bytes32 prevEpochRoot,
-        bytes32 prevAnchorHash,
-        string calldata agentMintCid,
-        bytes32 payloadHash,
-        bytes32 agentMintRoot,
-        bytes[] calldata signatures
     ) external {
+        if (msg.sender != governor) revert NotGovernor();
         if (bytes(epochId).length == 0) revert EpochIdEmpty();
         if (anchorIndexByEpochId[epochId] != 0) {
             revert EpochAlreadyAnchored(epochId);
@@ -397,27 +225,6 @@ contract Substrate is EIP712 {
         uint256 mintPool = nextMintPool();
         uint256 windowBurned = burnedSinceAnchor;
 
-        // Anchor authority: recover, then weigh at the previous anchor.
-        {
-            if (signatures.length > MAX_ANCHOR_SIGNERS) {
-                revert TooManySigners(signatures.length);
-            }
-            bytes32 digest = anchorDigest(
-                epochId, epochRoot, prevEpochRoot, prevAnchorHash,
-                agentMintCid, payloadHash, agentMintRoot
-            );
-            address[] memory signers = new address[](signatures.length);
-            for (uint256 i = 0; i < signatures.length; i++) {
-                signers[i] = ECDSA.recover(digest, signatures[i]);
-            }
-            (uint256 weight, uint256 total, bool genesis, bool reached) =
-                _anchorQuorum(signers);
-            if (!reached) revert AnchorQuorumNotMet(weight, total, genesis);
-            emit AnchorAuthorized(
-                epochIdHash, signers.length, weight, total, genesis,
-                mintPool, windowBurned
-            );
-        }
         burnedSinceAnchor = 0;
 
         anchors.push(Anchor({

@@ -1,8 +1,9 @@
 /**
  * Deploy contracts/core/Substrate.sol to a Hardhat-configured network.
  *
- * Constructor (2026-10-12): (treasury, vaultMinter, governor, repToken,
- * anchorQuorumBps, genesisSigners[], genesisQuorum), all from env below.
+ * Constructor (Decision 2026-10-16): (treasury, vaultMinter, governor),
+ * all from env below. The governor (the DAO timelock) is the only address
+ * that may anchor an epoch or retune the service fee.
  * Writes the deployed address + network info to
  * deployments/<network>.json so daemons + tests can pick it up.
  *
@@ -44,52 +45,23 @@ async function main() {
     "0x0000000000000000000000000000000000000000";
   console.log(`VaultMinter: ${vaultMinter}`);
 
-  // Governor: the single address allowed to retune the service fee via
-  // setServiceFeeBps (expected: the DAO timelock). Immutable; no admin key.
-  // Defaults to the zero address (knob frozen — fee stays at its default) —
-  // pass GOVERNOR to hand the fee lever to the DAO.
-  const governor =
-    process.env.GOVERNOR ||
-    "0x0000000000000000000000000000000000000000";
-  console.log(`Governor: ${governor}`);
-
-  // Anchor authority (2026-10-12). REP_TOKEN: the DAO RepToken whose
-  // delegated votes (getPastVotes at the previous anchor's timestamp) weigh
-  // anchor signers. Zero = REP-less network (genesis set forever; local dev
-  // only). ANCHOR_QUORUM_BPS: signed weight must strictly exceed this share
-  // of REP past total supply (ECONOMIC PARAMETER, proposed 5000). GENESIS_
-  // SIGNERS (comma-separated agent addresses) + GENESIS_QUORUM: the
-  // bootstrap rule used only while REP total supply at the snapshot is 0.
-  // Note: an EOA that holds REP must DELEGATE to a registered agent address
-  // for that weight to count (the genesis REP holder included).
-  const ZERO = "0x0000000000000000000000000000000000000000";
-  const repToken = process.env.REP_TOKEN || ZERO;
-  const anchorQuorumBps = Number(process.env.ANCHOR_QUORUM_BPS || 5000);
-  const genesisSigners = (process.env.GENESIS_SIGNERS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const genesisQuorum = Number(
-    process.env.GENESIS_QUORUM ||
-      (genesisSigners.length ? Math.floor(genesisSigners.length / 2) + 1 : 0)
-  );
-  console.log(`RepToken: ${repToken}`);
-  console.log(`AnchorQuorumBps: ${anchorQuorumBps}`);
-  console.log(`GenesisSigners: ${genesisSigners.join(",") || "(none)"} quorum=${genesisQuorum}`);
-  if (repToken === ZERO && genesisQuorum === 0) {
-    throw new Error("REP_TOKEN unset and no GENESIS_SIGNERS: nobody could ever anchor");
+  // Governor: the DAO timelock. The only address allowed to anchor an
+  // epoch (Substrate.anchor, reached through an ordinary DAO proposal) and
+  // to retune the service fee (setServiceFeeBps). Immutable and non-zero.
+  // TIMELOCK wins over GOVERNOR. Dev networks may pass an EOA (the
+  // daemon's key) so the daemon anchors directly.
+  const governor = process.env.TIMELOCK || process.env.GOVERNOR || "";
+  if (!governor || /^0x0{40}$/i.test(governor)) {
+    throw new Error("set TIMELOCK (or GOVERNOR): the address that anchors epochs");
   }
+  console.log(`Governor: ${governor}`);
 
   console.log("Deploying Substrate.sol...");
   const Substrate = await ethers.getContractFactory("Substrate");
   const substrate = await Substrate.deploy(
     treasury,
     vaultMinter,
-    governor,
-    repToken,
-    anchorQuorumBps,
-    genesisSigners,
-    genesisQuorum
+    governor
   );
   await substrate.waitForDeployment();
   const address = await substrate.getAddress();
@@ -111,10 +83,6 @@ async function main() {
     treasury: treasury,
     vault_minter: vaultMinter,
     governor: governor,
-    rep_token: repToken,
-    anchor_quorum_bps: anchorQuorumBps,
-    genesis_signers: genesisSigners,
-    genesis_quorum: genesisQuorum,
     deployer: deployer.address,
     deployment_tx: tx ? tx.hash : null,
     deployed_at: new Date().toISOString(),

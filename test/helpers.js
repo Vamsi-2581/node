@@ -5,54 +5,37 @@ const digest = (s) => ethers.keccak256(ethers.toUtf8Bytes(s));
 
 // Reserved signer slots (tests use indices 0..15).
 //   16: fee payer for seedPool, 17: fee recipient for seedPool,
-//   18: default genesis anchor signer (registered agent),
+//   18: default Substrate governor (the only account that may anchor;
+//       production uses the DAO timelock, Decision 2026-10-16),
 //   19: default vaultMinter (test faucet for purchased ATN).
 const SLOT_POOL_PAYER = 16;
 const SLOT_POOL_RECIPIENT = 17;
-const SLOT_GENESIS = 18;
+const SLOT_GOVERNOR = 18;
 const SLOT_VAULT = 19;
 
-// substrate address (lowercase) -> { vaultFaucet, anchorSigners }
+// substrate address (lowercase) -> { vaultFaucet, governor }
 const _ctx = {};
 const ctxOf = async (substrate) =>
   _ctx[(await substrate.getAddress()).toLowerCase()] || {};
 
-// Deploy Substrate with explicit constructor args. Defaults: REP-less
-// network (repToken = 0), quorum 5000 bps, genesis set = [signers[18]]
-// with genesisQuorum 1 (the signer is registered as an agent here),
-// vaultMinter = signers[19] (test faucet).
+// Deploy Substrate(treasury, vaultMinter, governor). Defaults: treasury =
+// signers[0], vaultMinter = signers[19] (test faucet), governor =
+// signers[18] (anchors via anchorEpoch).
 async function deploySubstrateWith(opts = {}) {
   const signers = await ethers.getSigners();
-  const genesisSigner = signers[SLOT_GENESIS];
   const vaultSigner = signers[SLOT_VAULT];
   const treasury = opts.treasury !== undefined ? opts.treasury : signers[0].address;
   const vaultMinter =
     opts.vaultMinter !== undefined ? opts.vaultMinter : vaultSigner.address;
-  const governor = opts.governor !== undefined ? opts.governor : ZERO;
-  const repToken = opts.repToken !== undefined ? opts.repToken : ZERO;
-  const quorumBps = opts.quorumBps !== undefined ? opts.quorumBps : 5000;
-  const genesis = opts.genesisSigners || [genesisSigner];
-  const genesisQuorum =
-    opts.genesisQuorum !== undefined ? opts.genesisQuorum : genesis.length ? 1 : 0;
+  const governor =
+    opts.governor !== undefined ? opts.governor : signers[SLOT_GOVERNOR].address;
   const Substrate = await ethers.getContractFactory("Substrate");
-  const substrate = await Substrate.deploy(
-    treasury,
-    vaultMinter,
-    governor,
-    repToken,
-    quorumBps,
-    genesis.map((g) => g.address),
-    genesisQuorum
-  );
+  const substrate = await Substrate.deploy(treasury, vaultMinter, governor);
   await substrate.waitForDeployment();
-  if (opts.registerGenesis !== false) {
-    for (let i = 0; i < genesis.length; i++) {
-      await registerAgent(substrate, genesis[i], "genesis-signer-" + i);
-    }
-  }
   _ctx[(await substrate.getAddress()).toLowerCase()] = {
     vaultFaucet: vaultMinter === vaultSigner.address ? vaultSigner : null,
-    anchorSigners: genesis.slice(0, Math.max(genesisQuorum, 1)),
+    governor:
+      signers.find((x) => x.address.toLowerCase() === governor.toLowerCase()) || null,
   };
   return substrate;
 }
@@ -75,30 +58,8 @@ async function deployToken(name = "TestUSD", symbol = "TUSD") {
 }
 
 // ---------------------------------------------------------------------------
-// Anchor authority (2026-10-12): EIP-712 AnchorApproval signatures.
+// Anchoring (Decision 2026-10-16): Substrate.anchor is governor-only.
 // ---------------------------------------------------------------------------
-
-const ANCHOR_TYPES = {
-  AnchorApproval: [
-    { name: "epochId", type: "string" },
-    { name: "epochRoot", type: "bytes32" },
-    { name: "prevEpochRoot", type: "bytes32" },
-    { name: "prevAnchorHash", type: "bytes32" },
-    { name: "agentMintCid", type: "string" },
-    { name: "payloadHash", type: "bytes32" },
-    { name: "agentMintRoot", type: "bytes32" },
-  ],
-};
-
-async function anchorDomain(substrate) {
-  const net = await ethers.provider.getNetwork();
-  return {
-    name: "AutonetSubstrate",
-    version: "1",
-    chainId: net.chainId,
-    verifyingContract: await substrate.getAddress(),
-  };
-}
 
 // Anchor fields chained onto the current chain head.
 async function anchorFields(substrate, epochId, agentMintRoot) {
@@ -113,42 +74,26 @@ async function anchorFields(substrate, epochId, agentMintRoot) {
   };
 }
 
-async function signAnchor(substrate, signer, f) {
-  return signer.signTypedData(await anchorDomain(substrate), ANCHOR_TYPES, f);
-}
-
-// Signatures from `signers`, ordered by ascending signer address (the
-// contract requires strictly ascending recovered addresses).
-async function signAnchorSorted(substrate, signers, f) {
-  const sorted = [...signers].sort((a, b) =>
-    BigInt(a.address) < BigInt(b.address) ? -1 : 1
-  );
-  const sigs = [];
-  for (const s of sorted) sigs.push(await signAnchor(substrate, s, f));
-  return sigs;
-}
-
-function submitAnchorTx(substrate, relayer, f, sigs) {
+function anchorTx(substrate, sender, f) {
   return substrate
-    .connect(relayer)
-    .submitAnchor(
+    .connect(sender)
+    .anchor(
       f.epochId,
       f.epochRoot,
       f.prevEpochRoot,
       f.prevAnchorHash,
       f.agentMintCid,
       f.payloadHash,
-      f.agentMintRoot,
-      sigs
+      f.agentMintRoot
     );
 }
 
-// Anchor `epochId` signed by `signers` (default: the deploy's genesis set).
-async function anchorSigned(substrate, relayer, epochId, agentMintRoot, signers) {
+// Anchor `epochId` from `sender` (default: the deploy's governor).
+async function anchorEpoch(substrate, epochId, agentMintRoot, sender) {
   const f = await anchorFields(substrate, epochId, agentMintRoot);
-  const ctx = await ctxOf(substrate);
-  const sigs = await signAnchorSorted(substrate, signers || ctx.anchorSigners || [], f);
-  await submitAnchorTx(substrate, relayer, f, sigs);
+  const s = sender || (await ctxOf(substrate)).governor;
+  if (!s) throw new Error("anchorEpoch: no governor signer for this substrate");
+  await (await anchorTx(substrate, s, f)).wait();
   return f;
 }
 
@@ -201,7 +146,7 @@ async function seedPool(substrate, gross = 1_000_000_000n) {
   await mintATN(substrate, null, payer, gross);
   await substrate.connect(payer).payForService(recipient.address, gross, digest("seed"));
   _seedCounter += 1;
-  await anchorSigned(substrate, payer, "seed-" + _seedCounter, ethers.ZeroHash);
+  await anchorEpoch(substrate, "seed-" + _seedCounter, ethers.ZeroHash);
   return substrate.nextMintPool();
 }
 
@@ -213,7 +158,7 @@ async function mintEarned(substrate, agentSigner, amount) {
   if (pool < amount) throw new Error("mintEarned: pool too small");
   _epochCounter += 1;
   const epochId = "earn-" + _epochCounter;
-  await anchorSigned(substrate, agentSigner, epochId, mintLeaf(agentSigner.address, amount));
+  await anchorEpoch(substrate, epochId, mintLeaf(agentSigner.address, amount));
   await substrate.connect(agentSigner).recordTrainingForEpoch(amount, digest(epochId), []);
   return epochId;
 }
@@ -254,9 +199,7 @@ module.exports = {
   seedPool,
   mintEarned,
   anchorFields,
-  signAnchor,
-  signAnchorSorted,
-  submitAnchorTx,
-  anchorSigned,
-  ANCHOR_TYPES,
+  anchorTx,
+  anchorEpoch,
+  SLOT_GOVERNOR,
 };

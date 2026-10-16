@@ -41,7 +41,6 @@ from nodes.common.event_gossip import EventBatch, Keypair
 from nodes.common.federated_reconcile import federated_epoch_close
 from tests.substrate_chain_helpers import (
     deploy_substrate,
-    genesis_keys,
     seed_pool,
 )
 
@@ -149,7 +148,7 @@ def _give_agent_some_atn(chain_fixture, agent_id: str, agent_addr: str) -> int:
         web3=w3, contract_abi=chain_fixture["abi"],
     )
     s = anchorer.anchor_close_result(
-        result, from_address=deployer, signer_keys=genesis_keys(w3))
+        result, from_address=deployer)
     assert s.success
     resolver = InMemoryBlobResolver()
     resolver.put(s.agent_mint_blob)

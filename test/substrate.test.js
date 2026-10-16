@@ -8,28 +8,25 @@ const {
   mintATN,
   deploySubstrateWith,
   seedPool,
-  anchorFields,
-  signAnchorSorted,
-  submitAnchorTx,
+  anchorEpoch,
 } = require("./helpers");
 
 const ZERO = "0x0000000000000000000000000000000000000000";
 
-// Deploy Substrate with an explicit governor (default governor=0 freezes the
-// fee knob; these tests need a live governor). The default test vault faucet
-// (signers[19]) stays wired so mintATN works.
+// Deploy Substrate with an explicit governor (ZERO = the helper default,
+// signers[18], which anchors). The default test vault faucet (signers[19])
+// stays wired so mintATN works.
 async function deployWith(treasury, vaultMinter, governor) {
-  const opts = { treasury, governor };
+  const opts = { treasury };
+  if (governor !== ZERO) opts.governor = governor;
   if (vaultMinter !== ZERO) opts.vaultMinter = vaultMinter;
   return deploySubstrateWith(opts);
 }
 
-// Anchor signed by the default genesis signer.
+// Anchor from the deploy's governor (Decision 2026-10-16). `relayer` is
+// unused: only the governor may anchor.
 async function genesisAnchor(substrate, relayer, epochId, root) {
-  const signers = await ethers.getSigners();
-  const f = await anchorFields(substrate, epochId, root);
-  const sigs = await signAnchorSorted(substrate, [signers[18]], f);
-  return submitAnchorTx(substrate, relayer, f, sigs);
+  return anchorEpoch(substrate, epochId, root);
 }
 
 // Sorted-pair keccak of two leaves (OpenZeppelin convention).
@@ -263,13 +260,11 @@ describe("Substrate — fees-only emission + REP-from-earnings (2026-07-10)", fu
       expect(await substrate.serviceFeeBps()).to.equal(1000);
     });
 
-    it("zero-address governor freezes the knob (setter always reverts)", async function () {
-      const substrate = await deployWith(deployer.address, ZERO, ZERO);
-      // Even the zero address itself cannot call (governor==0 branch).
+    it("zero-address governor is rejected at deploy", async function () {
+      const Substrate = await ethers.getContractFactory("Substrate");
       await expect(
-        substrate.connect(gov).setServiceFeeBps(500)
-      ).to.be.revertedWithCustomError(substrate, "NotGovernor");
-      expect(await substrate.serviceFeeBps()).to.equal(250);
+        Substrate.deploy(deployer.address, ZERO, ZERO)
+      ).to.be.revertedWithCustomError(Substrate, "NoAnchorAuthority");
     });
   });
 });

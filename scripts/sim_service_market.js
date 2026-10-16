@@ -86,9 +86,9 @@ async function main() {
 
   // --- deploy stack (deployer is the treasury for the fee split) ---
   const Substrate = await ethers.getContractFactory("Substrate");
-  const ZERO = "0x0000000000000000000000000000000000000000";
+  // (treasury, vaultMinter, governor): Decision 2026-10-16.
   const substrate = await Substrate.deploy(
-    deployer.address, deployer.address, ZERO, ZERO, 5000, [deployer.address], 1
+    deployer.address, deployer.address, deployer.address
   );
   _vaultMinter = deployer;
   await substrate.waitForDeployment();

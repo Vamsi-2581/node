@@ -6,7 +6,8 @@
 > **deleted wholesale in Phase 5.6a**. None of these exist in the repo today.
 > The live on-chain surface is four contracts under `contracts/core/`:
 > - **`Substrate.sol`**: constitutional core, covering epoch anchoring
->   (`submitAnchor`), agent registry (`registerAgent`/`updatePeerId`/
+>   (`anchor`, governor-only: the DAO timelock executes it as a proposal,
+>   Decision 2026-10-16), agent registry (`registerAgent`/`updatePeerId`/
 >   `updateEndpoint`), money-only training records
 >   (`recordTrainingForEpoch(amount, epochIdHash, proof)`, 2-field merkle
 >   leaf), ATN token (transferable, only mint path, no admin keys), and

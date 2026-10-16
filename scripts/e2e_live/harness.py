@@ -318,10 +318,10 @@ def deploy(w3) -> Dict[str, str]:
             raise RuntimeError(f"deploy {name} failed: {rcpt}")
         return rcpt.contractAddress
 
-    # (treasury, vaultMinter, governor, repToken, anchorQuorumBps,
-    #  genesisSigners, genesisQuorum), 2026-10-12 anchor authority.
+    # (treasury, vaultMinter, governor), Decision 2026-10-16: the deployer
+    # is the governor, so a daemon holding its key anchors directly.
     sub = _deploy("Substrate", "Substrate", acct.address, acct.address,
-                  zero, zero, 5000, [acct.address], 1)
+                  acct.address)
     out = {
         "substrate": sub,
         "service_registry": _deploy("ServiceRegistry", "ServiceMarket", sub),

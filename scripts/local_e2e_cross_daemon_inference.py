@@ -368,15 +368,13 @@ const { ethers } = require("hardhat");
 const fs = require("fs");
 async function main() {
   const [deployer] = await ethers.getSigners();
-  const zero = "0x0000000000000000000000000000000000000000";
-  // Substrate(treasury, vaultMinter, governor). governor=zero => the service
-  // fee is frozen at its 2.5% default, which is what this script asserts.
+  // Substrate(treasury, vaultMinter, governor), Decision 2026-10-16:
+  // deployer = treasury + test vaultMinter (purchased-ATN faucet) + governor
+  // (the only anchoring account). Nobody retunes the fee here, so it stays
+  // at its 2.5% default, which is what this script asserts.
   const Substrate = await ethers.getContractFactory("Substrate");
-  // Substrate(treasury, vaultMinter, governor, repToken, anchorQuorumBps,
-  // genesisSigners, genesisQuorum): deployer = treasury + test vaultMinter
-  // (purchased-ATN faucet) + sole genesis anchor signer (2026-10-12).
   const substrate = await Substrate.deploy(
-    deployer.address, deployer.address, zero, zero, 5000, [deployer.address], 1);
+    deployer.address, deployer.address, deployer.address);
   await substrate.waitForDeployment();
   const substrateAddr = await substrate.getAddress();
 
@@ -514,7 +512,7 @@ def fund_agent_atn(w3, substrate, *, epoch_id: str, agent_addr: str,
                    anchor_addr: str) -> int:
     """Fund an agent's own wallet with ATN.
 
-    Since 2026-10-12 a training mint needs a quorum-signed anchor AND a
+    A training mint needs a governor anchor (Decision 2026-10-16) AND a
     fees-only pool backed by burned service fees, so a fresh local chain
     cannot mint operating float through the close. The local deploy wires
     Substrate.vaultMinter to the deployer (``anchor_pk``), so this uses the
@@ -1139,7 +1137,7 @@ async def amain() -> int:  # noqa: C901 — a linear E2E script, staged for read
                     owner_acct=owner, lineage_hash=lineage, peer_id=peer)
 
             # Fund the child's own wallet through the production mint rail.
-            # The epoch id is per-box: submitAnchor hash-chains and refuses a
+            # The epoch id is per-box: anchor hash-chains and refuses a
             # duplicate, so a split run's two sides must not claim the same one.
             if child_addr and child_key:
                 child_atn = fund_agent_atn(
