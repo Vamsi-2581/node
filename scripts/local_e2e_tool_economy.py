@@ -123,8 +123,24 @@ def _npx() -> str:
     return "npx.cmd" if os.name == "nt" else "npx"
 
 
+def _port_taken() -> bool:
+    import socket
+    from urllib.parse import urlparse
+    u = urlparse(RPC_URL)
+    with socket.socket() as s:
+        s.settimeout(1)
+        return s.connect_ex((u.hostname, u.port)) == 0
+
+
 def start_hardhat(cwd: Path) -> subprocess.Popen:
-    """Launch `npx hardhat node` detached; caller polls the RPC."""
+    """Launch `npx hardhat node` detached; caller polls the RPC.
+
+    Refuses when something already listens on the RPC port: the run would
+    otherwise deploy onto someone else's chain (and fail on its chain id)."""
+    if _port_taken():
+        raise RuntimeError(
+            f"{RPC_URL} is already in use by another process; stop it or "
+            "free the port before running this E2E")
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
