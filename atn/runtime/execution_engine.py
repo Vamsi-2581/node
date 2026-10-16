@@ -431,6 +431,18 @@ class ExecutionEngine:
         # _booked_by_execution tally is authoritative (P0 risk #1).
         async def _on_done(status: ExecutionStatus, error: str | None,
                            tool_calls: list) -> None:
+            # The in-process path records the reply right after
+            # run_agent_loop; the worker path must do it here, or the UI's
+            # history reload drops the reply it just streamed.
+            _out = record.output if isinstance(record.output, dict) else {}
+            _reply = _out.get("result") or ""
+            if status == ExecutionStatus.COMPLETED and _reply:
+                try:
+                    self.session_manager.get_agent_conversation_store(
+                        agent_id).add_assistant_turn(_reply, execution_id=eid)
+                except Exception:
+                    log.warning("Failed to record worker reply for %s",
+                                agent_id, exc_info=True)
             await self._finalize_execution(
                 defn, record, status, error=error,
                 recorded_inflight=None,

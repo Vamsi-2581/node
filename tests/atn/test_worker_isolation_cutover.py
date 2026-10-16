@@ -180,6 +180,14 @@ async def test_flag_on_api_provider_runs_in_worker(bus, tmp_path, captured):
     assert out is not None and out.data["result"] == "worker answer"
     assert rt.get_status(defn.id) == AgentStatus.COMPLETED
 
+    # The reply landed in the agent's conversation history exactly once, so
+    # the chat window's history reload keeps it.
+    turns = rt.engine.session_manager.get_agent_conversation_store(
+        defn.id).get_turns()
+    replies = [t for t in turns if t.role == "assistant"]
+    assert [t.content for t in replies] == ["worker answer"]
+    assert replies[0].execution_id == eid
+
     # Terminal event emitted exactly once.
     completed = [e for e in captured if e.type == EventType.EXECUTION_COMPLETED
                  and e.data.get("agent_id") == defn.id]
