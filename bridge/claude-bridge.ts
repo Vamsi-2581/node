@@ -858,6 +858,112 @@ function respond(resp: BridgeResponse): void {
 
 const sessionManager = new SessionManager()
 
+// -- Background tasks (shells, subagents, monitors) --
+// The SDK reports every live background task (background_tasks_changed,
+// REPLACE semantics) plus a task_notification when one ends. We mirror them
+// to the Python side as @@EVENT@@ background_tasks so the daemon can show an
+// agent's running shells, read their output and stop them. A run whose
+// agent answered while tasks are still live keeps the session open: the SDK
+// wakes the agent when a task finishes (Decision 2026-10-16, option A).
+
+type BgTask = {
+  task_id: string
+  task_type: string
+  description: string
+  status: string            // running | completed | failed | stopped
+  started_at: number
+  ended_at?: number
+  output_file?: string
+  tool_use_id?: string
+}
+
+class BgTaskTracker {
+  tasks = new Map<string, BgTask>()
+
+  live(): BgTask[] {
+    return [...this.tasks.values()].filter(t => t.status === "running")
+  }
+
+  private emit(): void {
+    emitEvent({ type: "background_tasks", tasks: [...this.tasks.values()] })
+  }
+
+  handle(message: any): void {
+    if (message?.type === "system" && message.subtype === "background_tasks_changed") {
+      const liveIds = new Set<string>()
+      for (const t of message.tasks || []) {
+        if (!t?.task_id || t.ambient) continue
+        liveIds.add(t.task_id)
+        const prev = this.tasks.get(t.task_id)
+        this.tasks.set(t.task_id, {
+          started_at: prev?.started_at ?? Date.now(),
+          output_file: prev?.output_file,
+          tool_use_id: prev?.tool_use_id,
+          task_id: t.task_id,
+          task_type: t.task_type || prev?.task_type || "",
+          description: t.description || prev?.description || "",
+          status: "running",
+        })
+      }
+      for (const t of this.tasks.values()) {
+        if (t.status === "running" && !liveIds.has(t.task_id)) {
+          t.status = "completed"
+          t.ended_at = t.ended_at || Date.now()
+        }
+      }
+      this.emit()
+      return
+    }
+    if (message?.type === "system" && message.subtype === "task_started") {
+      if (!message.task_id || message.ambient) return
+      const prev = this.tasks.get(message.task_id)
+      // Foreground tasks block their tool call and end with it; only the
+      // backgrounded ones outlive the turn.
+      if (message.is_backgrounded === false && !prev) return
+      this.tasks.set(message.task_id, {
+        started_at: prev?.started_at ?? Date.now(),
+        status: prev?.status ?? "running",
+        output_file: prev?.output_file,
+        task_id: message.task_id,
+        task_type: prev?.task_type || message.task_type || "",
+        description: message.description || prev?.description || "",
+        tool_use_id: message.tool_use_id || prev?.tool_use_id,
+      })
+      this.emit()
+      return
+    }
+    if (message?.type === "system" && message.subtype === "task_notification") {
+      const t = this.tasks.get(message.task_id)
+      if (t) {
+        t.status = message.status || "completed"
+        t.ended_at = Date.now()
+        if (message.output_file) t.output_file = message.output_file
+        this.emit()
+      }
+      return
+    }
+    // A backgrounded Bash call's tool_result names the output file:
+    // "Output is being written to: <path>".
+    if (message?.type === "user" && message.tool_use_result?.backgroundTaskId) {
+      const id = message.tool_use_result.backgroundTaskId
+      for (const block of message.message?.content || []) {
+        if (block?.type !== "tool_result") continue
+        const parts = typeof block.content === "string" ? [block.content]
+          : (block.content || []).map((c: any) => c?.text || "")
+        const m = parts.join("\n").match(/Output is being written to: (.+?\.output)/)
+        if (!m) continue
+        const t: BgTask = this.tasks.get(id) || {
+          task_id: id, task_type: "local_bash", description: "",
+          status: "running", started_at: Date.now(),
+        }
+        t.output_file = m[1].trim()
+        this.tasks.set(id, t)
+        this.emit()
+      }
+    }
+  }
+}
+
 // Active agent-loop run state — allows stdin to reach the running query.
 //   onFatal:  invoked by the global error handlers to reject the in-flight
 //             collection when the SDK loop dies in a background promise.
@@ -865,6 +971,7 @@ let activeAgentLoop: {
   query: Query
   inputQueue: AsyncQueue<SDKUserMessage>
   onFatal?: (err: Error) => void
+  bgTasks?: BgTaskTracker
 } | null = null
 
 // -- Injection consumption tracking (§5 delivery ack, finding 8) --
@@ -1031,11 +1138,16 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
     const fatalPromise = new Promise<never>((_, reject) => { fatalReject = reject })
 
     // Expose to stdin handler for interrupt / user_message
+    const bgTasks = new BgTaskTracker()
     activeAgentLoop = {
       query: q,
       inputQueue,
       onFatal: (err: Error) => { if (fatalReject) fatalReject(err) },
+      bgTasks,
     }
+    // While the session waits on background tasks the stream can go quiet
+    // for minutes; a heartbeat keeps the Python idle ceiling from firing.
+    let bgHeartbeat: ReturnType<typeof setInterval> | null = null
 
     // Collect the full response
     let text = ""
@@ -1104,6 +1216,7 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
           type: message.type,
           subtype: (message as any).subtype,
         })
+        bgTasks.handle(message)
 
         if (message.type === "system" && (message as any).subtype === "init") {
           const initModel = (message as any).model
@@ -1214,6 +1327,12 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
 
           const modelUsage = resultMsg.modelUsage as Record<string, any> | undefined
           if (modelUsage) {
+            // modelUsage is the running total for this query(); a session
+            // kept open for background tasks yields several results.
+            inputTokens = 0
+            outputTokens = 0
+            cacheReadTokens = 0
+            cacheCreationTokens = 0
             for (const mu of Object.values(modelUsage)) {
               if (mu && typeof mu === "object") {
                 inputTokens += mu.inputTokens ?? 0
@@ -1252,6 +1371,21 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
             contextWindow,
           })
 
+          // Background tasks still running: keep the session open. The SDK
+          // wakes the agent when one finishes and a later result follows.
+          const live = bgTasks.live()
+          if (live.length > 0 && !wasInterrupted) {
+            log("agent_loop.waiting_background", { count: live.length })
+            emitEvent({ type: "waiting_background", count: live.length })
+            if (!bgHeartbeat) {
+              bgHeartbeat = setInterval(() => {
+                emitEvent({ type: "bg_heartbeat", count: bgTasks.live().length })
+              }, 60_000)
+            }
+            if (text && !text.endsWith("\n")) text += "\n\n"
+            continue
+          }
+
           // Close the input queue — this turn is done.
           // If a user_message was already pushed before this result, the SDK
           // will have consumed it.  Any future user_messages should start a
@@ -1275,6 +1409,17 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
         text = `[Bridge: agent-loop run error: ${errMsg}]`
       }
     } finally {
+      if (bgHeartbeat) clearInterval(bgHeartbeat)
+      // A run that ends with tasks still live (interrupt, error) stops them:
+      // once the session closes nobody could see or stop them again.
+      for (const t of bgTasks.live()) {
+        try { await q.stopTask(t.task_id) } catch {}
+        t.status = "stopped"
+        t.ended_at = Date.now()
+      }
+      if (bgTasks.tasks.size > 0) {
+        emitEvent({ type: "background_tasks", tasks: [...bgTasks.tasks.values()] })
+      }
       // Clean up — close the input queue and clear active agent-loop run
       try { inputQueue.done() } catch {}
       activeAgentLoop = null
@@ -1505,6 +1650,23 @@ rl.on("line", async (line: string) => {
         }
       } else {
         log("interrupt requested but no active agent-loop run")
+      }
+      return
+    }
+
+    // Stop one background task of the active agent-loop run.
+    if (parsed.type === "stop_task" && parsed.task_id) {
+      if (activeAgentLoop) {
+        log("stop_task requested", { taskId: parsed.task_id })
+        try {
+          await activeAgentLoop.query.stopTask(parsed.task_id)
+        } catch (err) {
+          log("stop_task error", {
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
+      } else {
+        log("stop_task requested but no active agent-loop run")
       }
       return
     }

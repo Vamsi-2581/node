@@ -312,6 +312,25 @@ class ExecutionControl:
         ))
         return "inbox_fallback"
 
+    async def stop_background_task(self, agent_id: str, task_id: str) -> bool:
+        """Stop one background task of an agent's live session: an IPC
+        "stop_task" cmd for a supervised worker, else the in-process provider."""
+        if self._supervised(agent_id):
+            worker = self.supervisor.get(agent_id)
+            channel = getattr(getattr(worker, "handle", None), "channel", None)
+            if channel is None:
+                return False
+            try:
+                await channel.send_cmd("stop_task", {"task_id": task_id})
+                return True
+            except Exception:
+                log.debug("stop_task cmd send failed for %s", agent_id, exc_info=True)
+                return False
+        provider = self.provider_manager._active_providers.get(agent_id)
+        if provider is None or not hasattr(provider, "stop_task"):
+            return False
+        return bool(await provider.stop_task(task_id))
+
     async def interrupt_delegate(self, agent_id: str) -> bool:
         # Dual-mode: for a supervised worker, a cooperative interrupt is an IPC
         # "interrupt" cmd (the provider loop lives in the worker, not here).

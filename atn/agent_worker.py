@@ -183,6 +183,15 @@ class AgentWorker:
                     await prov.interrupt()
                 except Exception:
                     log.debug("[%s] interrupt failed", self._agent_label, exc_info=True)
+        elif name == "stop_task":
+            # Stop one background task (shell, subagent) of the live session.
+            prov = self._provider
+            task_id = str((env.payload or {}).get("task_id") or "")
+            if prov is not None and hasattr(prov, "stop_task") and task_id:
+                try:
+                    await prov.stop_task(task_id)
+                except Exception:
+                    log.debug("[%s] stop_task failed", self._agent_label, exc_info=True)
         elif name == "shutdown":
             log.info("[%s] shutdown requested", self._agent_label)
             self._shutdown.set()

@@ -325,6 +325,9 @@ class Runtime:
             provider_manager=self.providers,
             supervisor=self.supervisor,
         )
+        from .agent_processes import AgentProcessRegistry
+        self.agent_processes = AgentProcessRegistry(
+            self.events, self.control.stop_background_task)
 
         self.sessions = SessionManager(
             registry=self.registry,

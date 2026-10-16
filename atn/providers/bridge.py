@@ -883,6 +883,16 @@ class BridgeProvider(Provider):
                                         "status": "in_progress",
                                     },
                                 ))
+                        elif event.get("type") == "background_tasks":
+                            if self.event_bus:
+                                await self.event_bus.emit(Event(
+                                    type=EventType.AGENT_PROCESSES,
+                                    source=self.source_agent_id,
+                                    data={
+                                        "agent_id": self.source_agent_id,
+                                        "tasks": event.get("tasks") or [],
+                                    },
+                                ))
                         elif event.get("type") == "usage":
                             # Per-turn usage from the TS bridge. Roll into the
                             # cascading budget; if the recorder vetoes, signal
@@ -1177,6 +1187,22 @@ class BridgeProvider(Provider):
             log.info("Interrupt sent to bridge")
         except (BrokenPipeError, ConnectionResetError, OSError):
             log.warning("Failed to send interrupt (bridge stdin broken)")
+
+    async def stop_task(self, task_id: str) -> bool:
+        """Stop one background task (shell, subagent, monitor) of the active
+        agent-loop session. Lock-free like :meth:`interrupt`."""
+        if not task_id or not self._process or self._process.returncode is not None:
+            return False
+        assert self._process.stdin
+        try:
+            line = json.dumps({"type": "stop_task", "task_id": task_id}) + "\n"
+            self._process.stdin.write(line.encode())
+            await self._process.stdin.drain()
+            log.info("stop_task %s sent to bridge", task_id)
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            log.warning("Failed to send stop_task (bridge stdin broken)")
+            return False
 
     async def refresh_usage(self) -> dict[str, Any]:
         """Return subscription-window utilization for Claude Max.

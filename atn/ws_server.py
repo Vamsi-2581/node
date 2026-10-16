@@ -251,6 +251,7 @@ INTEGRATION_DENIED_MESSAGES = frozenset({
     "trigger_run", "post_message", "send_agent_message",
     "delegate_message", "delegate_status", "delegate_collect",
     "interrupt_delegate", "approve_task",
+    "agent_processes_list", "agent_process_output", "agent_process_stop",
     "reject_task", "propose_task", "set_local_model",
     # Providers, connectors, OAuth, daemon control, profile.
     "provider_configure", "provider_remove", "custom_provider_add",
@@ -1649,6 +1650,25 @@ class WebSocketBridge:
             if result.get("error"):
                 return {"msg_id": msg_id, "ok": False, "error": result["error"],
                         "code": result.get("code"), "holder": result.get("holder")}
+            return {"msg_id": msg_id, "ok": True, "result": result}
+
+        # Background processes (shells, subagents, monitors) agents left running.
+        if msg_type == "agent_processes_list":
+            procs = self.runtime.agent_processes.list(msg.get("agent_id") or None)
+            return {"msg_id": msg_id, "ok": True, "result": {"processes": procs}}
+        if msg_type in ("agent_process_output", "agent_process_stop"):
+            agent_id = msg.get("agent_id") or ""
+            task_id = msg.get("task_id") or ""
+            if not agent_id or not task_id:
+                return {"msg_id": msg_id, "ok": False,
+                        "error": "Missing 'agent_id' or 'task_id'"}
+            if msg_type == "agent_process_output":
+                result = self.runtime.agent_processes.output(
+                    agent_id, task_id, int(msg.get("max_bytes") or 0))
+            else:
+                result = await self.runtime.agent_processes.stop(agent_id, task_id)
+            if "error" in result:
+                return {"msg_id": msg_id, "ok": False, "error": result["error"]}
             return {"msg_id": msg_id, "ok": True, "result": result}
 
         # Interrupt: gracefully stop a running agent's LLM session mid-turn.

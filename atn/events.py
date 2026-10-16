@@ -64,6 +64,10 @@ class EventType(Enum):
     # Context compaction (from Claude Agent SDK)
     CONTEXT_COMPACTION = "context.compaction"
 
+    # Background tasks an agent left running (shells, subagents, monitors);
+    # data = {agent_id, tasks: [...]} with the agent's full task list.
+    AGENT_PROCESSES = "agent.processes"
+
     # Voice service
     VOICE_STARTED = "voice.started"
     VOICE_STOPPED = "voice.stopped"
