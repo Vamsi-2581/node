@@ -59,9 +59,8 @@ extension with exactly one slot).
     have paid nothing since v4.1 (2026-07-09) dropped the vet royalty,
     which fake agents could buy. Owner binding plus ε = 0 closes that hole,
     so reviews get paid again:
-    - One review type: per-axis scores, optionally a malware flag. Audits
-      fold in; a malware flag is a review, and a settled malware result
-      slashes the author's bond as today.
+    - One review type: per-axis scores plus a harm score (below). Audits
+      fold in; there is no separate kind.
     - Any stake from zero up, in ATN (buyable, so newcomers can enter;
       accurate reviewers earn ATN and so REP).
     - Commit-reveal, as audits do today, so a round can't be copied.
@@ -90,7 +89,9 @@ extension with exactly one slot).
       withholding, whatever others revealed first. A round with no REP
       weight leaves stakes withdrawable (pulled, never pushed).
     - Harm is a gradient, not a flag: every review carries a harm score
-      in [0, 1]. An audit is a review with high harm. Harm settles like any
+      in [0, 1]. There is only one kind of review; "audit", if a UI wants the
+      word, means a heavily staked one, never one with a negative result.
+      Harm settles like any
       axis (REP-weighted), counts extra in accuracy (a DAO parameter), and
       the author's bond is slashed in proportion to the settled harm, with
       no dead zone; earnings soften it for tools that are actually used.
