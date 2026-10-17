@@ -976,6 +976,7 @@ let activeAgentLoop: {
   inputQueue: AsyncQueue<SDKUserMessage>
   onFatal?: (err: Error) => void
   bgTasks?: BgTaskTracker
+  injected?: boolean
 } | null = null
 
 // Imported Claude Code sessions kept live between runs, by session id. Their
@@ -986,6 +987,7 @@ const liveImported = new Map<string, {
   inputQueue: AsyncQueue<SDKUserMessage>
   iterator: AsyncIterator<SDKMessage, void>
   bgTasks: BgTaskTracker
+  toolNames: string
   totals: { inputTokens: number; outputTokens: number;
             cacheReadTokens: number; cacheCreationTokens: number }
 }>()
@@ -1048,7 +1050,17 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
     const imported = req.claude_session && req.claude_session.folder
       ? req.claude_session : null
     const liveKey = imported ? imported.session_id : ""
-    const reused = liveKey ? liveImported.get(liveKey) : undefined
+    // ATN's tools are fixed when a query starts. If this run's surface
+    // differs (the agent joined a group, got a new bundle), close the live
+    // query and resume the session afresh with the new tools.
+    const toolNames = req.tools.map(t => t.name).sort().join(",")
+    let reused = liveKey ? liveImported.get(liveKey) : undefined
+    if (reused && reused.toolNames !== toolNames) {
+      log("request.agent_loop.tools_changed", { session: liveKey })
+      liveImported.delete(liveKey)
+      try { reused.query.close() } catch {}
+      reused = undefined
+    }
     if (reused) log("request.agent_loop.reuse", { session: liveKey })
 
     // Use streaming input (async generator) — required for MCP tools.
@@ -1431,7 +1443,10 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
             continue
           }
 
-          if (imported && !wasInterrupted) {
+          // A message injected during this run may still be queued in the
+          // claude process; a live query would answer it with nobody
+          // reading. Close instead, and the next run resumes the session.
+          if (imported && !wasInterrupted && !activeAgentLoop?.injected) {
             // The session stays live for the next run (see liveImported).
             keepAlive = true
             break
@@ -1473,7 +1488,7 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
       }
       if (keepAlive) {
         liveImported.set(liveKey, {
-          query: q, inputQueue, iterator: orchIterator, bgTasks,
+          query: q, inputQueue, iterator: orchIterator, bgTasks, toolNames,
           totals: { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens },
         })
       } else {
@@ -1761,6 +1776,7 @@ rl.on("line", async (line: string) => {
         injMsg.__atn_injection_id = injId
         try {
           activeAgentLoop.inputQueue.push(injMsg)
+          activeAgentLoop.injected = true
         } catch (err) {
           // Queue already closed (turn ended between the active-check and the
           // push) — treat as not consumed so Python falls back to the inbox.

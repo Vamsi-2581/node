@@ -399,7 +399,15 @@ class GroupChatService:
         """True when the agent's running run(s) can act on a group delivery:
         their tool surface (fixed at run start for bridge and worker runs)
         contains group_post. A run that started before the agent joined the
-        group, or one that has not resolved its surface yet, is not."""
+        group, or one that has not resolved its surface yet, is not.
+
+        An imported Claude Code session is never injected into: its query
+        stays live after a run, so a delivery landing as a run ends would
+        start a turn nobody reads. It gets the coalesced wake instead."""
+        get_agent = getattr(self._rt, "get_agent", None)
+        defn = get_agent(agent_id) if callable(get_agent) else None
+        if getattr(defn, "claude_session", None):
+            return False
         engine = getattr(self._rt, "engine", None)
         check = getattr(engine, "running_runs_have_tool", None)
         if check is None:
