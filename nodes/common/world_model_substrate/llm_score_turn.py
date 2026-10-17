@@ -6,7 +6,7 @@ abstraction instead of raw urllib calls. This means the embedder
 works with any wired LLM provider (ollama, anthropic, openai_compat,
 bridge), not a hardcoded ollama URL.
 
-Public entry point: `llm_score_turn` — returns a 6-tuple of
+Public entry point: `llm_score_turn` returns one value per active-charter axis:
 ternary {-1, 0, +1} medians over N_SAMPLES calls. Caller owns the
 Provider instance and any caching.
 
@@ -217,12 +217,14 @@ async def llm_score_turn(
     cache_path: Optional[Path] = None,
     n_samples: int = N_SAMPLES,
     max_attempts: int = 5,
-) -> Tuple[float, float, float, float, float, float]:
-    """Score one turn on the 6-axis charter via an LLM provider.
+) -> Tuple[float, ...]:
+    """Score one turn on the active charter via an LLM provider.
 
-    Returns a 6-tuple of ternary medians in {-1.0, 0.0, +1.0}, one
-    per axis in CHARTER_AXES_6 order. Uses N_SAMPLES calls and
-    returns the per-axis median; on total failure returns all zeros.
+    Returns one ternary median in {-1.0, 0.0, +1.0} per active-charter
+    axis, in axis order. The prompt knows the v1 six axes
+    (CHARTER_AXES_6); any other axis abstains with 0.0. Uses N_SAMPLES
+    calls and returns the per-axis median; on total failure returns all
+    zeros.
 
     Args:
         turn: agent-turn dict.
@@ -273,11 +275,14 @@ async def llm_score_turn(
         if _is_valid(parsed):
             valid.append(row)
 
-    if not valid:
-        return (0.0,) * 6  # type: ignore[return-value]
+    from .charter import active_charter
 
-    coords: List[float] = []
+    axes = active_charter().ids
+    if not valid:
+        return (0.0,) * len(axes)
+
+    known: Dict[str, float] = {}
     for axis in CHARTER_AXES_6:
         votes = [_coerce_ternary(s["parsed"][axis]) for s in valid]
-        coords.append(float(round(median(votes))))
-    return tuple(coords)  # type: ignore[return-value]
+        known[axis] = float(round(median(votes)))
+    return tuple(known.get(axis, 0.0) for axis in axes)

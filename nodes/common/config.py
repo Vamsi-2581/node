@@ -50,6 +50,12 @@ class BlockchainConfig:
     # reviews and voice by REP read from it, pinned to the previous anchor.
     # Empty => genesis regime (no REP weighting). Seeded from registry.json.
     rep_token_address: str = ""
+    # The jurisdiction's DAO Registry (key-value store). The close reads
+    # the charter text (jurisdiction.autonet.charter) from its
+    # RegistryUpdated logs, pinned to the previous anchor, to detect a
+    # charter change (docs/multi_jurisdiction.md decision 5). Empty => no
+    # pinned charter read. Seeded from registry.json ("dao_registry").
+    dao_registry_address: str = ""
     # The jurisdiction's DAO Governor. Epoch anchors go through it as
     # proposals (Decision 2026-10-16). Seeded from registry.json ("dao").
     governor_address: str = ""
@@ -266,6 +272,7 @@ def _apply_env_overrides(raw: dict) -> dict:
         "AUTONET_SUBSTRATE_ADDRESS": ("blockchain.substrate_address", str),
         "AUTONET_TOOL_BOND_ADDRESS": ("blockchain.tool_bond_address", str),
         "AUTONET_REP_TOKEN_ADDRESS": ("blockchain.rep_token_address", str),
+        "AUTONET_DAO_REGISTRY_ADDRESS": ("blockchain.dao_registry_address", str),
         "AUTONET_GOVERNOR_ADDRESS": ("blockchain.governor_address", str),
         "AUTONET_BLOB_DIR": ("blob_store.data_dir", str),
         "AUTONET_DATA_DIR": ("data_dir", str),
@@ -395,6 +402,9 @@ def load_config(path: Optional[str] = None) -> AutonetConfig:
     if not cfg.blockchain.rep_token_address:
         cfg.blockchain.rep_token_address = _registry_substrate_address(
             path, key="rep_token")
+    if not cfg.blockchain.dao_registry_address:
+        cfg.blockchain.dao_registry_address = _registry_substrate_address(
+            path, key="dao_registry")
     if not cfg.blockchain.governor_address:
         cfg.blockchain.governor_address = _registry_substrate_address(
             path, key="dao")

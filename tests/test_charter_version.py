@@ -2,7 +2,7 @@
 """Charter version hash + anchor verification.
 
 Covers:
-  - charter_hash determinism (same constant -> same hash; key order irrelevant)
+  - charter_hash determinism (sha256 of the active charter's registry text)
   - charter_payload includes all 6 roots
   - the federated close authoritative payload carries charter_hash
   - verify_charter against the registry value (match / drift / none)
@@ -52,33 +52,16 @@ def test_hash_is_deterministic():
     assert charter_hash() == charter_hash()
 
 
-def test_hash_is_key_order_independent():
-    """Reshuffling dict key order in the source constant must not change the
-    hash — the serialization sorts keys, so the hash is a pure function of the
-    values, not declaration order."""
-    payload = charter_payload()
+def test_hash_is_sha256_of_registry_text():
+    """The hash is sha256 of the active charter's exact registry bytes
+    (compact JSON), so it equals the Registry's charter hash."""
+    from nodes.common.world_model_substrate.charter import active_charter
 
-    # Rebuild the same payload with dict keys inserted in a scrambled order
-    # (list order preserved — the payload deliberately fixes root order by
-    # axis_index). sort_keys must collapse the scrambled keys to identical bytes.
-    scrambled_roots = [
-        {
-            "veto_floor": r["veto_floor"],
-            "thesis": r["thesis"],
-            "id": r["id"],
-            "axis_index": r["axis_index"],
-        }
-        for r in payload["roots"]
-    ]
-    scrambled = {
-        "roots": scrambled_roots,
-        "n_dims": payload["n_dims"],
-        "schema": payload["schema"],
-    }
-    scrambled_bytes = json.dumps(
-        scrambled, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    assert hashlib.sha256(scrambled_bytes).hexdigest() == charter_hash()
+    text = active_charter().text
+    assert charter_bytes() == text.encode("utf-8")
+    assert charter_hash() == hashlib.sha256(text.encode("utf-8")).hexdigest()
+    assert "0x" + charter_hash() == active_charter().hash
+    assert json.loads(text)["axes"][0]["id"] == "life_precious"
 
 
 def test_hash_derived_from_same_constant():

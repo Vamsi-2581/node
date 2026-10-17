@@ -106,14 +106,33 @@ def test_charter_without_mandatory_axes_refused():
     assert any("mandatory axes" in e for e in svc.state.jurisdiction_errors)
 
 
-def test_custom_charter_refused_until_supported():
+def test_custom_charter_accepted():
+    """Each DAO defines its own axes (docs/multi_jurisdiction.md decision 5)."""
+    from atn.config import charter_text_error
     custom = json.dumps({"axes": [{"id": "correctness", "thesis": "a"},
                                   {"id": "simplicity", "thesis": "b"},
                                   {"id": "kindness", "thesis": "c"}]}, separators=(",", ":"))
     svc = _service(_config({**FULL, "charter": custom}))
     svc._mirror_jurisdiction()
-    assert svc.state.charter_match is False
-    assert any("differs" in e for e in svc.state.jurisdiction_errors)
+    assert svc.state.jurisdiction_errors == []
+    assert svc.state.charter_match is True
+    assert charter_text_error(custom) == (False, "")
+    assert charter_text_error(V1) == (True, "")
+
+
+def test_install_charter_sets_active_charter():
+    from nodes.common.world_model_substrate.charter import (
+        DEFAULT_CHARTER, active_charter, set_active_charter)
+    custom = json.dumps({"axes": [{"id": "kindness", "thesis": "c"},
+                                  {"id": "correctness", "thesis": "a"},
+                                  {"id": "simplicity", "thesis": "b"}]}, separators=(",", ":"))
+    svc = _service(_config({**FULL, "charter": custom}))
+    try:
+        svc._install_charter()
+        assert active_charter().text == custom
+        assert active_charter().ids == ("kindness", "correctness", "simplicity")
+    finally:
+        set_active_charter(DEFAULT_CHARTER)
 
 
 def test_non_compact_charter_refused():
@@ -121,3 +140,20 @@ def test_non_compact_charter_refused():
     svc = _service(_config({**FULL, "charter": spaced}))
     svc._mirror_jurisdiction()
     assert any("compact" in e for e in svc.state.jurisdiction_errors)
+
+
+def test_charter_change_requests_restart(monkeypatch):
+    import threading
+
+    from atn import cli
+
+    class _Rt:
+        _shutdown_event = threading.Event()
+
+    svc = _service(_config(FULL))
+    svc._runtime = _Rt()
+    monkeypatch.setattr(cli, "_restart_requested", False)
+    svc._on_charter_changed('{"axes":[]}')
+    assert "the jurisdiction changed its charter; restarting" in svc.state.jurisdiction_errors
+    assert cli._restart_requested is True
+    assert _Rt._shutdown_event.is_set()

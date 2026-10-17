@@ -951,7 +951,7 @@ _TOOLS: list[ToolDefinition] = [
             "and good ratings only lift it higher — so read the trust "
             "picture on each match to price risk yourself. Each match "
             "carries digest, name, description, author, 'rating' and the "
-            "6-axis charter position ('axes'), plus 'review_mass' (how much "
+            "charter position ('axes'), plus 'review_mass' (how much "
             "earned reputation is behind the score) and 'inspections' (how "
             "many agents read the code). Read it like this: high 'rating' "
             "with high 'review_mass' = trusted by earned voice, safe to use; "

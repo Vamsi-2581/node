@@ -33,11 +33,11 @@ from world_model.generalized import (
 from world_model.models.tree import Position
 
 from .adapter import (
-    CHARTER,
     build_charter_world,
     deserialize_world,
     turn_to_observation,
 )
+from .charter import active_charter
 from .tool_manifest import is_tool_manifest
 
 
@@ -128,7 +128,8 @@ def _infer_alignment(
     equilibrate(world, max_rounds=8, tolerance=1e-3)
 
     scores = world.root_scores()
-    ordered = [scores.get(entry["id"], 0.0) for entry in CHARTER]
+    charter = active_charter().entries()
+    ordered = [scores.get(entry["id"], 0.0) for entry in charter]
     probs = _softmax(ordered)
     pred = max(range(len(ordered)), key=lambda i: ordered[i])
 
@@ -137,8 +138,8 @@ def _infer_alignment(
         "predictions": [pred],
         "probabilities": [probs],
         "root_scores": dict(scores),
-        "aligned_principle": CHARTER[pred]["id"],
-        "principle_thesis": CHARTER[pred]["thesis"],
+        "aligned_principle": charter[pred]["id"],
+        "principle_thesis": charter[pred]["thesis"],
     }
 
 
@@ -230,7 +231,7 @@ def _tool_head(world: Any, claim_nodes: List[Any]) -> List[float]:
     """The tool's (review-drifted) charter head, read off the anchor
     node's backing observation coords. Deterministic node pick (sorted
     ids); empty list when no observation is resolvable."""
-    from .adapter import N_DIMS
+    n_dims = active_charter().n_dims
 
     for node in sorted(claim_nodes, key=lambda n: getattr(n, "id", "")):
         obs_id = getattr(node, "observation_id", None)
@@ -238,8 +239,8 @@ def _tool_head(world: Any, claim_nodes: List[Any]) -> List[float]:
             continue
         obs = world.observations.get(obs_id)
         coords = getattr(obs, "coords", None) if obs is not None else None
-        if coords is not None and len(coords) >= N_DIMS:
-            return [float(c) for c in coords[:N_DIMS]]
+        if coords is not None and len(coords) >= n_dims:
+            return [float(c) for c in coords[:n_dims]]
     return []
 
 
@@ -277,12 +278,10 @@ def _infer_artifacts(
 
     use_coverage = coverage_index is not None and query_vec is not None
 
-    from .adapter import CHARTER
-
     # Usefulness axes of the charter head (v3 ratings lift): correctness
     # and simplicity, resolved by id so a charter reorder can't silently
     # skew ranking.
-    _axis_by_id = {str(e["id"]): int(e["axis_index"]) for e in CHARTER}
+    _axis_by_id = active_charter().axis_index
     _useful_axes = [_axis_by_id[a] for a in ("correctness", "simplicity")
                     if a in _axis_by_id]
 

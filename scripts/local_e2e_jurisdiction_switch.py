@@ -119,11 +119,11 @@ async function main() {
   const autonetSetup = s.setups.autonet;
   const charterUi = (name) => metadata("autonet", "build").pluginSetup.prepareInstallation.inputs
     .find((i) => i.name === "substrate").components.find((c) => c.name === name)["x-ui"];
+  // ToolBond Params (trustless-contracts 448023a: staked epoch reviews).
   const bondParams = {
-    minStake: 100_000_000n, thresholdBps: 500n, reviewWindow: 14n * 86400n,
-    revealWindow: 2n * 86400n, finderBps: 5000n, degradeBps: 1000n,
-    authorSlashBps: 10000n, unbondDelay: 30n * 86400n, auditorShareBps: 4000n,
-    appealPeriod: 10n * 86400n,
+    minStake: 100_000_000n, revealWindow: 86400n, degradeBps: 1000n,
+    authorSlashBps: 10000n, unbondDelay: 30n * 86400n, reviewerShareBps: 4000n,
+    appealPeriod: 10n * 86400n, harmWeightBps: 20000n,
   };
   async function launch(name, epochRules) {
     const params = {

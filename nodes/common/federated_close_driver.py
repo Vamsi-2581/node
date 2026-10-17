@@ -154,7 +154,7 @@ class FederatedCloseDriver:
         )
         self._tool_vetting: Dict[str, Any] = self._load_tool_vetting()
         # v3 position-drift carry-over (spec Decision 2026-07-08):
-        # digest -> {"head": [6], "mass": [6]} — the mint-weighted review
+        # digest -> {"head": [n_dims], "mass": [n_dims]}: the mint-weighted review
         # centroid state. Same contract as registrations/vetting: derived
         # purely from canonical events, the on-disk copy is a rebuildable
         # cache, identical on every honest daemon.
@@ -215,6 +215,18 @@ class FederatedCloseDriver:
         # snapshot anchor block, by the same voice_source refresh. None
         # (no chain source / no ToolBond) = no auditor shares.
         self.vetting_snapshot: Optional[Dict[str, Any]] = None
+        # The jurisdiction's charter text pinned to the snapshot anchor
+        # (docs/multi_jurisdiction.md decision 5), read by the same
+        # voice_source refresh. None = no pinned read (no DAO Registry
+        # configured, genesis, or never written).
+        self.pinned_charter_text: Optional[str] = None
+        # Set to the new charter text once a pinned charter differs from
+        # the active one: the close must not run on the old axes. The host
+        # restarts the daemon onto the new charter (on_charter_change).
+        self.charter_restart_required: Optional[str] = None
+        # Optional one-arg callback(new_charter_text), called once when
+        # ``charter_restart_required`` is first set (from the close thread).
+        self.on_charter_change: Optional[Callable[[str], None]] = None
         # Optional zero-arg refresh hook returning
         # {"owner_map": {...}, "voice_weights": {...}} — wired by the
         # host when chain access exists (see AutonetService.
@@ -427,9 +439,45 @@ class FederatedCloseDriver:
             vetting = state.get("vetting_snapshot")
             if isinstance(vetting, dict):
                 self.vetting_snapshot = vetting
+            if "charter_text" in state:
+                text = state.get("charter_text")
+                self.pinned_charter_text = str(text) if text else None
         except Exception as e:
             logger.warning(
                 "voice-state refresh failed (keeping previous maps): %s", e)
+
+    def _charter_changed(self) -> bool:
+        """True when the jurisdiction's pinned charter differs from the
+        charter this process runs. The close then refuses to run with the
+        old axes and signals restart-required: every daemon reads the same
+        pinned value at the same epoch, so they restart onto it together."""
+        if self.charter_restart_required is not None:
+            return True
+        text = self.pinned_charter_text
+        if not text:
+            return False
+        from .world_model_substrate.charter import active_charter
+
+        active = active_charter()
+        if text == active.text:
+            return False
+        import hashlib
+
+        pinned_hash = "0x" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        logger.error(
+            "CHARTER CHANGED: the jurisdiction's charter pinned to the "
+            "previous anchor (hash=%s) differs from the active charter "
+            "(hash=%s). Refusing to close on the old axes; this daemon must "
+            "restart onto the new charter.", pinned_hash, active.hash,
+        )
+        self.charter_restart_required = text
+        cb = self.on_charter_change
+        if cb is not None:
+            try:
+                cb(text)
+            except Exception:
+                logger.exception("on_charter_change callback failed")
+        return True
 
     def run(self, local_close_result: Dict[str, Any]) -> Optional[FederatedCloseResult]:
         """Drive one federated close given the local close's result.
@@ -444,6 +492,9 @@ class FederatedCloseDriver:
             return None
 
         self._refresh_voice()
+
+        if self._charter_changed():
+            return None
 
         canonical = canonical_order(batches)
         if not canonical.ordered_batches:

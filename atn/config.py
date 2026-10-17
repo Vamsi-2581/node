@@ -613,30 +613,21 @@ def epoch_rules_error(an: "RPBConfig") -> str:
 
 
 def charter_text_error(text: str) -> tuple[bool, str]:
-    """(matches the built-in charter, why this build can't run it or "").
+    """(equals the built-in v1 charter, why this build can't run it or "").
 
-    Every charter must carry the correctness and simplicity axes. Until the
-    close takes the axis set as data, this build only computes its built-in
-    charter, so a different one is refused instead of forked."""
+    Any charter ``Charter.from_text`` accepts runs (each DAO defines its own
+    axes, docs/multi_jurisdiction.md decision 5): valid compact JSON, at
+    least one axis, distinct ids, and the mandatory correctness and
+    simplicity axes."""
+    from nodes.common.world_model_substrate.charter import (
+        DEFAULT_CHARTER,
+        Charter,
+    )
     try:
-        parsed = json.loads(text)
-        axes = parsed["axes"]
-        theirs = [(str(a["id"]), str(a["thesis"])) for a in axes]
-    except Exception:
-        return False, "the jurisdiction's charter is not valid JSON {\"axes\": [...]}"
-    # ToolBond counts axes on chain by counting "id": in the text, which is
-    # only reliable for the compact form; refuse anything else so a hand-
-    # written proposal can't make the contract and the daemons disagree.
-    if json.dumps(parsed, separators=(",", ":"), ensure_ascii=False) != text:
-        return False, "the jurisdiction's charter is not in compact JSON form"
-    if not {"correctness", "simplicity"} <= {i for i, _ in theirs}:
-        return False, ("the jurisdiction's charter lacks the mandatory axes "
-                       "correctness and simplicity")
-    from nodes.common.world_model_substrate.adapter import CHARTER
-    if theirs != [(c["id"], c["thesis"]) for c in CHARTER]:
-        return False, ("the jurisdiction's charter differs from the one this "
-                       "build computes; custom charters need a newer build")
-    return True, ""
+        charter = Charter.from_text(text)
+    except ValueError as e:
+        return False, f"the jurisdiction's charter is invalid: {e}"
+    return charter.hash == DEFAULT_CHARTER.hash, ""
 
 
 def check_jurisdiction(dao_registry: str, rpc_url: str,

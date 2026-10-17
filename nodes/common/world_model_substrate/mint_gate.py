@@ -69,21 +69,12 @@ from world_model.generalized import World
 logger = logging.getLogger(__name__)
 
 
-# Default charter tendency ids -- the seed concerns for the mint
-# gate. Stay synced with adapter.py:CHARTER. The 4 alignment axes
-# remain the load-bearing violation flags; the 2 usefulness axes
-# (correctness, simplicity) participate as well so that work that
-# is buggy or over-engineered can be debated through the same
-# mechanism.
+# Charter tendency ids: the seed concerns for the mint gate. Callers
+# that pass no ids get the ACTIVE charter's axes (charter.active_charter()).
+# DEFAULT_CHARTER_IDS is the v1 six, kept as a back-compat name.
+from .charter import DEFAULT_CHARTER, active_charter  # noqa: E402
 
-DEFAULT_CHARTER_IDS = (
-    "life_precious",
-    "self_preservation",
-    "promotion_of_intelligence",
-    "evolution",
-    "correctness",
-    "simplicity",
-)
+DEFAULT_CHARTER_IDS = DEFAULT_CHARTER.ids
 
 
 def _node_descendants(world: World, target_id: str) -> set[str]:
@@ -111,7 +102,7 @@ def _node_descendants(world: World, target_id: str) -> set[str]:
 def charter_violation_score(
     world: World,
     target_node_id: str,
-    charter_ids: Iterable[str] = DEFAULT_CHARTER_IDS,
+    charter_ids: Optional[Iterable[str]] = None,
 ) -> float:
     """Score how strongly the network has flagged target_node_id as
     violating any charter principle.
@@ -132,6 +123,8 @@ def charter_violation_score(
     """
     total_pos_flag_score = 0.0
     n_flags = 0
+    if charter_ids is None:
+        charter_ids = active_charter().ids
     for tid in charter_ids:
         tendency = world.tendencies.get(tid)
         if tendency is None:
@@ -160,7 +153,7 @@ def charter_violation_score(
 def apply_mint_gate(
     reconcile_result: Dict[str, Any],
     world: World,
-    charter_ids: Iterable[str] = DEFAULT_CHARTER_IDS,
+    charter_ids: Optional[Iterable[str]] = None,
     gate_strength: float = 1.0,
 ) -> Dict[str, Any]:
     """Apply the charter mint gate to a reconcile_epoch result.

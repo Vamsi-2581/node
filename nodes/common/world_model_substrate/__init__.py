@@ -14,6 +14,12 @@ from .adapter import (
     CHARTER,
     N_DIMS,
 )
+from .charter import (
+    Charter,
+    DEFAULT_CHARTER,
+    active_charter,
+    set_active_charter,
+)
 from .aggregate import (
     aggregate_contributions,
     apply_events,
@@ -64,6 +70,10 @@ __all__ = [
     "turn_to_observation",
     "CHARTER",
     "N_DIMS",
+    "Charter",
+    "DEFAULT_CHARTER",
+    "active_charter",
+    "set_active_charter",
     "aggregate_contributions",
     "apply_events",
     "aggregate_stake_deltas",

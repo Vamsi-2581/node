@@ -101,6 +101,10 @@ class AutonetService:
         # in self._federated_close_subscribers.
         self._federated_close_driver = None
         self._federated_close_subscribers: list = []
+        # Optional callback(new_charter_text): the jurisdiction's charter
+        # changed (pinned to the previous anchor) and the close refused to
+        # run on the old axes. The atn host restarts the daemon onto it.
+        self.on_charter_change = None
         # Chain submission driver (Phase 10.3b/c): attached by
         # attach_chain_submission() after the federated-close driver
         # is up. Owns the EpochAnchorer (one) and per-agent
@@ -913,6 +917,17 @@ class AutonetService:
         # carry-over files past genesis. See participation_blockers().
         self._federated_close_driver.enforce_preconditions = True
 
+        def _charter_changed(text: str) -> None:
+            cb = getattr(self, "on_charter_change", None)
+            if cb is not None:
+                cb(text)
+            else:
+                logger.error(
+                    "the jurisdiction changed its charter; restart this "
+                    "daemon to run the new charter (closes are halted)")
+
+        self._federated_close_driver.on_charter_change = _charter_changed
+
         # Household voice + fee-recycled emission sourcing. Wired here —
         # NOT in attach_chain_submission — because these are CLOSE
         # INPUTS every honest daemon must derive identically: they gate
@@ -930,15 +945,20 @@ class AutonetService:
             # ToolBond (Decision 2026-10-13): vetted tools' auditors share
             # their mint; read pinned on the same snapshot as the voices.
             tool_bond_addr = getattr(bc, "tool_bond_address", "") or ""
+            # DAO Registry: the charter in force, pinned to the same anchor
+            # (docs/multi_jurisdiction.md decision 5).
+            dao_registry_addr = getattr(bc, "dao_registry_address", "") or ""
         except Exception:
             substrate_addr, rpc_url, rep_token_addr = "", "", ""
             tool_bond_addr = ""
+            dao_registry_addr = ""
         if substrate_addr and rpc_url:
             def _voice_source():
                 from .common.voice_state import read_voice_state
                 return read_voice_state(
                     substrate_addr, rpc_url, rep_token_address=rep_token_addr,
                     tool_bond_address=tool_bond_addr,
+                    dao_registry_address=dao_registry_addr,
                 )
 
             self._federated_close_driver.voice_source = _voice_source

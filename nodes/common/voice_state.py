@@ -414,6 +414,77 @@ def read_tool_vetting_snapshot(
     return tool_vetting_snapshot_from_logs(records)
 
 
+# ---------------------------------------------------------------------------
+# Pinned charter (docs/multi_jurisdiction.md decision 5).
+#
+# The DAO Registry holds the charter text under jurisdiction.autonet.charter
+# and emits ``RegistryUpdated(string key, string value)`` (both fields
+# non-indexed) on every write. The charter in force for an epoch is the last
+# value written at or before the snapshot anchor's block, rebuilt from those
+# logs like the owner map (non-archive nodes serve them).
+# ---------------------------------------------------------------------------
+
+CHARTER_REGISTRY_KEY = "jurisdiction.autonet.charter"
+
+_REGISTRY_EVENTS_ABI = [
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": False, "internalType": "string", "name": "key", "type": "string"},
+            {"indexed": False, "internalType": "string", "name": "value", "type": "string"},
+        ],
+        "name": "RegistryUpdated",
+        "type": "event",
+    },
+]
+
+
+def charter_text_from_logs(
+    records: List[Dict[str, Any]], block: int,
+    key: str = CHARTER_REGISTRY_KEY,
+) -> Optional[str]:
+    """Last ``value`` written for ``key`` at or before ``block``.
+
+    ``records`` are ``{"block", "index", "key", "value"}``; ordered by
+    (block, logIndex). Returns None when the key was never written, or when
+    the last value is not charter text (a legacy 0x hash)."""
+    last: Optional[str] = None
+    for rec in sorted(records, key=lambda r: (int(r["block"]), int(r["index"]))):
+        if int(rec["block"]) > int(block):
+            break
+        if str(rec.get("key")) == key:
+            last = str(rec.get("value") or "")
+    if last is None or not last.lstrip().startswith("{"):
+        return None
+    return last
+
+
+def read_pinned_charter_text(
+    w3: Any, dao_registry_address: str, block: int,
+    key: str = CHARTER_REGISTRY_KEY,
+) -> Optional[str]:
+    """The jurisdiction's charter text as of ``block`` (the snapshot
+    anchor's block), from the DAO Registry's RegistryUpdated logs. Raises
+    on RPC failure, like the rest of the voice read."""
+    from web3 import Web3
+
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(dao_registry_address),
+        abi=_REGISTRY_EVENTS_ABI,
+    )
+    records = [
+        {
+            "block": int(log["blockNumber"]),
+            "index": int(log["logIndex"]),
+            "key": log["args"]["key"],
+            "value": log["args"]["value"],
+        }
+        for log in _get_logs(
+            contract.events.RegistryUpdated, w3, contract.address, block)
+    ]
+    return charter_text_from_logs(records, block, key)
+
+
 def read_voice_state(
     substrate_address: str,
     rpc_url: str = "",
@@ -421,6 +492,7 @@ def read_voice_state(
     epsilon: float = VOICE_EPSILON,
     rep_token_address: str = "",
     tool_bond_address: str = "",
+    dao_registry_address: str = "",
     web3: Any = None,
 ) -> Dict[str, Any]:
     """Read {owner_map, voice_weights, rep_shares, rep_supply, supply,
@@ -431,6 +503,11 @@ def read_voice_state(
     their auditors, rebuilt from ToolBond logs up to the SAME snapshot
     block as the owner map (``read_tool_vetting_snapshot``). Empty
     (``tools == {}``) when ``tool_bond_address`` is unset or at genesis.
+
+    ``charter_text`` (docs/multi_jurisdiction.md decision 5): the DAO
+    Registry's ``jurisdiction.autonet.charter`` value as of the SAME
+    snapshot block (``read_pinned_charter_text``). None when
+    ``dao_registry_address`` is unset, at genesis, or never written.
 
     ``emission_pool`` (Decision 2026-07-10, fees-only) = the burned fee
     shares (ServiceFee logs) in the snapshot anchor's window — NO base
@@ -473,6 +550,7 @@ def read_voice_state(
             "weight_source": "reputation",
             "vetting_snapshot": {
                 "auditor_share_bps": AUDITOR_SHARE_BPS_DEFAULT, "tools": {}},
+            "charter_text": None,
         }
     anchor = contract.functions.getAnchor(anchor_count - 1).call()
     block = int(anchor[7])       # Anchor.blockNumber (struct field 7)
@@ -580,6 +658,12 @@ def read_voice_state(
         vetting_snapshot = read_tool_vetting_snapshot(
             w3, tool_bond_address, block)
 
+    # The charter in force, pinned to the same anchor block.
+    charter_text: Optional[str] = None
+    if dao_registry_address:
+        charter_text = read_pinned_charter_text(
+            w3, dao_registry_address, block)
+
     return {
         "owner_map": owner_map,
         "voice_weights": voice_weights,
@@ -599,4 +683,5 @@ def read_voice_state(
         "snapshot_anchor_count": int(anchor_count),
         "weight_source": "reputation",
         "vetting_snapshot": vetting_snapshot,
+        "charter_text": charter_text,
     }

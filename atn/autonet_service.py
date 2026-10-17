@@ -199,6 +199,9 @@ class AutonetBridge:
 
         # Runtime back-reference (set by Runtime.__init__)
         self._runtime = None
+        # Main event loop, captured at start (charter-change restarts are
+        # requested from the nodes worker thread).
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # P2P agent advertisement
         self._p2p_host = None      # AutonetHost (lazy, trio-based)
@@ -283,12 +286,12 @@ class AutonetBridge:
                         st.jurisdiction_key or "(unknown)", e)
 
     def _charter_error(self) -> str:
-        """Check the jurisdiction's charter against what this build computes.
+        """Check the jurisdiction's charter text is one this build can run.
 
-        The Registry holds the charter text (2026-10-17). Until the close
-        takes the axis set as data, this build only runs the built-in
-        charter, so a DAO with different axes is refused instead of forked.
-        A missing charter (pre-2026-10-17 deploys) falls back to the hash
+        The Registry holds the charter text (2026-10-17) and each DAO
+        defines its own axes; only text ``Charter.from_text`` rejects is
+        refused. ``start`` installs a valid charter as the active one. A
+        missing charter (pre-2026-10-17 deploys) falls back to the hash
         comparison, which only warns."""
         text = getattr(self.config, "charter_text", "") or ""
         if not text:
@@ -302,9 +305,54 @@ class AutonetBridge:
                 log.debug("charter check skipped", exc_info=True)
             return ""
         from .config import charter_text_error
-        match, error = charter_text_error(text)
-        self.state.charter_match = match
+        _is_default, error = charter_text_error(text)
+        # A valid charter is installed and run, so local == jurisdiction.
+        self.state.charter_match = None if error else True
         return error
+
+    def _install_charter(self) -> None:
+        """Make the jurisdiction's charter the process's active charter.
+
+        Called at join, BEFORE the nodes-side service builds any world:
+        every charter root, coordinate head and the close's axis set come
+        from it. No charter text (pre-2026-10-17 deploys) keeps the
+        built-in DEFAULT_CHARTER."""
+        from nodes.common.world_model_substrate.charter import (
+            DEFAULT_CHARTER,
+            Charter,
+            set_active_charter,
+        )
+        text = getattr(self.config, "charter_text", "") or ""
+        charter = Charter.from_text(text) if text else DEFAULT_CHARTER
+        set_active_charter(charter)
+        log.info("Active charter: %d axes (%s), hash=%s",
+                 charter.n_dims, ",".join(charter.ids), charter.hash)
+
+    def _on_charter_changed(self, new_text: str) -> None:
+        """The close driver saw the jurisdiction's charter change (pinned
+        to the previous anchor). Every daemon sees the same pinned value at
+        the same epoch, so each restarts onto the new charter. Called from
+        the nodes worker thread."""
+        msg = "the jurisdiction changed its charter; restarting"
+        log.warning("%s", msg)
+        self.state.jurisdiction_errors = list(
+            dict.fromkeys(list(self.state.jurisdiction_errors) + [msg]))
+        self.state.last_error = msg
+
+        def _restart() -> None:
+            try:
+                from . import cli as _cli_module
+                _cli_module._restart_requested = True
+                if self._runtime is not None:
+                    self._runtime._shutdown_event.set()
+            except Exception:
+                log.exception("charter-change restart request failed")
+
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(_restart)
+        else:
+            _restart()
 
     # ------------------------------------------------------------------
     # P2P agent advertisement
@@ -808,6 +856,11 @@ class AutonetBridge:
             self.state.status = AutonetStatus.ERROR
             self.state.last_error = "; ".join(self.state.jurisdiction_errors)
             return {"status": "error", "error": self.state.last_error}
+        # The jurisdiction's charter defines the axes every world is built
+        # on (docs/multi_jurisdiction.md decision 5): install it before the
+        # nodes-side service exists.
+        self._install_charter()
+        self._loop = asyncio.get_running_loop()
 
         # Pre-flight cache refresh
         try:
@@ -845,6 +898,7 @@ class AutonetBridge:
             for atn_key, node_key in (("substrate_address", "substrate_address"),
                                       ("rep_token_address", "rep_token_address"),
                                       ("tool_bond_address", "tool_bond_address"),
+                                      ("dao_registry_address", "dao_registry_address"),
                                       ("dao_address", "governor_address")):
                 value = getattr(self.config, atn_key, "") or ""
                 if value:
@@ -859,6 +913,9 @@ class AutonetBridge:
             # registered when the WorldService gets constructed inside
             # start().
             self._service = AutonetService(self._autonet_config, data_dir=self._data_dir)
+            # A charter change pinned to the previous anchor halts the
+            # close and restarts the daemon onto the new axes.
+            self._service.on_charter_change = self._on_charter_changed
             self._wire_world_epoch_subscriber()
             self._wire_substrate_identity_resolver()
             self._task = asyncio.create_task(self._run_service())

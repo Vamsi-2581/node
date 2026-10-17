@@ -48,8 +48,8 @@ from .world_model_substrate.adapter import (
 )
 from .world_model_substrate.aggregate import apply_events
 from .world_model_substrate.events import snapshot_node_scores
+from .world_model_substrate.charter import active_charter
 from .world_model_substrate.mint_gate import (
-    DEFAULT_CHARTER_IDS,
     apply_mint_gate,
     charter_violation_score,
 )
@@ -323,7 +323,7 @@ class WorldService:
         self._tool_registrations: Dict[str, Dict[str, str]] = {}
         self._tool_vetting_path = state_dir / "local_tool_vetting.json"
         self._tool_vetting: Dict[str, Any] = {}
-        # v3 position drift carry-over: digest -> {"head": [6], "mass": [6]}.
+        # v3 position drift carry-over: digest -> {"head": [n_dims], "mass": [n_dims]}.
         self._tool_positions_path = state_dir / "local_tool_positions.json"
         self._tool_positions: Dict[str, Dict[str, Any]] = {}
         # True once a FEDERATED close has handed us its authoritative
@@ -1397,7 +1397,7 @@ class WorldService:
         this WorldService's embedding_dim.
 
         The result is shaped ``[charter_head_N | embedding_tail_M]``
-        where N == ``adapter.N_DIMS`` (the active charter dimensionality)
+        where N == ``active_charter().n_dims`` (the charter dimensionality)
         and M == self.embedding_dim:
 
           - ``charter_head``: optional N-tuple to seed the alignment
@@ -1412,16 +1412,16 @@ class WorldService:
         texts produce different coords assuming the embedder is
         non-degenerate.
         """
-        from .world_model_substrate.adapter import N_DIMS
+        n_dims = active_charter().n_dims
         from .world_model_substrate.usefulness_coords import (
             coords_for_query,
             default_usefulness_embedder,
         )
         if embedder is None:
             embedder = default_usefulness_embedder(dim=self.embedding_dim)
-        head = tuple(charter_head) if charter_head is not None else (0.0,) * N_DIMS
-        if len(head) != N_DIMS:
-            raise ValueError(f"charter_head must be length {N_DIMS}, got {len(head)}")
+        head = tuple(charter_head) if charter_head is not None else (0.0,) * n_dims
+        if len(head) != n_dims:
+            raise ValueError(f"charter_head must be length {n_dims}, got {len(head)}")
         tail = tuple(coords_for_query(text, embedder=embedder))
         # Match self.embedding_dim: truncate or zero-pad.
         if len(tail) > self.embedding_dim:
@@ -2257,7 +2257,7 @@ class WorldService:
             "registrations": {digest: {author, trust_class, deps: [...]}},
             "vetting": {digest: {greenlit, validators, royalty_left, busted}},
             "recent_tool_mint": {digest: float},
-            "positions": {digest: {head: [6], mass: [6], rating: float}},
+            "positions": {digest: {head: [n_dims], mass: [n_dims], rating: float}},
             "last_epoch": {epoch_id, closed_at, total_mint, tool_mint} | None,
             "epochs_considered": int,
           }
@@ -2266,9 +2266,7 @@ class WorldService:
         ``rating`` is the usefulness lift (mean of the correctness and
         simplicity axes) that ranks library retrieval.
         """
-        from .world_model_substrate.adapter import CHARTER
-
-        axis_by_id = {str(e["id"]): int(e["axis_index"]) for e in CHARTER}
+        axis_by_id = active_charter().axis_index
         useful = [axis_by_id[a] for a in ("correctness", "simplicity")
                   if a in axis_by_id]
 
@@ -2476,7 +2474,7 @@ class WorldService:
         if apply_gate:
             result = apply_mint_gate(
                 result, self._world,
-                charter_ids=DEFAULT_CHARTER_IDS,
+                charter_ids=active_charter().ids,
                 gate_strength=gate_strength,
             )
 
@@ -2531,7 +2529,7 @@ class WorldService:
         if apply_gate:
             for node_id in node_agent:
                 node_violation[node_id] = charter_violation_score(
-                    self._world, node_id, DEFAULT_CHARTER_IDS,
+                    self._world, node_id, active_charter().ids,
                 )
             tool_agent_mint = scale_node_agent_mint_by_violation(
                 node_agent, node_violation, gate_strength=gate_strength,

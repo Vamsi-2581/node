@@ -425,38 +425,52 @@ def _score_evolution(text: str, tool: str, ttype: str, turn: dict[str, Any]) -> 
 # ---------------------------------------------------------------------------
 
 
-def score_turn(turn: dict[str, Any]) -> tuple[float, float, float, float, float, float]:
-    """Heuristic 6D scoring of a single agent turn against the charter.
+def _score_v1(turn: dict[str, Any]) -> dict[str, float]:
+    """Heuristic scores for the v1 axes this module knows, by axis id."""
+    if not isinstance(turn, dict):
+        return {}
+    text = _gather_text(turn)
+    tool = _tool_name(turn)
+    ttype = _turn_type(turn)
+    return {
+        "life_precious": _score_life(text),
+        "self_preservation": _score_self_preservation(text, tool, ttype),
+        "promotion_of_intelligence": _score_intelligence(text, tool, ttype),
+        "evolution": _score_evolution(text, tool, ttype, turn),
+        # The 2 usefulness axes abstain by design (see score_turn).
+        "correctness": 0.0,
+        "simplicity": 0.0,
+    }
 
-    Returns ``(life, self_pres, intelligence, evolution, correctness,
-    simplicity)``, each in [-1, +1].
+
+def score_turn(turn: dict[str, Any]) -> tuple[float, ...]:
+    """Heuristic scoring of a single agent turn against the active charter.
+
+    Returns one value in [-1, +1] per active-charter axis, in axis order.
+    Under the v1 charter that is ``(life, self_pres, intelligence,
+    evolution, correctness, simplicity)``. Axes this heuristic does not
+    know (a jurisdiction's own axes) abstain with 0.0.
 
     The heuristic is keyword-based and validated only on the 4 alignment
     axes. The 2 usefulness axes (correctness, simplicity) abstain
-    (return 0.0) by design — Tier 3B (substrate_experiment) validated
+    (return 0.0) by design: Tier 3B (substrate_experiment) validated
     those axes on LLM embedders only, and keyword matching is the wrong
     tool for "is this code correct?" / "is this minimal?". Callers that
     need usefulness signal should route through the LLM embedder
     (see `llm_score_turn`).
     """
-    if not isinstance(turn, dict):
-        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    from .charter import active_charter
 
-    text = _gather_text(turn)
-    tool = _tool_name(turn)
-    ttype = _turn_type(turn)
-
-    life = _score_life(text)
-    self_pres = _score_self_preservation(text, tool, ttype)
-    intel = _score_intelligence(text, tool, ttype)
-    evo = _score_evolution(text, tool, ttype, turn)
-
-    return (life, self_pres, intel, evo, 0.0, 0.0)
+    scores = _score_v1(turn)
+    return tuple(float(scores.get(a, 0.0)) for a in active_charter().ids)
 
 
 def score_turn_4d(turn: dict[str, Any]) -> tuple[float, float, float, float]:
-    """Backwards-compatible 4-axis wrapper around `score_turn`.
+    """Backwards-compatible 4-axis wrapper: the v1 alignment axes only.
 
     Use `score_turn` for new code.
     """
-    return score_turn(turn)[:4]
+    s = _score_v1(turn)
+    return tuple(s.get(a, 0.0) for a in (
+        "life_precious", "self_preservation",
+        "promotion_of_intelligence", "evolution"))  # type: ignore[return-value]

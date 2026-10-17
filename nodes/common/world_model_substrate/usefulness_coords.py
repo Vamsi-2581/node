@@ -558,8 +558,8 @@ def verify_claim_coords(
     matched best.
     """
     if head_dims is None:
-        from .adapter import N_DIMS
-        head_dims = N_DIMS
+        from .charter import active_charter
+        head_dims = active_charter().n_dims
     tail = tuple(coords)[head_dims:]
     if dim is None:
         dim = len(tail) or DEFAULT_DIM

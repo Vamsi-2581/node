@@ -43,8 +43,8 @@ from .world_model_substrate.adapter import (
     build_charter_world,
 )
 from .world_model_substrate.aggregate import apply_events
+from .world_model_substrate.charter import active_charter
 from .world_model_substrate.mint_gate import (
-    DEFAULT_CHARTER_IDS,
     charter_violation_score,
 )
 from .world_model_substrate.reconcile import (
@@ -477,7 +477,7 @@ def compute_tool_mint(
         "node_agent": {node_id: {author: mint}},   # gate-mergeable
         "registrations_next": {digest: manifest_meta},
         "vetting_next": {"manifests": {...}, "busts": {agent: n}},
-        "positions_next": {digest: {"head": [N_DIMS], "mass": [N_DIMS],
+        "positions_next": {digest: {"head": [n_dims], "mass": [n_dims],
                                     "own_share"?: {"sum", "mass"}}},
         "credibility_next": {household: multiplier},
         "tool_review_book_next": {digest: {household: {axis: {sum,n}}}},
@@ -899,8 +899,9 @@ def compute_tool_mint(
     # (carried positions/book/credibility, canonical events) over sorted
     # keys → bit-identical on every daemon.
     # ------------------------------------------------------------------
-    from .world_model_substrate.adapter import CHARTER, N_DIMS
-    axis_index = {str(e["id"]): int(e["axis_index"]) for e in CHARTER}
+    _charter = active_charter()
+    n_dims = _charter.n_dims
+    axis_index = _charter.axis_index
 
     # carried_pos / review_book / cred_state: normalized above (with the
     # successor merit carry applied).
@@ -916,10 +917,10 @@ def compute_tool_mint(
         prior = carried_pos.get(digest) or {}
         head = [float(x) for x in (prior.get("head") or [])]
         mass = [float(x) for x in (prior.get("mass") or [])]
-        if len(head) != N_DIMS:
-            head = [0.0] * N_DIMS
-        if len(mass) != N_DIMS:
-            mass = [1.0] * N_DIMS
+        if len(head) != n_dims:
+            head = [0.0] * n_dims
+        if len(mass) != n_dims:
+            mass = [1.0] * n_dims
         # Carry the tool's prior book forward; this epoch's reviews update
         # each household's running centroid on the axes it scored.
         book_entry: Dict[str, Dict[str, Dict[str, float]]] = {
@@ -952,8 +953,8 @@ def compute_tool_mint(
                             str(axis_id), {"sum": 0.0, "n": 0})
                         agg["sum"] += float(cell.get("sum") or 0.0)
                         agg["n"] += int(cell.get("n") or 0)
-            add_mass = [0.0] * N_DIMS
-            add_val = [0.0] * N_DIMS
+            add_mass = [0.0] * n_dims
+            add_val = [0.0] * n_dims
             for house in sorted(house_cells.keys()):
                 if house == author_house:
                     continue
@@ -990,7 +991,7 @@ def compute_tool_mint(
                         str(axis_id), {"sum": 0.0, "n": 0})
                     bcell["sum"] += mean_score * n
                     bcell["n"] += n
-            for i in range(N_DIMS):
+            for i in range(n_dims):
                 if add_mass[i] > 0.0:
                     head[i] = ((mass[i] * head[i] + add_val[i])
                                / (mass[i] + add_mass[i]))
@@ -1003,8 +1004,8 @@ def compute_tool_mint(
             positions_next[digest]["own_share"] = own_share_next[digest]
         if book_entry:
             review_book_next[digest] = book_entry
-        # Review mass = total drifted mass minus the N_DIMS author prior.
-        tool_review_mass[digest] = sum(mass) - float(N_DIMS)
+        # Review mass = total drifted mass minus the n_dims author prior.
+        tool_review_mass[digest] = sum(mass) - float(n_dims)
 
     # ------------------------------------------------------------------
     # v4.1 [R5] CONTINUOUS reversal-aware credibility. Re-score EVERY
@@ -1252,7 +1253,7 @@ def federated_reconcile_epoch(
         node_violation: Dict[str, float] = {}
         for node_id in sorted(node_agent_mint.keys()):
             node_violation[node_id] = charter_violation_score(
-                world, node_id, DEFAULT_CHARTER_IDS,
+                world, node_id, active_charter().ids,
             )
         gated_agent_mint = scale_node_agent_mint_by_violation(
             node_agent_mint, node_violation, gate_strength=gate_strength,

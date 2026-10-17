@@ -201,7 +201,7 @@ class ToolUsed:
     score: float = 0.0
     review_digest: str = ""
     # Per-charter-axis review scores (v3, spec Decision 2026-07-08):
-    # {axis_id: float in [-1, +1]}, axis ids = adapter.CHARTER order.
+    # {axis_id: float in [-1, +1]}, axis ids = the active charter's axes.
     # Signed self-report on the caller's OWN usage. At close these
     # accumulate (same damping/exclusions as usage) into the tool's
     # drifted charter head — they rank discovery and move position,

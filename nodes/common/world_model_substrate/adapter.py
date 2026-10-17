@@ -43,9 +43,10 @@ from .events import (
 try:
     from .score_turn import score_turn
 except ImportError:
-    def score_turn(turn: Dict[str, Any]) -> Tuple[float, float, float, float, float, float]:
+    def score_turn(turn: Dict[str, Any]) -> Tuple[float, ...]:
         """Fallback when score_turn module isn't built yet -- returns zeros."""
-        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        from .charter import active_charter as _ac
+        return (0.0,) * _ac().n_dims
 
 
 logger = logging.getLogger(__name__)
@@ -55,49 +56,24 @@ logger = logging.getLogger(__name__)
 # Charter
 # ---------------------------------------------------------------------------
 
-CHARTER = [
-    # ``veto_floor`` controls the structural prune threshold per
-    # tendency: a child whose tendency-tree intrinsic_score falls
-    # below this value is pruned outright via prune_veto_negatives.
-    # ``None`` = no veto pruning (the engine's veto_shaped flag stays
-    # off for that tendency). The current default disables veto
-    # pruning everywhere so substrate behavior is unchanged from prior
-    # phases. To enable per-tendency veto in the future, set a finite
-    # negative number (correctness was historically -1.0 in the engine
-    # default; tightening to 0 makes it stricter).
-    {"id": "life_precious",
-     "thesis": "Life is precious and should be preserved.",
-     "axis_index": 0,
-     "veto_floor": None},
-    {"id": "self_preservation",
-     "thesis": "The system should preserve its own continuity.",
-     "axis_index": 1,
-     "veto_floor": None},
-    {"id": "promotion_of_intelligence",
-     "thesis": "Intelligence in any form should be promoted.",
-     "axis_index": 2,
-     "veto_floor": None},
-    {"id": "evolution",
-     "thesis": "Forward advancement of capability is desirable.",
-     "axis_index": 3,
-     "veto_floor": None},
-    {"id": "correctness",
-     "thesis": "Work should achieve what it claims and avoid bugs.",
-     "axis_index": 4,
-     "veto_floor": None},
-    {"id": "simplicity",
-     "thesis": "Solutions should be minimal and direct, not over-engineered.",
-     "axis_index": 5,
-     "veto_floor": None},
-]
-N_DIMS = len(CHARTER)
+# The charter is data (docs/multi_jurisdiction.md decision 5): the active
+# jurisdiction's axes live in ``charter.active_charter()``. ``CHARTER`` and
+# ``N_DIMS`` are back-compat aliases of the v1 DEFAULT charter for tests,
+# sims and scripts; live code reads the active charter. Every entry's
+# ``veto_floor`` is None (no veto pruning); ``build_charter_world`` still
+# honors a finite floor if an entry carries one.
+from .charter import DEFAULT_CHARTER, active_charter  # noqa: E402
+
+CHARTER = DEFAULT_CHARTER.entries()
+N_DIMS = DEFAULT_CHARTER.n_dims
 
 
 def build_charter_world(bandwidth: float = 1.5, embedding_dim: int = 0) -> World:
     """Build a world with the constitutional charter tendencies.
 
-    The charter is the alignment vocabulary the substrate thinks in.
-    Tier 3B (substrate_experiment) validated the 6-root configuration
+    The charter is the alignment vocabulary the substrate thinks in: one
+    root per axis of the active charter (``charter.active_charter()``).
+    Tier 3B (substrate_experiment) validated the v1 6-root configuration
     (life_precious, self_preservation, promotion_of_intelligence,
     evolution, correctness, simplicity) as sharper than 4-root.
 
@@ -110,16 +86,18 @@ def build_charter_world(bandwidth: float = 1.5, embedding_dim: int = 0) -> World
     if embedding_dim < 0:
         raise ValueError(f"embedding_dim must be >= 0, got {embedding_dim}")
     # Log the active charter version hash. Imported lazily to avoid a circular
-    # import (charter_version derives its payload from CHARTER in this module).
+    # import (charter_version imports this module).
     try:
         from .charter_version import charter_hash as _charter_hash
         logger.debug("build_charter_world: active charter_hash=%s", _charter_hash())
     except Exception:  # pragma: no cover - never let hashing break world build
         pass
     world = World()
-    for entry in CHARTER:
+    charter = active_charter()
+    n_dims = charter.n_dims
+    for entry in charter.entries():
         i = entry["axis_index"]
-        head = tuple(1.0 if j == i else 0.0 for j in range(N_DIMS))
+        head = tuple(1.0 if j == i else 0.0 for j in range(n_dims))
         anchor = head + (0.0,) * embedding_dim
         veto_floor = entry.get("veto_floor")
         kwargs: Dict[str, Any] = dict(
@@ -149,27 +127,37 @@ def _obs_id_from_turn(turn: Dict[str, Any]) -> str:
     ).hexdigest()[:16]
 
 
-_IMPACT_FIELDS = (
-    "life_impact",
-    "self_pres_impact",
-    "intelligence_impact",
-    "evolution_impact",
-    "correctness_impact",
-    "simplicity_impact",
-)
+# Explicit per-axis override fields for the v1 axes (test/override mode).
+# Any other axis reads ``<axis_id>_impact``.
+_IMPACT_FIELD_BY_AXIS = {
+    "life_precious": "life_impact",
+    "self_preservation": "self_pres_impact",
+    "promotion_of_intelligence": "intelligence_impact",
+    "evolution": "evolution_impact",
+    "correctness": "correctness_impact",
+    "simplicity": "simplicity_impact",
+}
+_IMPACT_FIELDS = tuple(_IMPACT_FIELD_BY_AXIS.values())
+
+
+def _impact_fields() -> Tuple[str, ...]:
+    return tuple(_IMPACT_FIELD_BY_AXIS.get(a, f"{a}_impact")
+                 for a in active_charter().ids)
 
 
 def turn_to_observation(turn: Dict[str, Any], turn_index: int = 0) -> Observation:
-    """Convert one agent-turn record to a 6D coordinate observation.
+    """Convert one agent-turn record to a charter-coordinate observation
+    (one coordinate per active-charter axis).
 
     Prefers explicit *_impact fields if any are present (test/override
     mode); missing impact fields default to 0.0. Otherwise calls the
-    `score_turn` heuristic which scores the 4 alignment axes and
-    abstains on the 2 usefulness axes.
+    `score_turn` heuristic which scores the 4 v1 alignment axes and
+    abstains on everything else.
     """
-    has_explicit = any(k in turn for k in _IMPACT_FIELDS)
+    fields = _impact_fields()
+    has_explicit = any(k in turn for k in fields)
     if has_explicit:
-        coords = tuple(float(turn.get(k, 0.0)) for k in _IMPACT_FIELDS)
+        coords = tuple(float(turn.get(k, 0.0)) for k in fields)
     else:
         coords = score_turn(turn)
     label = turn.get("label", f"turn_{turn_index}")
