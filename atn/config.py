@@ -619,10 +619,16 @@ def charter_text_error(text: str) -> tuple[bool, str]:
     close takes the axis set as data, this build only computes its built-in
     charter, so a different one is refused instead of forked."""
     try:
-        axes = json.loads(text)["axes"]
+        parsed = json.loads(text)
+        axes = parsed["axes"]
         theirs = [(str(a["id"]), str(a["thesis"])) for a in axes]
     except Exception:
         return False, "the jurisdiction's charter is not valid JSON {\"axes\": [...]}"
+    # ToolBond counts axes on chain by counting "id": in the text, which is
+    # only reliable for the compact form; refuse anything else so a hand-
+    # written proposal can't make the contract and the daemons disagree.
+    if json.dumps(parsed, separators=(",", ":"), ensure_ascii=False) != text:
+        return False, "the jurisdiction's charter is not in compact JSON form"
     if not {"correctness", "simplicity"} <= {i for i, _ in theirs}:
         return False, ("the jurisdiction's charter lacks the mandatory axes "
                        "correctness and simplicity")

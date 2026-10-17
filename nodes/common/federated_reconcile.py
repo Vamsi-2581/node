@@ -125,9 +125,16 @@ VET_BUST_THRESHOLD = 0.5
 # throttle on zero-rep weight zeroes honest author income). The ε MINT-weight
 # floor survives — REP dilution, not β, is the youth defense now, and the sim
 # validated the model with ε present. v4.1 (2026-07-09) drops this ε floor
-# from DRIFT weight (drift = raw rep_share × credibility); it survives only
-# here, on the mint rail. PROVISIONAL VALUE pending user blessing.
-VOICE_EPSILON = 0.05
+# from DRIFT weight (drift = raw rep_share × credibility); it survived only
+# here, on the mint rail.
+#
+# ε = 0 (2026-10-17, docs/multi_jurisdiction.md decision 8): a household's
+# mint weight is its REP share, no floor. A fake owner wallet is free, so a
+# floor paid every fake household for farming its own tools. Newcomers
+# still earn as authors when REP holders use their tools, and earn REP by
+# staking accurate reviews (decision 10). A DAO starts with genesis REP, so
+# the weights are never all zero.
+VOICE_EPSILON = 0.0
 
 # ---------------------------------------------------------------------------
 # Tool economy v4.1 "gradient trust" (ratified 2026-07-09) as amended by

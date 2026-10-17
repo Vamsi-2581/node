@@ -100,7 +100,7 @@ def test_no_errors_before_joining():
 
 
 def test_charter_without_mandatory_axes_refused():
-    bad = json.dumps({"axes": [{"id": "life_precious", "thesis": "x"}]})
+    bad = json.dumps({"axes": [{"id": "life_precious", "thesis": "x"}]}, separators=(",", ":"))
     svc = _service(_config({**FULL, "charter": bad}))
     svc._mirror_jurisdiction()
     assert any("mandatory axes" in e for e in svc.state.jurisdiction_errors)
@@ -109,8 +109,15 @@ def test_charter_without_mandatory_axes_refused():
 def test_custom_charter_refused_until_supported():
     custom = json.dumps({"axes": [{"id": "correctness", "thesis": "a"},
                                   {"id": "simplicity", "thesis": "b"},
-                                  {"id": "kindness", "thesis": "c"}]})
+                                  {"id": "kindness", "thesis": "c"}]}, separators=(",", ":"))
     svc = _service(_config({**FULL, "charter": custom}))
     svc._mirror_jurisdiction()
     assert svc.state.charter_match is False
     assert any("differs" in e for e in svc.state.jurisdiction_errors)
+
+
+def test_non_compact_charter_refused():
+    spaced = json.dumps(json.loads(V1), indent=1)
+    svc = _service(_config({**FULL, "charter": spaced}))
+    svc._mirror_jurisdiction()
+    assert any("compact" in e for e in svc.state.jurisdiction_errors)

@@ -190,18 +190,18 @@ class TestVoiceWeights:
         assert entry["mint"] == pytest.approx(
             math.log1p(1) * 0.55 + math.log1p(1) * 0.05)
 
-    def test_unknown_household_gets_epsilon_floor(self):
-        """A weights map is present but doesn't know this household →
-        the epsilon floor, not full weight. Zero-balance throwaway
-        identities carry at most epsilon each."""
+    def test_unknown_household_mints_nothing(self):
+        """A weights map is present but doesn't know this household: with
+        ε = 0 (2026-10-17) a zero-REP household's usage pays no author, so
+        throwaway owner wallets farm nothing."""
+        assert VOICE_EPSILON == 0.0
         batches = _scenario([_receipt_event(1, "agent-a")])
         result = federated_epoch_close(
             canonical_order(batches),
             agent_owner_map={"agent-a": "0xstranger"},
             voice_weights={"0xelse": 1.0})
-        entry = result["tool_mint"][DIGEST]
-        assert entry["mint"] == pytest.approx(
-            math.log1p(1) * VOICE_EPSILON)
+        entry = result["tool_mint"].get(DIGEST, {"mint": 0.0})
+        assert entry["mint"] == 0.0
 
     def test_no_weights_means_unit_voice(self):
         """voice_weights=None (no chain access) = every household weighs
