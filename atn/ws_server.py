@@ -260,6 +260,7 @@ INTEGRATION_DENIED_MESSAGES = frozenset({
     "add_connector", "remove_connector", "use_connector", "oauth_start",
     "oauth_status", "daemon_restart", "update_status", "skip_onboarding",
     "autonet_publish_standards", "autonet_set_capture_config",
+    "autonet_switch", "autonet_jurisdictions",
     # Whole-fleet reads (snapshot carries owner-global sections).
     "snapshot", "get_snapshot", "list_agents",
 })
@@ -2799,6 +2800,42 @@ class WebSocketBridge:
             # Lazily load constitution CID from chain on first status request
             await self.runtime.autonet.load_constitution()
             return {"msg_id": msg_id, "ok": True, "result": self.runtime.autonet.get_status()}
+
+        if msg_type == "autonet_jurisdictions":
+            return {"msg_id": msg_id, "ok": True,
+                    "result": self._jurisdictions_view()}
+
+        if msg_type == "autonet_switch":
+            # Switch the daemon to another jurisdiction (docs/
+            # multi_jurisdiction.md decision 1): check it can be joined,
+            # save the selection, restart. Substrate data of the current
+            # jurisdiction stays parked under its key; agents keep their
+            # identity, registration is per jurisdiction.
+            dao_registry = str(msg.get("dao_registry") or "").strip()
+            rpc_url = str(msg.get("rpc_url") or "").strip()
+            if not dao_registry or not rpc_url:
+                return {"msg_id": msg_id, "ok": False,
+                        "error": "autonet_switch needs 'dao_registry' and 'rpc_url'"}
+            import asyncio as _asyncio
+            from .config import check_jurisdiction, save_selected_jurisdiction
+            check = await _asyncio.to_thread(check_jurisdiction, dao_registry, rpc_url)
+            if not check["ok"]:
+                return {"msg_id": msg_id, "ok": False,
+                        "error": "; ".join(check["errors"]), "result": check}
+            if check["key"] == self.runtime.jurisdiction:
+                return {"msg_id": msg_id, "ok": True,
+                        "result": {**check, "switched": False,
+                                   "note": "already in this jurisdiction"}}
+            save_selected_jurisdiction(
+                {**check, "name": str(msg.get("name") or check.get("name") or "")},
+                getattr(self.runtime._config, "data_dir", None))
+            if msg.get("restart", True):
+                from . import cli as _cli_module
+                _cli_module._restart_requested = True
+                self.runtime._shutdown_event.set()
+            return {"msg_id": msg_id, "ok": True,
+                    "result": {**check, "switched": True,
+                               "restarting": bool(msg.get("restart", True))}}
 
         if msg_type == "autonet_start":
             result = await self.runtime.autonet.start()
@@ -5421,6 +5458,33 @@ class WebSocketBridge:
             identity.registration_tx = result.get("tx_hash")
             self.runtime.registry.persist_identity(agent_id)
         return result
+
+    def _jurisdictions_view(self) -> dict[str, Any]:
+        """The current jurisdiction plus every jurisdiction this daemon's
+        agents are registered in (their substrate data is parked locally).
+        The frontend merges this with the DAO directory it reads itself."""
+        from .config import load_selected_jurisdiction
+        current = self.runtime.jurisdiction
+        st = self.runtime.autonet.state
+        known: dict[str, dict[str, Any]] = {}
+        for defn, _status in self.runtime.registry.list_agents():
+            ident = getattr(defn, "identity", None)
+            for key in (getattr(ident, "registrations", None) or {}):
+                row = known.setdefault(key, {"key": key, "agents": []})
+                row["agents"].append(defn.id)
+        sel = load_selected_jurisdiction(getattr(self.runtime._config, "data_dir", None))
+        return {
+            "current": {
+                "key": current,
+                "selection": sel,          # None = the packaged default
+                "dao_registry": st.dao_registry_address,
+                "dao": st.dao_address,
+                "chain_id": st.chain_id,
+                "substrate": st.substrate_address,
+                "errors": list(st.jurisdiction_errors),
+            },
+            "registered_in": sorted(known.values(), key=lambda r: r["key"]),
+        }
 
     async def _handle_check_registration(self, agent_id: str) -> dict[str, Any]:
         """Check if an agent is registered on-chain."""

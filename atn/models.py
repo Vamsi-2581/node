@@ -102,9 +102,14 @@ class AgentIdentity:
     address: str = ""                       # Derived 0x address
     lineage_hash: str = ""                  # hash(parent_hash + charter + public_key)
     parent_lineage_hash: str | None = None  # Parent's lineage hash
+    # Registration in the CURRENT jurisdiction (the one this process runs).
     registered_on_chain: bool = False
     registration_tx: str | None = None
     contract_address: str | None = None     # Deployed agent contract
+    # Every jurisdiction this agent registered in: "<chain_id>:<dao>" ->
+    # registration tx. The same 0x keeps its identity across switches;
+    # registration is per jurisdiction (docs/multi_jurisdiction.md 6).
+    registrations: dict[str, str | None] = field(default_factory=dict)
 
 
 @dataclass

@@ -301,23 +301,10 @@ class AutonetBridge:
             except Exception:
                 log.debug("charter check skipped", exc_info=True)
             return ""
-        try:
-            axes = json.loads(text)["axes"]
-            theirs = [(str(a["id"]), str(a["thesis"])) for a in axes]
-        except Exception:
-            self.state.charter_match = False
-            return "the jurisdiction's charter is not valid JSON {\"axes\": [...]}"
-        ids = {i for i, _ in theirs}
-        if not {"correctness", "simplicity"} <= ids:
-            self.state.charter_match = False
-            return "the jurisdiction's charter lacks the mandatory axes correctness and simplicity"
-        from nodes.common.world_model_substrate.adapter import CHARTER
-        ours = [(c["id"], c["thesis"]) for c in CHARTER]
-        self.state.charter_match = (theirs == ours)
-        if theirs != ours:
-            return ("the jurisdiction's charter differs from the one this build "
-                    "computes; custom charters need a newer build")
-        return ""
+        from .config import charter_text_error
+        match, error = charter_text_error(text)
+        self.state.charter_match = match
+        return error
 
     # ------------------------------------------------------------------
     # P2P agent advertisement

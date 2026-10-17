@@ -612,6 +612,58 @@ def epoch_rules_error(an: "RPBConfig") -> str:
     return ""
 
 
+def charter_text_error(text: str) -> tuple[bool, str]:
+    """(matches the built-in charter, why this build can't run it or "").
+
+    Every charter must carry the correctness and simplicity axes. Until the
+    close takes the axis set as data, this build only computes its built-in
+    charter, so a different one is refused instead of forked."""
+    try:
+        axes = json.loads(text)["axes"]
+        theirs = [(str(a["id"]), str(a["thesis"])) for a in axes]
+    except Exception:
+        return False, "the jurisdiction's charter is not valid JSON {\"axes\": [...]}"
+    if not {"correctness", "simplicity"} <= {i for i, _ in theirs}:
+        return False, ("the jurisdiction's charter lacks the mandatory axes "
+                       "correctness and simplicity")
+    from nodes.common.world_model_substrate.adapter import CHARTER
+    if theirs != [(c["id"], c["thesis"]) for c in CHARTER]:
+        return False, ("the jurisdiction's charter differs from the one this "
+                       "build computes; custom charters need a newer build")
+    return True, ""
+
+
+def check_jurisdiction(dao_registry: str, rpc_url: str,
+                       jurisdiction_id: str = "autonet") -> dict[str, Any]:
+    """Read a candidate jurisdiction's Registry and say whether this daemon
+    can join it: {ok, errors, chain_id, dao, name, rpc_url, dao_registry}.
+    Network read; used before switching."""
+    data = _fetch_onchain_registry(dao_registry, rpc_url, jurisdiction_id)
+    if data is None:
+        return {"ok": False, "dao_registry": dao_registry, "rpc_url": rpc_url,
+                "errors": [f"no autonet jurisdiction readable at {dao_registry}"]}
+    seed = _parse_registry_data(data, jurisdiction_id)
+    an = RPBConfig()
+    for k, v in seed.items():
+        if hasattr(an, k):
+            setattr(an, k, v)
+    errors: list[str] = []
+    missing = missing_prerequisites(an)
+    if missing:
+        errors.append("missing jurisdiction addresses: " + ", ".join(missing))
+    rules = epoch_rules_error(an)
+    if rules:
+        errors.append(rules)
+    if an.charter_text:
+        _match, charter = charter_text_error(an.charter_text)
+        if charter:
+            errors.append(charter)
+    return {"ok": not errors, "errors": errors, "chain_id": an.chain_id,
+            "dao": an.dao_address, "dao_registry": dao_registry,
+            "rpc_url": rpc_url, "key": jurisdiction_key(an),
+            "name": seed.get("name", "")}
+
+
 def jurisdiction_key(an: "RPBConfig") -> str:
     """``<chain_id>:<DAO address>``: the jurisdiction's identity, used as its
     gossip topic and the key its local substrate data is parked under."""
@@ -646,13 +698,86 @@ _REGISTRY_READ_ABI = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# The selected jurisdiction (docs/multi_jurisdiction.md decision 1)
+# ---------------------------------------------------------------------------
+#
+# A daemon participates in one jurisdiction at a time. The owner's choice is
+# saved as <data_dir>/jurisdiction.json: {chain_id, rpc_url, dao_registry,
+# dao, name}. Switching rewrites it and restarts the daemon. Without it the
+# daemon uses the packaged registry.json's jurisdiction.
+
+SELECTION_FILE = "jurisdiction.json"
+
+
+def _selection_path(data_dir: Path | None = None) -> Path:
+    return Path(data_dir or _DEFAULT_DIR) / SELECTION_FILE
+
+
+def load_selected_jurisdiction(data_dir: Path | None = None) -> dict[str, Any] | None:
+    """The saved jurisdiction selection, or None when there is none (or it
+    is unreadable, which is logged)."""
+    path = _selection_path(data_dir)
+    if not path.is_file():
+        return None
+    try:
+        sel = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.warning("jurisdiction selection %s unreadable; ignoring it", path)
+        return None
+    if not isinstance(sel, dict) or not sel.get("dao_registry") or not sel.get("chain_id"):
+        log.warning("jurisdiction selection %s incomplete; ignoring it", path)
+        return None
+    return sel
+
+
+def save_selected_jurisdiction(sel: dict[str, Any], data_dir: Path | None = None) -> Path:
+    """Write the selection atomically. Takes effect at the next start."""
+    path = _selection_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
+        "chain_id": int(sel["chain_id"]),
+        "rpc_url": str(sel.get("rpc_url") or ""),
+        "dao_registry": str(sel["dao_registry"]),
+        "dao": str(sel.get("dao") or ""),
+        "name": str(sel.get("name") or ""),
+    }, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def boot_jurisdiction_key(data_dir: Path | None = None) -> str:
+    """``<chain_id>:<DAO address>`` of the jurisdiction this process runs,
+    known at boot without touching the network: the saved selection, else
+    the packaged registry.json's entry. "" when neither names a DAO."""
+    sel = load_selected_jurisdiction(data_dir)
+    if sel is not None:
+        dao, chain_id = str(sel.get("dao") or ""), int(sel.get("chain_id") or 0)
+    else:
+        try:
+            data = json.loads(_packaged_registry_path().read_text(encoding="utf-8"))
+            entry = data["jurisdictions"]["autonet"]
+            dao = str(entry.get("contracts", {}).get("dao") or "")
+            chain_id = int(entry.get("network", {}).get("chain_id") or 0)
+        except Exception:
+            return ""
+    if not dao or not chain_id:
+        return ""
+    return f"{chain_id}:{dao.strip().lower()}"
+
+
 def _onchain_registry_target() -> tuple[str, str]:
-    """(DAO Registry address, rpc url) for a jurisdiction launched on chain,
-    from ATN_JURISDICTION_REGISTRY / ATN_JURISDICTION_RPC. The rpc falls back
-    to the packaged network's. ("", "") when unset."""
+    """(DAO Registry address, rpc url) for a jurisdiction launched on chain:
+    ATN_JURISDICTION_REGISTRY / ATN_JURISDICTION_RPC, else the saved
+    jurisdiction selection. The rpc falls back to the packaged network's.
+    ("", "") when neither is set."""
     addr = os.environ.get("ATN_JURISDICTION_REGISTRY", "").strip()
     if not addr:
-        return "", ""
+        sel = load_selected_jurisdiction(_selection_data_dir())
+        if sel is None:
+            return "", ""
+        return str(sel["dao_registry"]), str(sel.get("rpc_url") or "")
     rpc = os.environ.get("ATN_JURISDICTION_RPC", "").strip()
     if not rpc:
         from .jurisdiction import RPC_URL
@@ -719,10 +844,21 @@ def _load_registry_seed(jurisdiction_id: str = "autonet") -> dict[str, Any]:
         if reg_addr:
             data = _fetch_onchain_registry(reg_addr, reg_rpc, jurisdiction_id)
             if data is None:
+                if load_selected_jurisdiction(_selection_data_dir()) is not None:
+                    # The owner chose this DAO: never quietly join the
+                    # packaged one instead. Nothing resolves, so the
+                    # jurisdiction refuses to start and says why.
+                    log.warning("Selected jurisdiction registry %s unreadable on "
+                                "chain; not joining any network", reg_addr)
+                    return {}
                 log.warning("Jurisdiction registry %s unreadable on chain; using "
                             "the packaged registry", reg_addr)
             else:
                 source = f"chain:{reg_addr}"
+                sel = load_selected_jurisdiction(_selection_data_dir())
+                contracts = data["jurisdictions"][jurisdiction_id]["contracts"]
+                if sel is not None and sel.get("dao"):
+                    contracts.setdefault("dao", sel["dao"])
     if data is None:
         path = _packaged_registry_path()
         try:
@@ -741,6 +877,20 @@ def _load_registry_seed(jurisdiction_id: str = "autonet") -> dict[str, Any]:
              (seed.get("dao_address") or "")[:10] or "(none)",
              (seed.get("substrate_address") or "")[:10] or "(none)")
     return seed
+
+
+# The data dir whose jurisdiction.json the registry resolution reads. Set by
+# the runtime at boot (tests point it elsewhere); None = ~/.atn.
+_SELECTION_DATA_DIR: Path | None = None
+
+
+def set_selection_data_dir(data_dir: Path | None) -> None:
+    global _SELECTION_DATA_DIR
+    _SELECTION_DATA_DIR = Path(data_dir) if data_dir else None
+
+
+def _selection_data_dir() -> Path | None:
+    return _SELECTION_DATA_DIR
 
 
 def _seed_defaults() -> dict[str, Any]:

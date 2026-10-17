@@ -104,7 +104,14 @@ class ToolRecord:
     # Three tiers (tool_substrate.md v2): private (default) vs published.
     # Private tools are pure local capability — never pushed to the
     # substrate, no consensus footprint. Publishing is a deliberate act.
+    # ``published`` is for the CURRENT jurisdiction; ``published_in`` keeps
+    # every jurisdiction it was published in. Publishing in another
+    # jurisdiction is a fresh act there (docs/multi_jurisdiction.md 6).
     published: bool = False
+    published_in: set[str] = field(default_factory=set)
+    # For ADOPTED records: the jurisdiction they were adopted from. They
+    # are usable only there; switching away parks them.
+    jurisdiction: str = ""
     # Local author agent id (scoping). Empty on pre-address rows —
     # author_id falls back to the manifest author. For ADOPTED records
     # this is the adopting agent — adoption scopes to the adopter's
@@ -155,6 +162,8 @@ class ToolRecord:
             "grants": sorted(self.grants),
             "enabled": self.enabled,
             "published": self.published,
+            "published_in": sorted(self.published_in),
+            **({"jurisdiction": self.jurisdiction} if self.jurisdiction else {}),
             "local_author": self.local_author,
             "registered_ts": self.registered_ts,
             "origin": self.origin,
@@ -175,6 +184,9 @@ class ToolStore:
         self._receipts_path = self._dir / "receipts.jsonl"
         self._attestations_path = self._dir / "attestations.jsonl"
         self._records: dict[str, ToolRecord] = {}
+        # Adopted records from another jurisdiction: kept on disk, invisible
+        # and unusable until the daemon switches back to that jurisdiction.
+        self._parked: list[ToolRecord] = []
         self._blobs: Any = None  # lazy; None until substrate package needed
         self._embedder: Any = None  # lazy usefulness embedder; injectable for tests
         self._receipt_seq = 0
@@ -449,6 +461,8 @@ class ToolStore:
             digest=digest,
             manifest=manifest,
             published=bool(publish),
+            published_in=({self._jurisdiction} if publish and self._jurisdiction
+                          else set()),
             local_author=author,
             registered_ts=int(time.time()),
             origin=origin,
@@ -604,6 +618,12 @@ class ToolStore:
             frontier = nxt
         return False
 
+    @property
+    def _jurisdiction(self) -> str:
+        """The jurisdiction this process runs ("<chain_id>:<dao>"), or "" in
+        chain-free runs."""
+        return str(getattr(self._runtime, "jurisdiction", "") or "")
+
     def set_published(self, digest: str, published: bool) -> bool:
         """Owner-gated publish/unpublish. Publishing pushes the manifest
         to the substrate; unpublishing only stops future pushes (the
@@ -628,6 +648,11 @@ class ToolStore:
             # re-registering the tool re-stamps it once an identity exists.
             raise ValueError(_ORPHAN_PUBLISH_ERROR)
         record.published = bool(published)
+        if self._jurisdiction:
+            if record.published:
+                record.published_in.add(self._jurisdiction)
+            else:
+                record.published_in.discard(self._jurisdiction)
         self._persist()
         if record.published and self.manifest_sink is not None:
             try:
@@ -1953,6 +1978,7 @@ class ToolStore:
             registered_ts=int(time.time()),
             origin="adopted",
             core_replacement_ack=bool(replaces and core_replacement_ack),
+            jurisdiction=self._jurisdiction,
         )
         self._records[digest] = record
         proposal["status"] = "approved"
@@ -2617,23 +2643,38 @@ class ToolStore:
                 log.warning("ToolStore: manifest blob %s... missing, dropping",
                             digest[:16])
                 continue
-            self._records[digest] = ToolRecord(
+            cur = self._jurisdiction
+            published_in = set(row.get("published_in") or [])
+            if "published_in" not in row and row.get("published") and cur:
+                # Pre-2026-10-17 row: published in the jurisdiction this
+                # daemon ran then, the packaged one.
+                published_in = {cur}
+            origin = str(row.get("origin") or "authored")
+            record = ToolRecord(
                 digest=digest,
                 manifest=manifest,
                 grants=set(row.get("grants") or []),
                 enabled=bool(row.get("enabled", True)),
-                published=bool(row.get("published", False)),
+                published=((cur in published_in) if cur
+                           else bool(row.get("published", False))),
+                published_in=published_in,
+                jurisdiction=str(row.get("jurisdiction")
+                                 or (cur if origin == "adopted" else "")),
                 local_author=str(row.get("local_author") or ""),
                 registered_ts=int(row.get("registered_ts") or 0),
-                origin=str(row.get("origin") or "authored"),
+                origin=origin,
                 core_replacement_ack=bool(row.get("core_replacement_ack")),
                 last_evidence_digest=str(row.get("last_evidence_digest") or ""),
             )
+            if origin == "adopted" and cur and record.jurisdiction != cur:
+                self._parked.append(record)
+                continue
+            self._records[digest] = record
 
     def _persist(self) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
         tmp = self._registry_path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as fh:
-            for record in self._records.values():
+            for record in [*self._records.values(), *self._parked]:
                 fh.write(json.dumps(record.to_row()) + "\n")
         os.replace(tmp, self._registry_path)

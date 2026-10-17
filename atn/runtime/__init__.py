@@ -71,6 +71,11 @@ class Runtime:
         self.events = event_bus
         self.data_dir = data_dir
         self._config = config or ATNConfig()
+        # One jurisdiction per process (docs/multi_jurisdiction.md 1): the
+        # saved selection in the data dir, else the packaged one.
+        from ..config import boot_jurisdiction_key, set_selection_data_dir
+        set_selection_data_dir(getattr(self._config, "data_dir", None))
+        self.jurisdiction = boot_jurisdiction_key(getattr(self._config, "data_dir", None))
 
         # Single-writer input arbitration (P3). Runtime-owned; a gate ABOVE
         # every per-surface InputPolicy. Surfaces register/release against it;

@@ -128,6 +128,10 @@ class AgentRegistry:
         self.inbox = inbox
         self.output_store = output_store
         self._config = config
+        # The jurisdiction this process runs; registration flags are read
+        # and written for it (docs/multi_jurisdiction.md decision 6).
+        from ..config import boot_jurisdiction_key
+        self.jurisdiction = boot_jurisdiction_key(getattr(config, "data_dir", None))
 
         self._agents: dict[str, AgentDefinition] = {}
         self._status: dict[str, AgentStatus] = {}
@@ -203,12 +207,22 @@ class AgentRegistry:
                 raise RuntimeError(
                     "agent-key vault unavailable; cannot persist wallet key")
             ks.put_secret(self._key_secret_name(agent_id), private_key)
+        jur = getattr(self, "jurisdiction", "")
+        regs = dict(getattr(identity, "registrations", None) or {})
+        if jur:
+            if identity.registered_on_chain:
+                regs[jur] = identity.registration_tx
+            else:
+                regs.pop(jur, None)
+        identity.registrations = regs
         data = {
             "public_key": identity.public_key,
             "address": identity.address,
             "lineage_hash": identity.lineage_hash,
+            # Current jurisdiction's flag, kept for older builds.
             "registered_on_chain": identity.registered_on_chain,
             "registration_tx": identity.registration_tx,
+            "registrations": regs,
         }
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         log.info("Persisted identity for %s to %s", agent_id, path)
@@ -235,6 +249,17 @@ class AgentRegistry:
                 registered_on_chain=data.get("registered_on_chain", False),
                 registration_tx=data.get("registration_tx"),
             )
+            jur = getattr(self, "jurisdiction", "")
+            regs = data.get("registrations")
+            if not isinstance(regs, dict):
+                # Pre-2026-10-17 file: its flag was for the jurisdiction
+                # this daemon ran then, the packaged one.
+                regs = ({jur: identity.registration_tx}
+                        if identity.registered_on_chain and jur else {})
+            identity.registrations = dict(regs)
+            if jur:
+                identity.registered_on_chain = jur in regs
+                identity.registration_tx = regs.get(jur)
             # Key source of truth is the vault. LEGACY MIGRATION: if the file
             # still carries a non-empty "private_key" field, honor it, push it
             # into the vault, and rewrite the file without the field.
