@@ -275,6 +275,12 @@ class AgentDefinition:
     #     ratified 2026-07-26: employer-chooses-the-tool) ---
     service_provider: dict[str, Any] | None = None
 
+    # --- Imported Claude Code session (atn/claude_sessions.py) ---
+    # ``{"folder": "<abs path>", "session_id": "<uuid>"}``: this agent IS
+    # that session. Its bridge runs resume it in its own folder with the
+    # project's settings, Claude Code's system prompt and full tools.
+    claude_session: dict[str, Any] | None = None
+
     # --- Harness loadout (docs/tool_substrate.md, Decision 2026-10-12) ---
     loadout: str = ""
     # The 64-hex digest of the harness DISTRO this agent runs: its loop

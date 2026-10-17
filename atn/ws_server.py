@@ -261,6 +261,7 @@ INTEGRATION_DENIED_MESSAGES = frozenset({
     "oauth_status", "daemon_restart", "update_status", "skip_onboarding",
     "autonet_publish_standards", "autonet_set_capture_config",
     "autonet_switch", "autonet_jurisdictions",
+    "claude_sessions", "claude_session_import",
     # Whole-fleet reads (snapshot carries owner-global sections).
     "snapshot", "get_snapshot", "list_agents",
 })
@@ -2818,6 +2819,23 @@ class WebSocketBridge:
             # Lazily load constitution CID from chain on first status request
             await self.runtime.autonet.load_constitution()
             return {"msg_id": msg_id, "ok": True, "result": self.runtime.autonet.get_status()}
+
+        # Claude Code sessions on this machine (atn/claude_sessions.py): list
+        # a folder's sessions, and import one as an agent whose runs resume
+        # it in place. Owner-only: an import gives the daemon the session.
+        if msg_type == "claude_sessions":
+            folder = str(msg.get("folder") or "").strip()
+            if not folder:
+                return {"msg_id": msg_id, "ok": False, "error": "Missing 'folder'"}
+            from .claude_sessions import list_sessions
+            listing = list_sessions(folder)
+            imported = self._imported_sessions()
+            for row in listing["sessions"]:
+                row["imported_as"] = imported.get(row["session_id"], "")
+            return {"msg_id": msg_id, "ok": True, "result": listing}
+
+        if msg_type == "claude_session_import":
+            return {"msg_id": msg_id, **(await self._import_claude_session(msg))}
 
         if msg_type == "autonet_jurisdictions":
             return {"msg_id": msg_id, "ok": True,
@@ -5491,6 +5509,62 @@ class WebSocketBridge:
             identity.registration_tx = result.get("tx_hash")
             self.runtime.registry.persist_identity(agent_id)
         return result
+
+    def _imported_sessions(self) -> dict[str, str]:
+        """session id -> the agent that imported it."""
+        out: dict[str, str] = {}
+        for defn, _status in self.runtime.list_agents():
+            cs = getattr(defn, "claude_session", None)
+            if cs and cs.get("session_id"):
+                out[cs["session_id"]] = defn.id
+        return out
+
+    async def _import_claude_session(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Make an agent that IS a Claude Code session. Refused while a
+        Claude process may hold the session, or if it is imported already.
+        The model is the one the session last ran on unless one is given."""
+        import re as _re
+        from pathlib import Path
+        from .claude_sessions import import_check
+        from .loader import save_agent
+        from .models import AgentDefinition, AgentMode
+
+        folder = str(msg.get("folder") or "").strip()
+        sid = str(msg.get("session_id") or "").strip().lower()
+        if not folder or not sid:
+            return {"ok": False, "error": "Missing 'folder' or 'session_id'"}
+        owner = self._imported_sessions().get(sid)
+        if owner:
+            return {"ok": False, "error": f"session already imported as '{owner}'"}
+        info, why = import_check(folder, sid)
+        if why:
+            return {"ok": False, "error": why}
+        model = str(msg.get("model") or info.get("model") or "")
+        if not model:
+            return {"ok": False, "error": "the session names no model; pass 'model'"}
+        name = str(msg.get("name") or info.get("title") or Path(folder).name)
+        agent_id = str(msg.get("id") or "").strip() or (
+            _re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "session")
+        base, n = agent_id, 2
+        while self.runtime.get_agent(agent_id) is not None:
+            agent_id, n = f"{base}-{n}", n + 1
+        defn = AgentDefinition(
+            id=agent_id, name=name, mode=AgentMode.COGNITIVE,
+            provider="claude_max", cognitive_model=model,
+            # Claude Code's own tools come with the session; ATN adds the
+            # tool library on top.
+            tools=list(msg.get("tools") or ["unified_tools"]),
+            description=info.get("first_prompt", "")[:200],
+            claude_session={"folder": str(Path(folder).resolve()), "session_id": sid},
+        )
+        try:
+            await self.runtime.register_agent(defn)
+            save_agent(defn, self.runtime._config.agents_dir)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "result": {
+            "agent_id": agent_id, "name": name, "model": model,
+            "claude_session": defn.claude_session}}
 
     def _jurisdictions_view(self) -> dict[str, Any]:
         """The current jurisdiction plus every jurisdiction this daemon's

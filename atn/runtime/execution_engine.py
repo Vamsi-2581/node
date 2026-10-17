@@ -45,6 +45,12 @@ class _BudgetExceeded(Exception):
     pass
 
 
+class _NothingToSay(Exception):
+    """Flow control: a run with no message for an agent that must never be
+    sent a stand-in (an imported Claude Code session)."""
+    pass
+
+
 class ExecutionEngine:
     """Manages execution of pipeline and cognitive agents."""
 
@@ -406,6 +412,8 @@ class ExecutionEngine:
             "native_tools": bool(native_tools),
             "max_turns": defn.max_turns,
             "session_id": session_id or "",
+            # An imported Claude Code session (atn/claude_sessions.py).
+            "claude_session": getattr(defn, "claude_session", None) or None,
             "history": history_messages or None,
             "per_turn_input_max": defn.per_turn_input_max,
             "repeat_call_limit": defn.repeat_call_limit,
@@ -1044,7 +1052,13 @@ class ExecutionEngine:
             # hits the prompt cache. Agents with a custom system_prompt own
             # their identity, so we don't inject for them.
             _inject_identity = False
-            if defn.system_prompt:
+            # An imported Claude Code session keeps Claude Code's own system
+            # prompt, its folder and its settings (the bridge loads them);
+            # ATN adds nothing to its messages.
+            _imported = getattr(defn, "claude_session", None) or None
+            if _imported:
+                system_prompt = ""
+            elif defn.system_prompt:
                 system_prompt = defn.system_prompt
             else:
                 system_prompt = build_delegate_prompt(
@@ -1060,6 +1074,7 @@ class ExecutionEngine:
             # AutonetBridge.  Only agents with registered_on_chain=True get
             # the preamble — unregistered agents operate without it.
             if (defn.identity and defn.identity.registered_on_chain
+                    and not _imported
                     and hasattr(self, '_autonet_bridge') and self._autonet_bridge):
                 constitution = self._autonet_bridge.constitution_text
                 if constitution:
@@ -1235,6 +1250,10 @@ class ExecutionEngine:
                 prompt_parts.append(
                     "[group] No new group posts since your last delivery. "
                     "Nothing to do; end your turn.")
+            if not prompt_parts and getattr(defn, "claude_session", None):
+                # A stand-in prompt would land in the user's own session.
+                record.status = ExecutionStatus.COMPLETED
+                raise _NothingToSay()
             if not prompt_parts:
                 prompt_parts.append(defn.description or defn.name)
             user_message = "\n\n".join(prompt_parts)
@@ -1262,7 +1281,8 @@ class ExecutionEngine:
 
             # --- Session resume / history (unified for all agents) ---
             agent_convo = self.session_manager.get_agent_conversation_store(defn.id)
-            session_id = getattr(sub_provider, '_session_id', "") or ""
+            session_id = (getattr(sub_provider, '_session_id', "")
+                          or (_imported or {}).get("session_id", "") or "")
             # Record the user message (skip if already recorded by
             # ws_server or prior path to avoid duplicates).
             existing_turns = agent_convo.get_turns()
@@ -1326,7 +1346,8 @@ class ExecutionEngine:
                 # Same leading block as the stamp: conversation.py strips
                 # everything up to the first blank line when it hydrates.
                 stamp = f"{stamp}\n{_ident}"
-            user_message = f"{stamp}\n\n{user_message}"
+            if not _imported:
+                user_message = f"{stamp}\n\n{user_message}"
 
             # --- P4 worker-isolation cutover (flag-gated, API providers only) ---
             # The shared context above (system prompt, drained inbox, prompt
@@ -1452,6 +1473,8 @@ class ExecutionEngine:
             }
             if session_id:
                 send_kwargs["session_id"] = session_id
+            if _imported:
+                send_kwargs["claude_session"] = dict(_imported)
             if history_messages:
                 send_kwargs["history"] = history_messages
             # Long-horizon safeguards — providers that support them honour these;
@@ -1480,7 +1503,9 @@ class ExecutionEngine:
                 needs_verify_reinvoke,
                 review_owed_tools,
             )
-            _review_session = getattr(sub_provider, "_session_id", "") or ""
+            # Never inject ATN follow-up turns into an imported session.
+            _review_session = ("" if _imported else
+                               getattr(sub_provider, "_session_id", "") or "")
             # §16 verify step for providers whose loop can't inject it
             # (BridgeProvider): one follow-up turn on the SAME session when
             # the run modified code files. Capture the set NOW — the
@@ -1673,7 +1698,7 @@ class ExecutionEngine:
         except asyncio.CancelledError:
             record.status = ExecutionStatus.KILLED
             record.error = "Force-cancelled by kill switch"
-        except _BudgetExceeded:
+        except (_BudgetExceeded, _NothingToSay):
             # Already handled — status and error set before raising
             pass
         except Exception as exc:

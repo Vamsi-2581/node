@@ -723,6 +723,14 @@ class BridgeProvider(Provider):
                 request["thinking_budget_tokens"] = int(_budget)
             if session_id:
                 request["session_id"] = session_id
+            _imported = kwargs.get("claude_session")
+            if _imported:
+                # An imported Claude Code session: the bridge resumes it in
+                # its own folder with the project's settings.
+                request["claude_session"] = {
+                    "folder": str(_imported.get("folder") or ""),
+                    "session_id": str(_imported.get("session_id") or ""),
+                }
 
             # Drain stale events
             while not self._event_queue.empty():

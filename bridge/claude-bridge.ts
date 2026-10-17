@@ -770,6 +770,10 @@ interface AgentLoopRequest {
   max_turns?: number
   session_id?: string      // Resume this SDK session (loads history)
   native_tools?: boolean   // If true, allow all native Claude tools (Bash, Read, Write, etc.)
+  // An imported Claude Code session: run it as the user's own Claude Code
+  // would, in its folder, with the project's settings and Claude Code's
+  // system prompt and tools. ATN's tools ride along as the atn MCP server.
+  claude_session?: { folder: string; session_id: string }
 }
 
 interface DeleteRequest {
@@ -1077,6 +1081,26 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
       sdkOptions.effort = pinnedEffort
     }
 
+    const imported = req.claude_session && req.claude_session.folder
+      ? req.claude_session : null
+    if (imported) {
+      sdkOptions.cwd = imported.folder
+      // User, project and local settings: CLAUDE.md, hooks, MCP servers and
+      // permission rules, the same files the user's own session reads.
+      sdkOptions.settingSources = ["user", "project", "local"]
+      sdkOptions.strictMcpConfig = false
+      sdkOptions.systemPrompt = { type: "preset", preset: "claude_code" }
+      // Every tool, subagents included; only the claude.ai connectors stay
+      // out (the rule for every agent the daemon runs).
+      sdkOptions.allowedTools = undefined
+      sdkOptions.disallowedTools = [
+        "mcp__claude_ai_Gmail",
+        "mcp__claude_ai_Google_Calendar",
+        "mcp__claude_ai_Google_Drive",
+      ]
+      log("request.agent_loop.imported", { cwd: imported.folder })
+    }
+
     // Native built-in tools (Bash/Read/Write/Edit/Glob/Grep/WebSearch/...) are
     // a large chunk of the first-turn context (~tens of thousands of tokens of
     // JSON schemas). `allowedTools` only gates PERMISSIONS — it does not strip
@@ -1086,7 +1110,7 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
     // tools, disable them — it still has the ATN MCP tools via mcpServers, and
     // a lean agent (e.g. a simple cognitive responder) carries a much smaller
     // prefix. This shrinks per-agent cold-start cost across the fleet.
-    if (!req.native_tools) {
+    if (!req.native_tools && !imported) {
       sdkOptions.tools = []
     }
 
@@ -1100,7 +1124,7 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
     // System prompt — passed as SDK option so it gets server-side caching.
     // Falls back to legacy inline system field for backward compat.
     const sysPrompt = req.system_prompt || req.system
-    if (sysPrompt) {
+    if (sysPrompt && !imported) {
       sdkOptions.systemPrompt = sysPrompt
     }
 

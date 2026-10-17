@@ -321,6 +321,9 @@ async def run_cognitive_loop(
     }
     if session_id:
         send_kwargs["session_id"] = session_id
+    claude_session = manifest.get("claude_session") or None
+    if claude_session:
+        send_kwargs["claude_session"] = dict(claude_session)
     if history:
         send_kwargs["history"] = history
     if per_turn_input_max is not None:
@@ -342,7 +345,9 @@ async def run_cognitive_loop(
         needs_verify_reinvoke,
         review_owed_tools,
     )
-    _review_session = getattr(provider, "_session_id", "") or ""
+    # Never inject ATN follow-up turns into an imported session.
+    _review_session = ("" if claude_session else
+                       getattr(provider, "_session_id", "") or "")
     # §16 verify step (bridge path) — capture before any follow-up
     # agent loop resets the provider's tracking.
     _modified_code = set(getattr(

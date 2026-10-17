@@ -168,6 +168,9 @@ class SnapshotBuilder:
                 # creation. Model pickers use it to offer only that
                 # provider's models.
                 "provider": _prov,
+                # The Claude Code session this agent is, when imported:
+                # {folder, session_id}.
+                "claude_session": getattr(defn, "claude_session", None),
                 # The provider its runs (and so its budget) are booked
                 # against, resolved the way the engine routes it.
                 "effective_provider": self._effective_provider(

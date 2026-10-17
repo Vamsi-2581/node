@@ -316,6 +316,7 @@ def _validate_agent(raw: dict, file: Path) -> tuple[AgentDefinition | None, list
         tool_input_schema=tool_input_schema,
         secrets_allowance=secrets_allowance,
         service_provider=service_provider,
+        claude_session=_claude_session(raw.get("claude_session")),
         loadout=loadout.lower(),
     ), errors
 
@@ -477,6 +478,8 @@ def save_agent(defn: AgentDefinition, directory: Path) -> Path:
     # re-route the spend to the daemon owner after a restart.
     if defn.service_provider:
         data["service_provider"] = dict(defn.service_provider)
+    if defn.claude_session:
+        data["claude_session"] = dict(defn.claude_session)
     if getattr(defn, "loadout", ""):
         data["loadout"] = defn.loadout
 
@@ -599,3 +602,12 @@ def load_agents_dir(directory: Path) -> tuple[list[AgentDefinition], list[LoadEr
         log.info("No agents found in %s", directory)
 
     return agents, all_errors
+
+
+def _claude_session(raw: Any) -> dict[str, Any] | None:
+    """An imported session binding, or None when absent or malformed."""
+    if not isinstance(raw, dict):
+        return None
+    folder = str(raw.get("folder") or "")
+    sid = str(raw.get("session_id") or "")
+    return {"folder": folder, "session_id": sid} if folder and sid else None
