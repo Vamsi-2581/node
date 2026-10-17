@@ -43,6 +43,14 @@ class AutonetStatus(str, Enum):
     ERROR = "error"             # Failed to start or crashed
 
 
+def _charter_axes() -> list[dict[str, str]]:
+    try:
+        from nodes.common.world_model_substrate.charter import active_charter
+        return [{"id": i, "thesis": t} for i, t in active_charter().axes]
+    except Exception:
+        return []
+
+
 @dataclass
 class AutonetState:
     """Observable state of the autonet service."""
@@ -146,6 +154,9 @@ class AutonetState:
             "tool_bond_address": self.tool_bond_address,
             "epoch_rules": self.epoch_rules,
             "jurisdiction_errors": list(self.jurisdiction_errors),
+            # The active charter's axes, in coordinate order: what the UI
+            # draws (a DAO defines its own; docs/multi_jurisdiction.md 5).
+            "charter_axes": _charter_axes(),
             "constitution_cid": self.constitution_cid,
             "constitution_text": self.constitution_text,
         }
