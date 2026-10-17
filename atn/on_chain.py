@@ -7,8 +7,9 @@ surface. It supersedes the pre-substrate ``RPB`` contract integration
 What lives here
 ---------------
 
-- ``register_agent`` / ``build_register_call_data`` — register an
-  agent with a libp2p PeerId so daemons can DHT-resolve it later.
+- ``register_agent_bound`` / ``sign_binding`` — register an agent,
+  owner-bound (or parent-signed), with a libp2p PeerId so daemons can
+  DHT-resolve it later. ``revoke_agent`` relays the owner's revocation.
 - ``update_peer_id`` / ``build_update_peer_id_call_data`` — rotate
   the libp2p keypair without losing on-chain identity.
 - ``is_registered``, ``get_agent_record`` — basic membership reads.
@@ -45,35 +46,24 @@ log = logging.getLogger(__name__)
 SUBSTRATE_ABI = [
     # Agent registration / discovery
     {
-        "inputs": [
-            {"internalType": "bytes32", "name": "lineageHash", "type": "bytes32"},
-            {"internalType": "bytes",   "name": "peerId",      "type": "bytes"},
-        ],
-        "name": "registerAgent",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    {
         "inputs": [{"internalType": "bytes", "name": "peerId", "type": "bytes"}],
         "name": "updatePeerId",
         "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function",
     },
-    # Owner-rooted registration (docs/tool_substrate.md §Owner-rooted
-    # registration). The AGENT (msg.sender) submits; the OWNER wallet has
-    # signed an EIP-712 OwnerBinding{agent, parent, nonce} over the domain
-    # ("AutonetSubstrate", "1", chainId, this contract). rotateOwner needs
-    # NO old-owner sig (key-loss recovery); the per-agent bindingNonce closes
-    # replay.
+    # Owner-rooted registration, the only registration path (docs/
+    # multi_jurisdiction.md decision 7). The AGENT (msg.sender) submits; the
+    # OWNER wallet, or the live parent agent, has signed an EIP-712
+    # OwnerBinding{agent, parent, nonce} over the domain ("AutonetSubstrate",
+    # "1", chainId, this contract). rotateOwner needs NO old-owner sig
+    # (key-loss recovery); the per-agent bindingNonce closes replay.
     {
         "inputs": [
-            {"internalType": "bytes32", "name": "lineageHash",  "type": "bytes32"},
             {"internalType": "bytes",   "name": "peerId",       "type": "bytes"},
             {"internalType": "address", "name": "owner",        "type": "address"},
             {"internalType": "address", "name": "parentAgent",  "type": "address"},
-            {"internalType": "bytes",   "name": "ownerSig",     "type": "bytes"},
+            {"internalType": "bytes",   "name": "sig",          "type": "bytes"},
         ],
         "name": "registerAgentBound",
         "outputs": [],
@@ -89,6 +79,23 @@ SUBSTRATE_ABI = [
         "name": "rotateOwner",
         "outputs": [],
         "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "agent",    "type": "address"},
+            {"internalType": "bytes",   "name": "ownerSig", "type": "bytes"},
+        ],
+        "name": "revokeAgent",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "agent", "type": "address"}],
+        "name": "isLive",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "view",
         "type": "function",
     },
     {
@@ -139,7 +146,6 @@ SUBSTRATE_ABI = [
         "inputs": [{"internalType": "address", "name": "", "type": "address"}],
         "name": "agents",
         "outputs": [
-            {"internalType": "bytes32", "name": "lineageHash", "type": "bytes32"},
             {"internalType": "uint256", "name": "registeredAt", "type": "uint256"},
             {"internalType": "bool",    "name": "active", "type": "bool"},
             {"internalType": "uint256", "name": "totalTrainingMint", "type": "uint256"},
@@ -307,11 +313,19 @@ SUBSTRATE_ABI = [
         "anonymous": False,
         "inputs": [
             {"indexed": True,  "internalType": "address", "name": "agent",       "type": "address"},
-            {"indexed": True,  "internalType": "bytes32", "name": "lineageHash", "type": "bytes32"},
             {"indexed": False, "internalType": "bytes",   "name": "peerId",      "type": "bytes"},
             {"indexed": False, "internalType": "uint256", "name": "timestamp",   "type": "uint256"},
         ],
         "name": "AgentRegistered",
+        "type": "event",
+    },
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "address", "name": "agent", "type": "address"},
+            {"indexed": True, "internalType": "address", "name": "owner", "type": "address"},
+        ],
+        "name": "AgentRevoked",
         "type": "event",
     },
     {
@@ -712,104 +726,6 @@ class OnChainService:
     # Agent registration (write)
     # ------------------------------------------------------------------
 
-    def build_register_call_data(
-        self,
-        identity: "AgentIdentity",
-        peer_id: str | bytes,
-        # Kept for back-compat with ws_server handler signatures, ignored:
-        system_prompt: str = "",
-        parent_address: str = "",
-        sponsor_address: str = "",
-    ) -> str:
-        """Build ABI-encoded call data for ``registerAgent(lineage, peerId)``.
-
-        Returns hex-encoded call data (with 0x prefix) that the
-        frontend wallet can use to send the transaction. ``system_prompt``,
-        ``parent_address``, ``sponsor_address`` are accepted for
-        legacy callsite stability and ignored (the substrate has no
-        analog).
-        """
-        contract = self._get_contract()
-        lineage_bytes = _to_bytes32(identity.lineage_hash)
-        peer_bytes = _to_peer_id_bytes(peer_id)
-        return contract.functions.registerAgent(
-            lineage_bytes, peer_bytes,
-        )._encode_transaction_data()
-
-    async def register_agent(
-        self,
-        identity: "AgentIdentity",
-        private_key: str,
-        peer_id: str | bytes,
-        # Back-compat parameters, ignored:
-        system_prompt: str = "",
-        parent_address: str = "",
-        sponsor_address: str = "",
-    ) -> dict[str, Any]:
-        """Sign and submit a ``registerAgent`` transaction directly.
-
-        Used when the daemon holds the private key. For wallet-signed
-        registration, use :meth:`build_register_call_data` instead.
-        """
-        try:
-            from eth_account import Account
-
-            w3 = self._get_web3()
-            contract = self._get_contract(w3)
-            account = Account.from_key(private_key)
-
-            lineage_bytes = _to_bytes32(identity.lineage_hash)
-            peer_bytes = _to_peer_id_bytes(peer_id)
-
-            nonce = w3.eth.get_transaction_count(account.address)
-            chain_id = self.config.chain_id or w3.eth.chain_id
-
-            # Estimate gas with a margin for networks that report higher
-            # actual costs (e.g. Etherlink shadownet).
-            try:
-                estimated = contract.functions.registerAgent(
-                    lineage_bytes, peer_bytes,
-                ).estimate_gas({"from": account.address})
-                gas_limit = max(int(estimated * 12 // 10), 500_000)
-            except Exception:
-                gas_limit = 1_500_000
-
-            tx = contract.functions.registerAgent(
-                lineage_bytes, peer_bytes,
-            ).build_transaction({
-                "from": account.address,
-                "nonce": nonce,
-                "gas": gas_limit,
-                "gasPrice": w3.eth.gas_price,
-                "chainId": chain_id,
-            })
-
-            signed = account.sign_transaction(tx)
-            raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-            tx_hash = w3.eth.send_raw_transaction(raw)
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-
-            if receipt.status == 1:
-                log.info(
-                    "Agent registered on substrate: %s tx=%s",
-                    account.address, tx_hash.hex(),
-                )
-                return {
-                    "success": True,
-                    "tx_hash": tx_hash.hex(),
-                    "agent_address": account.address,
-                }
-            return {
-                "success": False,
-                "error": "Transaction reverted",
-                "tx_hash": tx_hash.hex(),
-            }
-        except ImportError:
-            return {"success": False, "error": "web3/eth-account not installed"}
-        except Exception as e:
-            log.exception("Failed to register agent on chain")
-            return {"success": False, "error": str(e)}
-
     async def register_agent_bound(
         self,
         identity: "AgentIdentity",
@@ -819,16 +735,18 @@ class OnChainService:
         owner_sig: str | bytes,
         parent: str = "",
     ) -> dict[str, Any]:
-        """Sign and submit a ``registerAgentBound`` transaction.
+        """Sign and submit a ``registerAgentBound`` transaction, the only
+        way an agent registers.
 
-        Mirrors :meth:`register_agent`, but binds the agent to a proven
-        ``owner`` wallet (and optional ``parent`` agent). ``owner_sig`` is
-        the owner wallet's EIP-712 ``OwnerBinding{agent, parent, nonce}``
-        signature over the domain ("AutonetSubstrate", "1", chainId, this
-        contract) at the agent's CURRENT ``bindingNonce`` — the contract
-        verifies it on-chain (BadOwnerBindingSignature revert on mismatch).
-        The tx is signed by the AGENT key (msg.sender), exactly like the
-        legacy path. ``parent`` defaults to the zero address (top-level).
+        Binds the agent to a proven ``owner`` wallet (and optional ``parent``
+        agent). ``owner_sig`` is the EIP-712 ``OwnerBinding{agent, parent,
+        nonce}`` signature over the domain ("AutonetSubstrate", "1", chainId,
+        this contract) at the agent's CURRENT ``bindingNonce``, signed by the
+        owner wallet or, when ``parent`` is set, by the parent agent's key
+        (see :meth:`sign_binding`). The contract verifies it on-chain
+        (BadOwnerBindingSignature revert on mismatch). The tx is signed by
+        the AGENT key (msg.sender). ``parent`` defaults to the zero address
+        (top-level).
         """
         try:
             from eth_account import Account
@@ -837,7 +755,6 @@ class OnChainService:
             contract = self._get_contract(w3)
             account = Account.from_key(private_key)
 
-            lineage_bytes = _to_bytes32(identity.lineage_hash)
             peer_bytes = _to_peer_id_bytes(peer_id)
             owner_addr = w3.to_checksum_address(owner)
             parent_addr = w3.to_checksum_address(parent) if parent else ZERO_ADDRESS
@@ -850,14 +767,14 @@ class OnChainService:
 
             try:
                 estimated = contract.functions.registerAgentBound(
-                    lineage_bytes, peer_bytes, owner_addr, parent_addr, sig_bytes,
+                    peer_bytes, owner_addr, parent_addr, sig_bytes,
                 ).estimate_gas({"from": account.address})
                 gas_limit = max(int(estimated * 12 // 10), 500_000)
             except Exception:
                 gas_limit = 1_500_000
 
             tx = contract.functions.registerAgentBound(
-                lineage_bytes, peer_bytes, owner_addr, parent_addr, sig_bytes,
+                peer_bytes, owner_addr, parent_addr, sig_bytes,
             ).build_transaction({
                 "from": account.address,
                 "nonce": nonce,
@@ -893,6 +810,92 @@ class OnChainService:
         except Exception as e:
             log.exception("Failed to register (bound) agent on chain")
             return {"success": False, "error": str(e)}
+
+    def sign_binding(self, signer_key: str, agent: str, parent: str = "",
+                     nonce: int = 0) -> str:
+        """EIP-712 ``OwnerBinding{agent, parent, nonce}`` signed by
+        ``signer_key``. A registered parent agent signs its child's binding
+        with this, so agents spawn registered children without the owner
+        wallet; the child lands in the parent's household."""
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+
+        w3 = self._get_web3()
+        contract = self._get_contract(w3)
+        chain_id = self.config.chain_id or w3.eth.chain_id
+        message = encode_typed_data(full_message={
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "OwnerBinding": [
+                    {"name": "agent", "type": "address"},
+                    {"name": "parent", "type": "address"},
+                    {"name": "nonce", "type": "uint256"},
+                ],
+            },
+            "primaryType": "OwnerBinding",
+            "domain": {"name": "AutonetSubstrate", "version": "1",
+                       "chainId": int(chain_id),
+                       "verifyingContract": contract.address},
+            "message": {"agent": w3.to_checksum_address(agent),
+                        "parent": (w3.to_checksum_address(parent)
+                                   if parent else ZERO_ADDRESS),
+                        "nonce": int(nonce)},
+        })
+        signed = Account.from_key(signer_key).sign_message(message)
+        return "0x" + bytes(signed.signature).hex()
+
+    async def revoke_agent(self, agent: str, owner_sig: str | bytes,
+                           relayer_key: str) -> dict[str, Any]:
+        """Relay the owner wallet's ``RevokeAgent{agent}`` signature. Revokes
+        the agent and every descendant, permanently. ``relayer_key`` only
+        pays gas (any agent key works); the owner's signature authorizes."""
+        try:
+            from eth_account import Account
+
+            w3 = self._get_web3()
+            contract = self._get_contract(w3)
+            account = Account.from_key(relayer_key)
+            sig_bytes = (owner_sig if isinstance(owner_sig, bytes)
+                         else bytes.fromhex(owner_sig[2:] if owner_sig.startswith("0x")
+                                            else owner_sig))
+            fn = contract.functions.revokeAgent(w3.to_checksum_address(agent), sig_bytes)
+            try:
+                gas_limit = max(int(fn.estimate_gas({"from": account.address}) * 12 // 10),
+                                200_000)
+            except Exception:
+                gas_limit = 500_000
+            tx = fn.build_transaction({
+                "from": account.address,
+                "nonce": w3.eth.get_transaction_count(account.address),
+                "gas": gas_limit,
+                "gasPrice": w3.eth.gas_price,
+                "chainId": self.config.chain_id or w3.eth.chain_id,
+            })
+            signed = account.sign_transaction(tx)
+            raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+            tx_hash = w3.eth.send_raw_transaction(raw)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt.status == 1:
+                log.info("Agent %s revoked (with its subtree) tx=%s", agent, tx_hash.hex())
+                return {"success": True, "tx_hash": tx_hash.hex(), "agent": agent}
+            return {"success": False, "error": "Transaction reverted",
+                    "tx_hash": tx_hash.hex()}
+        except ImportError:
+            return {"success": False, "error": "web3/eth-account not installed"}
+        except Exception as e:
+            log.exception("Failed to revoke agent %s", agent)
+            return {"success": False, "error": str(e)}
+
+    async def is_live(self, address: str) -> bool:
+        """Registered, not revoked, no revoked ancestor."""
+        w3 = self._get_web3()
+        contract = self._get_contract(w3)
+        return bool(contract.functions.isLive(w3.to_checksum_address(address)).call())
 
     async def rotate_owner(
         self,
@@ -1205,13 +1208,12 @@ class OnChainService:
             contract = self._get_contract(w3)
             addr = w3.to_checksum_address(address)
             result = contract.functions.agents(addr).call()
-            lineage, registered_at, active, total_mint, submission_count = result
+            registered_at, active, total_mint, submission_count = result
             if registered_at == 0:
                 return None
             peer_id = contract.functions.getAgentPeerId(addr).call()
             return {
                 "agent_address": addr,
-                "lineage_hash": lineage.hex() if isinstance(lineage, bytes) else str(lineage),
                 "peer_id": peer_id.hex() if isinstance(peer_id, bytes) else str(peer_id),
                 "registered_at": registered_at,
                 "active": active,
@@ -1297,11 +1299,11 @@ class OnChainService:
             registered_at = 0
             submissions = 0
             try:
-                # (lineageHash, registeredAt, active, totalTrainingMint,
-                #  trainingSubmissionCount) — see the `agents` ABI entry.
+                # (registeredAt, active, totalTrainingMint,
+                #  trainingSubmissionCount): see the `agents` ABI entry.
                 agent = contract.functions.agents(addr).call()
-                registered_at = int(agent[1])
-                submissions = int(agent[4])
+                registered_at = int(agent[0])
+                submissions = int(agent[3])
             except Exception:                              # noqa: BLE001
                 pass
             return {
@@ -1453,7 +1455,7 @@ class OnChainService:
         request id (bytes32; e.g. keccak256 of the request body) emitted in
         the ServicePayment event so the payment is matchable off-chain.
 
-        Signs with the agent key exactly like ``register_agent`` /
+        Signs with the agent key exactly like ``register_agent_bound`` /
         ``record_training_for_epoch``, with Etherlink-tolerant explicit gas
         (estimate × 1.2, floored). Returns
         ``{success, tx_hash[, request_id]}`` or ``{success: False, error}``.

@@ -243,6 +243,36 @@ def kill_node(proc: Optional[subprocess.Popen]) -> None:
 # Chain helpers
 # ---------------------------------------------------------------------------
 
+def _self_owned_binding_sig(substrate_address: str, chain_id: int, key: str,
+                            agent_addr: str) -> bytes:
+    """EIP-712 OwnerBinding{agent, parent=0, nonce=0} signed by the agent's
+    own key (the agent is its own owner)."""
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+    msg = encode_typed_data(full_message={
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "OwnerBinding": [
+                {"name": "agent", "type": "address"},
+                {"name": "parent", "type": "address"},
+                {"name": "nonce", "type": "uint256"},
+            ],
+        },
+        "primaryType": "OwnerBinding",
+        "domain": {"name": "AutonetSubstrate", "version": "1",
+                   "chainId": int(chain_id),
+                   "verifyingContract": substrate_address},
+        "message": {"agent": agent_addr,
+                    "parent": "0x" + "00" * 20, "nonce": 0},
+    })
+    return bytes(Account.from_key(key).sign_message(msg).signature)
+
+
 def send(w3, call, pk: str, gas: int = 3_000_000) -> Any:
     from eth_account import Account
     acct = Account.from_key(pk)
@@ -419,8 +449,11 @@ async def amain() -> int:
             key = rt.registry.get_agent_key(aid)
             agents[aid], keys[aid] = addr, key
             fund_eth(w3, addr)
-            send(w3, substrate.functions.registerAgent(
-                Web3.keccak(text=f"lineage-{aid}"), f"peer-{aid}".encode()), key)
+            # Self-owned binding (the agent key is its own owner).
+            send(w3, substrate.functions.registerAgentBound(
+                f"peer-{aid}".encode(), addr, "0x" + "00" * 20,
+                _self_owned_binding_sig(substrate.address, CHAIN_ID, key, addr)),
+                key)
             # What the production register flow flips after the tx verifies.
             defn.identity.registered_on_chain = True
             send(w3, rep.functions.mint(addr, REP_GRANTS[aid] * E18), HH_DEPLOYER_PK)

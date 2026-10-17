@@ -35,7 +35,8 @@ module.exports = {
   },
   networks: {
     localhost: {
-      url: "http://127.0.0.1:8545",
+      // E2E scripts set HARDHAT_LOCAL_URL to run on another port.
+      url: process.env.HARDHAT_LOCAL_URL || "http://127.0.0.1:8545",
     },
     hardhat: {
       chainId: 1337,

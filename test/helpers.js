@@ -44,10 +44,66 @@ async function deploySubstrate() {
   return deploySubstrateWith();
 }
 
-async function registerAgent(substrate, signer, lineage) {
+// EIP-712 OwnerBinding{agent, parent, nonce} for Substrate, signed by
+// `signer` (the owner wallet, or the parent agent for a parent-signed child).
+// `nonce` defaults to the agent's current on-chain binding nonce.
+async function signBinding(substrate, signer, agent, parent = ZERO, nonce) {
+  const net = await ethers.provider.getNetwork();
+  const domain = {
+    name: "AutonetSubstrate",
+    version: "1",
+    chainId: net.chainId,
+    verifyingContract: await substrate.getAddress(),
+  };
+  const types = {
+    OwnerBinding: [
+      { name: "agent", type: "address" },
+      { name: "parent", type: "address" },
+      { name: "nonce", type: "uint256" },
+    ],
+  };
+  if (nonce === undefined) nonce = await substrate.bindingNonce(agent);
+  return signer.signTypedData(domain, types, { agent, parent, nonce });
+}
+
+// EIP-712 RevokeAgent(address agent), signed by the owner wallet.
+async function signRevoke(substrate, ownerSigner, agent) {
+  const net = await ethers.provider.getNetwork();
+  const domain = {
+    name: "AutonetSubstrate",
+    version: "1",
+    chainId: net.chainId,
+    verifyingContract: await substrate.getAddress(),
+  };
+  const types = { RevokeAgent: [{ name: "agent", type: "address" }] };
+  return ownerSigner.signTypedData(domain, types, { agent });
+}
+
+// Register `signer` through registerAgentBound (the only registration path).
+// Owner defaults to the agent itself. The binding signature comes from
+// `ownerSigner`, or from `parentSigner` when given (parent-signed child).
+async function registerAgent(
+  substrate,
+  signer,
+  label,
+  ownerSigner = signer,
+  parent = ZERO,
+  parentSigner
+) {
+  const sig = await signBinding(
+    substrate,
+    parentSigner || ownerSigner,
+    signer.address,
+    parent
+  );
   return substrate
     .connect(signer)
-    .registerAgent(digest(lineage), ethers.toUtf8Bytes("peer-" + lineage));
+    .registerAgentBound(
+      ethers.toUtf8Bytes("peer-" + label),
+      ownerSigner.address,
+      parent,
+      sig
+    );
 }
 
 async function deployToken(name = "TestUSD", symbol = "TUSD") {
@@ -190,6 +246,8 @@ module.exports = {
   deploySubstrate,
   deploySubstrateWith,
   registerAgent,
+  signBinding,
+  signRevoke,
   deployToken,
   signVoucher,
   mintLeaf,

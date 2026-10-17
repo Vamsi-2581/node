@@ -227,14 +227,12 @@ def _register_bound_agent(w3, substrate, binding_shape, rt, agent_id: str,
     agent_key = rt.registry.get_agent_key(agent_id)
     agent_addr = Web3.to_checksum_address(ident.address)
     _fund_gas(w3, gas_from_key, gas_from_addr, agent_addr, ether=1)
-    lin = bytes.fromhex(
-        ident.lineage_hash.replace("0x", "").ljust(64, "0")[:64])
     ZERO = "0x" + "00" * 20
     sponsored_register(
         w3, substrate, binding_shape,
         agent_pk=agent_key, agent_addr=agent_addr,
         owner_pk=owner_key, owner_addr=owner_addr,
-        parent_addr=ZERO, lineage_hash=lin,
+        parent_addr=ZERO,
         peer_id=("peer-" + agent_id).encode("utf-8"))
     return {"address": agent_addr, "key": agent_key}
 
@@ -373,17 +371,17 @@ async def amain(from_stage: str = "A", to_stage: str = "G") -> int:
         await register_local_agent(rt, "author-1")
         await register_local_agent(rt, "faucet-agent")
 
-        # Faucet: a plain (ownerless) registered agent — it only mints +
+        # Faucet: a plain self-owned registered agent (owner = its own key) — it only mints +
         # transfers ATN. Register it directly from its own key.
         faucet_ident = rt.get_agent("faucet-agent").identity
         faucet_key = rt.registry.get_agent_key("faucet-agent")
         faucet_addr = Web3.to_checksum_address(faucet_ident.address)
         _fund_gas(w3, HH_KEYS[0], DEPLOYER.address, faucet_addr, ether=2)
-        faucet_lin = bytes.fromhex(
-            faucet_ident.lineage_hash.replace("0x", "").ljust(64, "0")[:64])
-        reg_call = substrate.functions.registerAgent(
-            faucet_lin, b"peer-faucet")
-        send_agent_tx(w3, reg_call, faucet_key, faucet_addr, gas=800_000)
+        sponsored_register(
+            w3, substrate, binding_shape,
+            agent_pk=faucet_key, agent_addr=faucet_addr,
+            owner_pk=faucet_key, owner_addr=faucet_addr,
+            parent_addr="0x" + "00" * 20, peer_id=b"peer-faucet")
 
         faucet = ATNFaucet(w3, substrate, faucet_addr, faucet_key,
                            HH_GOVERNOR_PK)

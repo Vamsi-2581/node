@@ -1,38 +1,8 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
-// Local helpers (mirrors test/helpers.js conventions, kept inline so this
-// suite is self-contained).
-const digest = (s) => ethers.keccak256(ethers.toUtf8Bytes(s));
-
-async function registerAgent(substrate, signer, lineage) {
-  return substrate
-    .connect(signer)
-    .registerAgent(digest(lineage), ethers.toUtf8Bytes("peer-" + lineage));
-}
-
-// Sign an EIP-712 OwnerBinding{agent, parent, nonce} for Substrate as `owner`.
-// `nonce` defaults to the agent's current on-chain binding nonce.
-async function signBinding(substrate, ownerSigner, agent, parent, nonce) {
-  const net = await ethers.provider.getNetwork();
-  const domain = {
-    name: "AutonetSubstrate",
-    version: "1",
-    chainId: net.chainId,
-    verifyingContract: await substrate.getAddress(),
-  };
-  const types = {
-    OwnerBinding: [
-      { name: "agent", type: "address" },
-      { name: "parent", type: "address" },
-      { name: "nonce", type: "uint256" },
-    ],
-  };
-  if (nonce === undefined) {
-    nonce = await substrate.bindingNonce(agent);
-  }
-  return ownerSigner.signTypedData(domain, types, { agent, parent, nonce });
-}
+const digest = (x) => ethers.keccak256(ethers.toUtf8Bytes(x));
+const { registerAgent, signBinding, signRevoke } = require("./helpers");
 
 describe("Substrate owner-rooted registration (OwnerBound)", function () {
   let substrate;
@@ -42,7 +12,6 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
   beforeEach(async function () {
     [deployer, ownerW, otherOwnerW, agentA, agentB, agentC, stranger] =
       await ethers.getSigners();
-    const Substrate = await ethers.getContractFactory("Substrate");
     substrate = await require("./helpers").deploySubstrate();
     await substrate.waitForDeployment();
   });
@@ -55,8 +24,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       substrate
         .connect(agentA)
         .registerAgentBound(
-          digest("lineA"),
-          ethers.toUtf8Bytes("peer-A"),
+          ethers.toUtf8Bytes("peer-x"),
           ownerW.address,
           ZERO,
           sig
@@ -79,8 +47,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sigA
@@ -97,8 +64,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       substrate
         .connect(agentB)
         .registerAgentBound(
-          digest("lineB"),
-          ethers.toUtf8Bytes("peer-B"),
+          ethers.toUtf8Bytes("peer-x"),
           ownerW.address,
           agentA.address,
           sigB
@@ -107,48 +73,6 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       .to.emit(substrate, "OwnerBound")
       .withArgs(agentB.address, ownerW.address, agentA.address, ZERO, 0);
 
-    expect(await substrate.getAgentParent(agentB.address)).to.equal(agentA.address);
-    expect(await substrate.getAgentOwner(agentB.address)).to.equal(ownerW.address);
-  });
-
-  // ---- happy path: retrofit on an existing ownerless agent ---------------
-
-  it("retrofit: legacy agent attaches owner+parent once", async function () {
-    // A registered the legacy way (ownerless).
-    await registerAgent(substrate, agentA, "lineA");
-    expect(await substrate.getAgentOwner(agentA.address)).to.equal(ZERO);
-
-    const sig = await signBinding(substrate, ownerW, agentA.address, ZERO);
-    await expect(
-      substrate.connect(agentA).attachOwner(ownerW.address, ZERO, sig)
-    )
-      .to.emit(substrate, "OwnerBound")
-      .withArgs(agentA.address, ownerW.address, ZERO, ZERO, 0);
-
-    expect(await substrate.getAgentOwner(agentA.address)).to.equal(ownerW.address);
-  });
-
-  it("retrofit with a parent under the same owner", async function () {
-    // A is bound top-level.
-    const sigA = await signBinding(substrate, ownerW, agentA.address, ZERO);
-    await substrate
-      .connect(agentA)
-      .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
-        ownerW.address,
-        ZERO,
-        sigA
-      );
-    // B registered legacy, retrofits under A.
-    await registerAgent(substrate, agentB, "lineB");
-    const sigB = await signBinding(
-      substrate,
-      ownerW,
-      agentB.address,
-      agentA.address
-    );
-    await substrate.connect(agentB).attachOwner(ownerW.address, agentA.address, sigB);
     expect(await substrate.getAgentParent(agentB.address)).to.equal(agentA.address);
     expect(await substrate.getAgentOwner(agentB.address)).to.equal(ownerW.address);
   });
@@ -162,8 +86,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       substrate
         .connect(agentA)
         .registerAgentBound(
-          digest("lineA"),
-          ethers.toUtf8Bytes("peer-A"),
+          ethers.toUtf8Bytes("peer-x"),
           ownerW.address,
           ZERO,
           sig
@@ -178,8 +101,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       substrate
         .connect(agentA)
         .registerAgentBound(
-          digest("lineA"),
-          ethers.toUtf8Bytes("peer-A"),
+          ethers.toUtf8Bytes("peer-x"),
           ownerW.address,
           ZERO,
           sig
@@ -193,8 +115,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sigA
@@ -205,8 +126,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       substrate
         .connect(agentB)
         .registerAgentBound(
-          digest("lineB"),
-          ethers.toUtf8Bytes("peer-B"),
+          ethers.toUtf8Bytes("peer-x"),
           ownerW.address,
           agentA.address,
           sig
@@ -221,8 +141,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       substrate
         .connect(agentA)
         .registerAgentBound(
-          digest("lineA"),
-          ethers.toUtf8Bytes("peer-A"),
+          ethers.toUtf8Bytes("peer-x"),
           ownerW.address,
           ZERO,
           sig
@@ -236,8 +155,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       substrate
         .connect(agentA)
         .registerAgentBound(
-          digest("lineA"),
-          ethers.toUtf8Bytes("peer-A"),
+          ethers.toUtf8Bytes("peer-x"),
           ZERO,
           ZERO,
           sig
@@ -259,8 +177,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       substrate
         .connect(agentB)
         .registerAgentBound(
-          digest("lineB"),
-          ethers.toUtf8Bytes("peer-B"),
+          ethers.toUtf8Bytes("peer-x"),
           ownerW.address,
           agentC.address,
           sig
@@ -274,8 +191,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sigA
@@ -291,8 +207,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       substrate
         .connect(agentB)
         .registerAgentBound(
-          digest("lineB"),
-          ethers.toUtf8Bytes("peer-B"),
+          ethers.toUtf8Bytes("peer-x"),
           otherOwnerW.address,
           agentA.address,
           sigB
@@ -308,8 +223,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sigA
@@ -339,8 +253,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         oldSig
@@ -368,18 +281,6 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     );
   });
 
-  it("rotateOwner first-attach works on a legacy ownerless agent", async function () {
-    await registerAgent(substrate, agentA, "lineA");
-    expect(await substrate.getAgentOwner(agentA.address)).to.equal(ZERO);
-    const sig = await signBinding(substrate, ownerW, agentA.address, ZERO);
-    await expect(
-      substrate.connect(agentA).rotateOwner(ownerW.address, ZERO, sig)
-    )
-      .to.emit(substrate, "OwnerBound")
-      .withArgs(agentA.address, ownerW.address, ZERO, ZERO, 0);
-    expect(await substrate.getAgentOwner(agentA.address)).to.equal(ownerW.address);
-  });
-
   it("rotateOwner on an unregistered agent reverts (AgentNotActive)", async function () {
     const sig = await signBinding(substrate, ownerW, stranger.address, ZERO);
     await expect(
@@ -393,8 +294,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sigA
@@ -403,8 +303,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentB)
       .registerAgentBound(
-        digest("lineB"),
-        ethers.toUtf8Bytes("peer-B"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         agentA.address,
         sigB
@@ -445,15 +344,14 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sigA
       );
-    // B is a fresh legacy agent we rotate; claim otherOwnerW as owner but
-    // parent A (owned by ownerW) → ParentOwnerMismatch.
-    await registerAgent(substrate, agentB, "lineB");
+    // B is a fresh top-level agent under otherOwnerW; rotating it under parent A
+    // (owned by ownerW) while keeping otherOwnerW as owner -> ParentOwnerMismatch.
+    await registerAgent(substrate, agentB, "lineB", otherOwnerW);
     const sigB = await signBinding(
       substrate,
       otherOwnerW,
@@ -471,8 +369,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sigA
@@ -481,8 +378,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentB)
       .registerAgentBound(
-        digest("lineB"),
-        ethers.toUtf8Bytes("peer-B"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         agentA.address,
         sigB
@@ -510,8 +406,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sig0
@@ -528,8 +423,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentB)
       .registerAgentBound(
-        digest("lineB"),
-        ethers.toUtf8Bytes("peer-B"),
+        ethers.toUtf8Bytes("peer-x"),
         otherOwnerW.address,
         ZERO,
         sigB
@@ -537,22 +431,14 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     expect(await substrate.sameOwner(agentA.address, agentB.address)).to.equal(true);
   });
 
-  it("retrofit on an unregistered agent reverts (AgentNotActive)", async function () {
-    const sig = await signBinding(substrate, ownerW, stranger.address, ZERO);
-    await expect(
-      substrate.connect(stranger).attachOwner(ownerW.address, ZERO, sig)
-    ).to.be.revertedWithCustomError(substrate, "AgentNotActive");
-  });
-
   it("bound registration cannot re-register an already-registered agent", async function () {
-    await registerAgent(substrate, agentA, "lineA");
+    await registerAgent(substrate, agentA, "lineA", ownerW);
     const sig = await signBinding(substrate, ownerW, agentA.address, ZERO);
     await expect(
       substrate
         .connect(agentA)
         .registerAgentBound(
-          digest("lineA2"),
-          ethers.toUtf8Bytes("peer-A2"),
+          ethers.toUtf8Bytes("peer-x"),
           ownerW.address,
           ZERO,
           sig
@@ -562,14 +448,13 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
 
   // ---- sameOwner truth table ---------------------------------------------
 
-  it("sameOwner truth table including unset cases", async function () {
+  it("sameOwner truth table (unregistered addresses have no owner)", async function () {
     // A and B under ownerW; C under otherOwnerW; stranger unset.
     const sigA = await signBinding(substrate, ownerW, agentA.address, ZERO);
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sigA
@@ -578,8 +463,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentB)
       .registerAgentBound(
-        digest("lineB"),
-        ethers.toUtf8Bytes("peer-B"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sigB
@@ -588,8 +472,7 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     await substrate
       .connect(agentC)
       .registerAgentBound(
-        digest("lineC"),
-        ethers.toUtf8Bytes("peer-C"),
+        ethers.toUtf8Bytes("peer-x"),
         otherOwnerW.address,
         ZERO,
         sigC
@@ -609,27 +492,12 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
     expect(await substrate.sameOwner(stranger.address, deployer.address)).to.equal(false);
   });
 
-  // ---- back-compat --------------------------------------------------------
-
-  it("legacy registerAgent still works and leaves owner/parent unset", async function () {
-    await expect(registerAgent(substrate, agentA, "lineA")).to.emit(
-      substrate,
-      "AgentRegistered"
-    );
-    expect(await substrate.isRegistered(agentA.address)).to.equal(true);
-    expect(await substrate.getAgentOwner(agentA.address)).to.equal(ZERO);
-    expect(await substrate.getAgentParent(agentA.address)).to.equal(ZERO);
-    // no binding consumed
-    expect(await substrate.bindingNonce(agentA.address)).to.equal(0);
-  });
-
   it("registerTool unaffected: bound agent can register a tool", async function () {
     const sig = await signBinding(substrate, ownerW, agentA.address, ZERO);
     await substrate
       .connect(agentA)
       .registerAgentBound(
-        digest("lineA"),
-        ethers.toUtf8Bytes("peer-A"),
+        ethers.toUtf8Bytes("peer-x"),
         ownerW.address,
         ZERO,
         sig
@@ -640,5 +508,151 @@ describe("Substrate owner-rooted registration (OwnerBound)", function () {
       "ToolRegistered"
     );
     expect(await substrate.toolAuthor(d)).to.equal(agentA.address);
+  });
+
+  // ---- parent-signed registration ----------------------------------------
+
+  async function regTop(agent, owner = ownerW) {
+    await registerAgent(substrate, agent, "top", owner);
+  }
+
+  it("parent-signed child registers into the parent's household at depth + 1", async function () {
+    await regTop(agentA);
+    expect(await substrate.agentDepth(agentA.address)).to.equal(0);
+    await expect(
+      registerAgent(substrate, agentB, "kid", ownerW, agentA.address, agentA)
+    )
+      .to.emit(substrate, "OwnerBound")
+      .withArgs(agentB.address, ownerW.address, agentA.address, ZERO, 0);
+    expect(await substrate.getAgentOwner(agentB.address)).to.equal(ownerW.address);
+    expect(await substrate.agentDepth(agentB.address)).to.equal(1);
+    expect(await substrate.sameOwner(agentA.address, agentB.address)).to.equal(true);
+    // grandchild
+    await registerAgent(substrate, agentC, "grand", ownerW, agentB.address, agentB);
+    expect(await substrate.agentDepth(agentC.address)).to.equal(2);
+  });
+
+  it("a parent-signed signature cannot rotateOwner", async function () {
+    await regTop(agentA);
+    await registerAgent(substrate, agentB, "kid", ownerW, agentA.address, agentA);
+    // parent A signs B's rotation (parent 0): rejected, only the new owner may sign.
+    const sig = await signBinding(substrate, agentA, agentB.address, ZERO);
+    await expect(
+      substrate.connect(agentB).rotateOwner(ownerW.address, ZERO, sig)
+    ).to.be.revertedWithCustomError(substrate, "BadOwnerBindingSignature");
+  });
+
+  it("a stranger's signature with parent set reverts", async function () {
+    await regTop(agentA);
+    await expect(
+      registerAgent(substrate, agentB, "kid", ownerW, agentA.address, stranger)
+    ).to.be.revertedWithCustomError(substrate, "BadOwnerBindingSignature");
+  });
+
+  it("child of a revoked parent cannot register (AgentNotActive)", async function () {
+    await regTop(agentA);
+    await substrate.connect(ownerW).revokeAgent(agentA.address, "0x");
+    await expect(
+      registerAgent(substrate, agentB, "kid", ownerW, agentA.address, agentA)
+    ).to.be.revertedWithCustomError(substrate, "AgentNotActive");
+  });
+
+  // ---- revocation --------------------------------------------------------
+
+  it("owner revokes directly with an empty signature", async function () {
+    await regTop(agentA);
+    expect(await substrate.isLive(agentA.address)).to.equal(true);
+    await expect(substrate.connect(ownerW).revokeAgent(agentA.address, "0x"))
+      .to.emit(substrate, "AgentRevoked")
+      .withArgs(agentA.address, ownerW.address);
+    expect(await substrate.isLive(agentA.address)).to.equal(false);
+  });
+
+  it("anyone can relay the owner's revoke signature", async function () {
+    await regTop(agentA);
+    const sig = await signRevoke(substrate, ownerW, agentA.address);
+    await expect(substrate.connect(stranger).revokeAgent(agentA.address, sig))
+      .to.emit(substrate, "AgentRevoked")
+      .withArgs(agentA.address, ownerW.address);
+    expect(await substrate.isLive(agentA.address)).to.equal(false);
+  });
+
+  it("revoke with a bad signature reverts (BadRevokeSignature)", async function () {
+    await regTop(agentA);
+    const sig = await signRevoke(substrate, otherOwnerW, agentA.address);
+    await expect(
+      substrate.connect(stranger).revokeAgent(agentA.address, sig)
+    ).to.be.revertedWithCustomError(substrate, "BadRevokeSignature");
+    // owner's signature, but for a different agent
+    const sigB = await signRevoke(substrate, ownerW, agentB.address);
+    await expect(
+      substrate.connect(stranger).revokeAgent(agentA.address, sigB)
+    ).to.be.revertedWithCustomError(substrate, "BadRevokeSignature");
+  });
+
+  it("non-owner sender with an empty signature reverts", async function () {
+    await regTop(agentA);
+    await expect(
+      substrate.connect(stranger).revokeAgent(agentA.address, "0x")
+    ).to.be.reverted;
+    expect(await substrate.isLive(agentA.address)).to.equal(true);
+  });
+
+  it("double revoke reverts (AgentNotActive); unregistered agent too", async function () {
+    await regTop(agentA);
+    await substrate.connect(ownerW).revokeAgent(agentA.address, "0x");
+    await expect(
+      substrate.connect(ownerW).revokeAgent(agentA.address, "0x")
+    ).to.be.revertedWithCustomError(substrate, "AgentNotActive");
+    await expect(
+      substrate.connect(ownerW).revokeAgent(stranger.address, "0x")
+    ).to.be.revertedWithCustomError(substrate, "AgentNotActive");
+  });
+
+  it("revoking a parent kills the whole subtree", async function () {
+    await regTop(agentA);
+    await registerAgent(substrate, agentB, "kid", ownerW, agentA.address, agentA);
+    await registerAgent(substrate, agentC, "grand", ownerW, agentB.address, agentB);
+    for (const a of [agentA, agentB, agentC]) {
+      expect(await substrate.isLive(a.address)).to.equal(true);
+    }
+    await substrate.connect(ownerW).revokeAgent(agentA.address, "0x");
+    for (const a of [agentA, agentB, agentC]) {
+      expect(await substrate.isLive(a.address)).to.equal(false);
+    }
+    // descendants are blocked from acting and from escaping via rotation
+    for (const a of [agentB, agentC]) {
+      await expect(
+        substrate.connect(a).registerTool(digest("m-" + a.address))
+      ).to.be.revertedWithCustomError(substrate, "AgentNotActive");
+      const sig = await signBinding(substrate, otherOwnerW, a.address, ZERO);
+      await expect(
+        substrate.connect(a).rotateOwner(otherOwnerW.address, ZERO, sig)
+      ).to.be.revertedWithCustomError(substrate, "AgentNotActive");
+      await expect(
+        substrate.connect(a).updatePeerId(ethers.toUtf8Bytes("p"))
+      ).to.be.revertedWithCustomError(substrate, "AgentNotActive");
+    }
+  });
+
+  it("FleetTooDeep: a chain deeper than MAX_FLEET_DEPTH reverts", async function () {
+    const max = Number(await substrate.MAX_FLEET_DEPTH());
+    expect(max).to.equal(16);
+    const wallets = [];
+    for (let i = 0; i <= max + 1; i++) {
+      const w = ethers.Wallet.createRandom().connect(ethers.provider);
+      await ethers.provider.send("hardhat_setBalance", [w.address, "0x56BC75E2D63100000"]);
+      wallets.push(w);
+    }
+    // depths 0..16 succeed
+    await registerAgent(substrate, wallets[0], "d0", ownerW);
+    for (let i = 1; i <= max; i++) {
+      await registerAgent(substrate, wallets[i], "d" + i, ownerW, wallets[i - 1].address, wallets[i - 1]);
+    }
+    expect(await substrate.agentDepth(wallets[max].address)).to.equal(max);
+    // depth 17 reverts
+    await expect(
+      registerAgent(substrate, wallets[max + 1], "d17", ownerW, wallets[max].address, wallets[max])
+    ).to.be.revertedWithCustomError(substrate, "FleetTooDeep");
   });
 });

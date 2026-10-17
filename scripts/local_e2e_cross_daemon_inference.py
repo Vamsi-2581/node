@@ -489,8 +489,7 @@ def fund_gas(w3, from_acct, to_addr: str, ether: int = 1) -> None:
 
 
 def register_agent_on_chain(w3, substrate, shape, *, agent_pk: str,
-                            agent_addr: str, owner_acct, lineage_hash: bytes,
-                            peer_id: bytes) -> str:
+                            agent_addr: str, owner_acct, peer_id: bytes) -> str:
     """Owner-bound registration signed by the agent's own key."""
     nonce_val = 0
     if shape["nonce_view"]:
@@ -503,7 +502,7 @@ def register_agent_on_chain(w3, substrate, shape, *, agent_pk: str,
     reg_fn = getattr(substrate.functions, shape["register"])
     return send_tx(
         w3,
-        reg_fn(lineage_hash, peer_id, owner_acct.address, ZERO, sig),
+        reg_fn(peer_id, owner_acct.address, ZERO, sig),
         agent_pk, agent_addr)
 
 
@@ -1130,11 +1129,9 @@ async def amain() -> int:  # noqa: C901 — a linear E2E script, staged for read
             for pk, addr, owner, peer in regs:
                 if not (addr and pk):
                     continue
-                lineage = bytes.fromhex(
-                    Web3.keccak(text=addr).hex().replace("0x", "")[:64])
                 register_agent_on_chain(
                     w3, substrate, shape, agent_pk=pk, agent_addr=addr,
-                    owner_acct=owner, lineage_hash=lineage, peer_id=peer)
+                    owner_acct=owner, peer_id=peer)
 
             # Fund the child's own wallet through the production mint rail.
             # The epoch id is per-box: anchor hash-chains and refuses a

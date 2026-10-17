@@ -325,8 +325,7 @@ def fund_gas(w3, from_acct, to_addr: str, ether: int = 1) -> None:
 
 
 def register_agent_on_chain(w3, substrate, shape, *, agent_pk: str,
-                            agent_addr: str, owner_acct, lineage_hash: bytes,
-                            peer_id: bytes) -> str:
+                            agent_addr: str, owner_acct, peer_id: bytes) -> str:
     """Owner-bound registration signed by the agent's own key."""
     nonce_val = 0
     if shape["nonce_view"]:
@@ -339,7 +338,7 @@ def register_agent_on_chain(w3, substrate, shape, *, agent_pk: str,
     reg_fn = getattr(substrate.functions, shape["register"])
     return send_tx(
         w3,
-        reg_fn(lineage_hash, peer_id, owner_acct.address, ZERO, sig),
+        reg_fn(peer_id, owner_acct.address, ZERO, sig),
         agent_pk, agent_addr)
 
 
@@ -535,11 +534,9 @@ async def amain() -> int:  # noqa: C901 — a linear E2E script, staged for read
             (parent_defn, parent_key, parent_addr, owner_buyer, b"peer-parent"),
             (child_defn, child_key, child_addr, owner_buyer, b"peer-child"),
         ):
-            lin = bytes.fromhex(
-                defn.identity.lineage_hash.replace("0x", "").ljust(64, "0")[:64])
             register_agent_on_chain(
                 w3, substrate, shape, agent_pk=pk, agent_addr=addr,
-                owner_acct=owner, lineage_hash=lin, peer_id=peer)
+                owner_acct=owner, peer_id=peer)
             defn.identity.registered_on_chain = True
 
         assert substrate.functions.getAgentOwner(seller_addr).call() == \

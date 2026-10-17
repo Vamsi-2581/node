@@ -43,7 +43,9 @@ REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-RPC_URL = "http://127.0.0.1:8545"
+# E2E_HARDHAT_PORT moves the run off 8545 when another chain lives there.
+HARDHAT_PORT = int(os.environ.get("E2E_HARDHAT_PORT", "8545"))
+RPC_URL = f"http://127.0.0.1:{HARDHAT_PORT}"
 # `npx hardhat node` serves the in-process "hardhat" network, whose
 # chainId is 1337 (see hardhat.config.js). NOT 31337 (that's the
 # eth_tester default the daemon config assumes). Signing for the wrong
@@ -148,7 +150,7 @@ def start_hardhat(cwd: Path) -> subprocess.Popen:
     # and a filled PIPE buffer blocks the process (seen as an undici
     # HeadersTimeoutError on the deploy side). DEVNULL keeps it draining.
     proc = subprocess.Popen(
-        [_npx(), "hardhat", "node"],
+        [_npx(), "hardhat", "node", "--port", str(HARDHAT_PORT)],
         cwd=str(cwd),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         shell=(os.name == "nt"),
@@ -271,6 +273,7 @@ def deploy_contracts(cwd: Path) -> Dict[str, Optional[str]]:
     try:
         env = dict(os.environ)
         env["DEPLOY_OUT"] = str(out_json)
+        env["HARDHAT_LOCAL_URL"] = RPC_URL
         log("deploying Substrate + ServiceMarket via hardhat run…")
         proc = subprocess.run(
             [_npx(), "hardhat", "run", str(tmp_js), "--network", "localhost"],
@@ -369,7 +372,7 @@ def sign_binding_digest(w3, contract, shape: Dict[str, Any],
 def sponsored_register(w3, contract, shape: Dict[str, Any],
                        agent_pk: str, agent_addr: str,
                        owner_pk: str, owner_addr: str,
-                       parent_addr: str, lineage_hash: bytes,
+                       parent_addr: str,
                        peer_id: bytes) -> str:
     """registerAgentBound / registerAgentSponsored from the agent key,
     with an owner EIP-712 binding signature."""
@@ -385,10 +388,9 @@ def sponsored_register(w3, contract, shape: Dict[str, Any],
     reg_fn = getattr(contract.functions, shape["register"])
     inputs = shape["register_inputs"]
     # Build args positionally to match the ABI: the register method takes
-    # (lineageHash, peerId, owner, parentAgent, ownerSig) in both the
-    # pre- and post-rename shapes (nonce is carried in the sig, not the
-    # call args — the contract reads its own bindingNonce).
-    call = reg_fn(lineage_hash, peer_id, owner_addr, parent_addr, sig)
+    # (peerId, owner, parentAgent, ownerSig) (nonce is carried in the sig,
+    # not the call args: the contract reads its own bindingNonce).
+    call = reg_fn(peer_id, owner_addr, parent_addr, sig)
 
     agent_acct = Account.from_key(agent_pk)
     tx = call.build_transaction({
@@ -582,21 +584,19 @@ async def amain() -> int:
             w3.eth.wait_for_transaction_receipt(
                 w3.eth.send_raw_transaction(raw), timeout=60)
 
-        lin_a = bytes.fromhex(author_ident.lineage_hash.replace("0x", "").ljust(64, "0")[:64])
-        lin_c = bytes.fromhex(caller_ident.lineage_hash.replace("0x", "").ljust(64, "0")[:64])
         ZERO = "0x" + "00" * 20
 
         tx_a = sponsored_register(
             w3, substrate, binding_shape,
             agent_pk=author_key, agent_addr=author_addr,
             owner_pk=owner_a._private_key.hex(), owner_addr=owner_a.address,
-            parent_addr=ZERO, lineage_hash=lin_a,
+            parent_addr=ZERO,
             peer_id=b"peer-author-1")
         tx_c = sponsored_register(
             w3, substrate, binding_shape,
             agent_pk=caller_key, agent_addr=caller_addr,
             owner_pk=owner_b._private_key.hex(), owner_addr=owner_b.address,
-            parent_addr=ZERO, lineage_hash=lin_c,
+            parent_addr=ZERO,
             peer_id=b"peer-caller-1")
 
         got_owner_a = substrate.functions.getAgentOwner(author_addr).call()
@@ -669,7 +669,10 @@ async def amain() -> int:
         reg = await execute_tool(
             "register_tool",
             {"name": "echo_tool", "description": "Echo x back.",
-             "input_schema": SCHEMA, "code": ECHO_CODE},
+             "input_schema": SCHEMA, "code": ECHO_CODE,
+             # Publishing needs a novelty claim (Decision 2026-10-13).
+             "novelty": {"statement": "Echoes x back; no comparable tool "
+                                      "exists yet.", "prior_art": []}},
             rt_a, caller_id="author-1")
         if "error" in reg:
             raise RuntimeError(f"register_tool failed: {reg}")
@@ -677,6 +680,9 @@ async def amain() -> int:
         assert reg["author"] == "author-1"
         assert reg["trust_class"] == "pinned"
         assert reg["published"] is False
+        # This E2E covers the mint loop, not the ToolBond stake (that is
+        # local_e2e_tool_security.py), so publish without one.
+        os.environ["ATN_TOOL_BOND_DEV_OVERRIDE"] = "1"
         pub = await execute_tool(
             "publish_tool", {"digest": tool_digest},
             rt_a, caller_id="author-1")

@@ -120,15 +120,12 @@ def chain():
     data = json.loads(ARTIFACT.read_text(encoding="utf-8"))
     w3 = Web3(EthereumTesterProvider())
     deployer = w3.eth.accounts[0]
-    from tests.substrate_chain_helpers import deploy_substrate, seed_pool
+    from tests.substrate_chain_helpers import deploy_substrate, register_bound, seed_pool
     addr = deploy_substrate(w3, data["abi"], data["bytecode"], deployer)
     contract = w3.eth.contract(address=addr, abi=data["abi"])
     agent_addrs = w3.eth.accounts[1:4]
     for i, a in enumerate(agent_addrs):
-        tx = contract.functions.registerAgent(
-            Web3.keccak(text=f"lineage-{i}"), f"peer-{i}".encode(),
-        ).transact({"from": a, "gas": 500_000})
-        assert w3.eth.wait_for_transaction_receipt(tx).status == 1
+        assert register_bound(w3, contract, a, f"peer-{i}".encode()).status == 1
     # Fees-only pool for the next anchor (on-chain conservation).
     seed_pool(w3, contract)
     return {

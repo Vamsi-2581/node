@@ -1326,19 +1326,15 @@ _TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="register_on_chain",
         description=(
-            "Register a child agent on-chain in the jurisdiction's RPB contract. "
-            "The daemon signs the transaction with the agent's stored private key. "
-            "Returns the transaction hash on success."
+            "Register a child agent on-chain in the jurisdiction's Substrate. "
+            "Its registered parent signs the owner binding, so the child joins "
+            "the parent's household; the daemon sends the transaction with the "
+            "child's stored private key. Returns the transaction hash on success."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "agent_id": {"type": "string", "description": "The child agent to register."},
-                "sponsor_address": {
-                    "type": "string",
-                    "description": "Optional sponsor agent address (0x...).",
-                    "default": "",
-                },
             },
             "required": ["agent_id"],
         },
@@ -4639,10 +4635,43 @@ async def _get_children_status(runtime: Runtime, input: dict[str, Any]) -> dict[
     }
 
 
+async def register_parent_signed(runtime: Runtime, svc: Any, defn: Any,
+                                 private_key: str, peer_id: str) -> dict[str, Any]:
+    """Register ``defn`` bound to its parent's household, the binding signed
+    by the parent agent's key instead of the owner wallet (docs/
+    multi_jurisdiction.md decision 7). The parent must be registered; the
+    child inherits the parent's on-chain owner. A root agent has no parent
+    and registers with the owner wallet's signature instead."""
+    parent = runtime.get_agent(defn.parent_id) if defn.parent_id else None
+    if parent is None:
+        return {"success": False,
+                "error": f"Agent '{defn.id}' has no parent agent; a root agent "
+                         "registers with the owner wallet's signature (frontend)."}
+    pid = getattr(parent, "identity", None)
+    if pid is None or not pid.registered_on_chain:
+        return {"success": False,
+                "error": f"Parent agent '{parent.id}' is not registered on-chain; "
+                         "register it first."}
+    parent_key = runtime.registry.get_agent_key(parent.id)
+    if not parent_key:
+        return {"success": False,
+                "error": f"No private key stored for parent agent '{parent.id}'."}
+    owner = await svc.get_agent_owner(pid.address)
+    if not owner or int(owner, 16) == 0:
+        return {"success": False,
+                "error": f"Parent agent '{parent.id}' has no owner on-chain."}
+    nonce = await svc.binding_nonce(defn.identity.address)
+    sig = svc.sign_binding(parent_key, defn.identity.address, pid.address, nonce)
+    return await svc.register_agent_bound(
+        identity=defn.identity, private_key=private_key, peer_id=peer_id,
+        owner=owner, owner_sig=sig, parent=pid.address)
+
+
 async def _register_on_chain(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
-    """Register a child agent on-chain via the daemon's stored private key."""
+    """Register a child agent on-chain via the daemon's stored private key.
+    The parent agent signs the binding, so the child joins the parent's
+    household without the owner wallet."""
     agent_id = input["agent_id"]
-    sponsor_address = input.get("sponsor_address", "")
 
     defn = runtime.get_agent(agent_id)
     if defn is None:
@@ -4689,12 +4718,7 @@ async def _register_on_chain(runtime: Runtime, input: dict[str, Any]) -> dict[st
     if not peer_id:
         return {"error": "libp2p host did not come up in time; try again shortly."}
 
-    result = await svc.register_agent(
-        identity=defn.identity,
-        private_key=private_key,
-        peer_id=peer_id,
-        sponsor_address=sponsor_address,
-    )
+    result = await register_parent_signed(runtime, svc, defn, private_key, peer_id)
 
     if result.get("success"):
         defn.identity.registered_on_chain = True

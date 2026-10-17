@@ -62,6 +62,36 @@ from nodes.common.federated_close_driver import FederatedCloseResult
 from nodes.common.federated_reconcile import federated_epoch_close
 
 
+def _self_owned_binding_sig(substrate_address: str, chain_id: int, key: str,
+                            agent_addr: str) -> bytes:
+    """EIP-712 OwnerBinding{agent, parent=0, nonce=0} signed by the agent's
+    own key (the agent is its own owner)."""
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+    msg = encode_typed_data(full_message={
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "OwnerBinding": [
+                {"name": "agent", "type": "address"},
+                {"name": "parent", "type": "address"},
+                {"name": "nonce", "type": "uint256"},
+            ],
+        },
+        "primaryType": "OwnerBinding",
+        "domain": {"name": "AutonetSubstrate", "version": "1",
+                   "chainId": int(chain_id),
+                   "verifyingContract": substrate_address},
+        "message": {"agent": agent_addr,
+                    "parent": "0x" + "00" * 20, "nonce": 0},
+    })
+    return bytes(Account.from_key(key).sign_message(msg).signature)
+
+
 def _load_substrate_abi():
     artifact = json.loads(
         (
@@ -174,12 +204,13 @@ def main():
             print(f"[reg] {label} already registered")
             continue
         print(f"[reg] {label} registering...")
-        lineage = Web3.keccak(text=f"smoke-lineage-{label}-{int(time.time())}")
         # Synthetic libp2p PeerId placeholder — real daemon registration
         # will pass the actual PeerId bytes from libp2p_host.get_id().
         peer_id = b"smoke-peer-" + label.encode() + b"-" + str(int(time.time())).encode()
         nonce = w3.eth.get_transaction_count(addr)
-        tx = contract.functions.registerAgent(lineage, peer_id).build_transaction({
+        sig = _self_owned_binding_sig(contract.address, chain_id, "0x" + pk, addr)
+        tx = contract.functions.registerAgentBound(
+            peer_id, addr, "0x" + "00" * 20, sig).build_transaction({
             "from": addr,
             "nonce": nonce,
             "gas": 1_500_000,
@@ -191,7 +222,7 @@ def main():
         h = w3.eth.send_raw_transaction(raw)
         receipt = w3.eth.wait_for_transaction_receipt(h)
         if receipt.status != 1:
-            raise RuntimeError(f"registerAgent({label}) reverted: {receipt}")
+            raise RuntimeError(f"registerAgentBound({label}) reverted: {receipt}")
         print(f"[reg] {label} ok: tx={h.hex()}")
 
     # 2. Build a synthetic federated close result with mint to both addrs.

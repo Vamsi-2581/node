@@ -42,6 +42,7 @@ from nodes.common.federated_reconcile import (
 from nodes.common.voice_state import read_voice_state
 from tests.substrate_chain_helpers import (
     deploy_substrate,
+    register_bound,
     seed_pool,
 )
 
@@ -93,11 +94,8 @@ def _set_votes(w3: Web3, rep_contract, deployer: str, account: str,
 
 
 def _register_agent(w3: Web3, contract, agent_addr: str, seed: str) -> None:
-    lineage = Web3.keccak(text=seed)
-    tx = contract.functions.registerAgent(
-        lineage, b"peer-" + seed.encode()).transact({
-            "from": agent_addr, "gas": 300_000})
-    assert w3.eth.wait_for_transaction_receipt(tx).status == 1
+    receipt = register_bound(w3, contract, agent_addr, b"peer-" + seed.encode())
+    assert receipt.status == 1
 
 
 _DIGEST = "ef" * 32
@@ -298,6 +296,40 @@ class TestVoiceStateSnapshot:
             fx["addr"], web3=w3, rep_token_address=fx["rep_addr"])
         assert state_1b["voice_weights"] == state_1["voice_weights"]
         assert state_1b["snapshot_block"] == state_1["snapshot_block"]
+
+    def test_revoked_agent_and_child_drop_out(self, fx):
+        """A revoked agent and its descendant (via OwnerBound parent links)
+        are absent from the snapshot; unrelated agents stay."""
+        w3, contract = fx["w3"], fx["contract"]
+        parent, other = fx["agent_addrs"][0], fx["agent_addrs"][1]
+        child = w3.eth.accounts[4]
+        # Child bound under the (self-owned) parent, signed by the owner.
+        r = register_bound(w3, contract, child, b"peer-child",
+                           owner=parent, parent=parent)
+        assert r.status == 1
+        _set_votes(w3, fx["rep_contract"], fx["deployer"], parent, 400)
+        _set_votes(w3, fx["rep_contract"], fx["deployer"], child, 300)
+        _set_votes(w3, fx["rep_contract"], fx["deployer"], other, 300)
+        _anchor_epoch(fx, fx["agent_addrs"], "e_rv0", "rpb_rv0")
+        before = read_voice_state(
+            fx["addr"], web3=w3, rep_token_address=fx["rep_addr"])
+        assert child.lower() in before["owner_map"]
+        assert parent.lower() in before["owner_map"]
+
+        # Owner (== parent agent) revokes the parent: subtree goes with it.
+        tx = contract.functions.revokeAgent(parent, b"").transact(
+            {"from": parent, "gas": 300_000})
+        assert w3.eth.wait_for_transaction_receipt(tx).status == 1
+        assert not contract.functions.isLive(child).call()
+        _anchor_epoch(fx, fx["agent_addrs"], "e_rv1", "rpb_rv1")
+        after = read_voice_state(
+            fx["addr"], web3=w3, rep_token_address=fx["rep_addr"])
+        assert parent.lower() not in after["owner_map"]
+        assert child.lower() not in after["owner_map"]
+        assert other.lower() in after["owner_map"]
+        assert parent.lower() not in after["voice_weights"]
+        assert child.lower() not in after["voice_weights"]
+        assert other.lower() in after["voice_weights"]
 
     def test_owner_wallet_not_agent_has_no_rep_term(self, fx):
         """Only registered agents contribute REP to a household; a bare

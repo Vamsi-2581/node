@@ -126,11 +126,19 @@ _VOICE_ABI = [
         "anonymous": False,
         "inputs": [
             {"indexed": True,  "internalType": "address", "name": "agent",       "type": "address"},
-            {"indexed": True,  "internalType": "bytes32", "name": "lineageHash", "type": "bytes32"},
             {"indexed": False, "internalType": "bytes",   "name": "peerId",      "type": "bytes"},
             {"indexed": False, "internalType": "uint256", "name": "timestamp",   "type": "uint256"},
         ],
         "name": "AgentRegistered",
+        "type": "event",
+    },
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "address", "name": "agent", "type": "address"},
+            {"indexed": True, "internalType": "address", "name": "owner", "type": "address"},
+        ],
+        "name": "AgentRevoked",
         "type": "event",
     },
     {
@@ -492,9 +500,30 @@ def read_voice_state(
         key=lambda log: (int(log["blockNumber"]), int(log["logIndex"])),
     )
     owner_of: Dict[str, str] = {}
+    parent_of: Dict[str, str] = {}
     for log in bindings:
-        owner_of[str(log["args"]["agent"]).lower()] = (
-            str(log["args"]["owner"]).lower())
+        agent_l = str(log["args"]["agent"]).lower()
+        owner_of[agent_l] = str(log["args"]["owner"]).lower()
+        parent_of[agent_l] = str(log["args"]["parent"]).lower()
+
+    # Revoked agents drop out with their whole subtree (Substrate.isLive
+    # walks the same parent links), as of the snapshot block.
+    revoked = {
+        str(log["args"]["agent"]).lower()
+        for log in _get_logs(
+            contract.events.AgentRevoked, w3, contract.address, block)
+    }
+    if revoked:
+        def _live(agent: str) -> bool:
+            seen = set()
+            a = agent
+            while a and a != _ZERO and a not in seen:
+                if a in revoked:
+                    return False
+                seen.add(a)
+                a = parent_of.get(a, "")
+            return True
+        agents = [a for a in agents if _live(a)]
 
     # Reputation (voice) reads: RepToken (DAO), pinned to the anchor
     # TIMESTAMP (ERC20Votes mode=timestamp). No RepToken configured =>

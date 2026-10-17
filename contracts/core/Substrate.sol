@@ -54,8 +54,8 @@ import {Checkpoints} from "@openzeppelin/contracts/utils/structs/Checkpoints.sol
 /// What an agent's chain interaction looks like
 /// --------------------------------------------
 ///
-/// 1. Once: ``registerAgent(lineageHash)``. Sets msg.sender as an
-///    active agent.
+/// 1. Once: ``registerAgentBound(peerId, owner, parent, sig)``. Sets
+///    msg.sender as an active agent, bound to its owner wallet.
 ///
 /// 2. Per epoch close it minted in:
 ///      a. Off-chain: read EpochAnchored event for the epoch_id.
@@ -302,7 +302,6 @@ contract Substrate is EIP712 {
     // =========================================================================
 
     struct Agent {
-        bytes32 lineageHash;
         uint256 registeredAt;
         bool active;
         uint256 totalTrainingMint;
@@ -310,7 +309,6 @@ contract Substrate is EIP712 {
     }
 
     mapping(address => Agent) public agents;
-    mapping(bytes32 => address) public agentByLineage;
     address[] private registeredAgentList;
 
     /// @dev libp2p PeerId bytes (multihash-encoded). Stored separately
@@ -330,7 +328,6 @@ contract Substrate is EIP712 {
 
     event AgentRegistered(
         address indexed agent,
-        bytes32 indexed lineageHash,
         bytes peerId,
         uint256 timestamp
     );
@@ -342,43 +339,14 @@ contract Substrate is EIP712 {
     event EndpointUpdated(address indexed agent, string wsEndpoint);
 
     error AlreadyRegistered();
-    error LineageHashRequired();
-    error LineageHashAlreadyUsed();
     error AgentNotActive();
     error PeerIdRequired();
-
-    /// @notice Register the caller as a substrate agent.
-    /// @param lineageHash Caller-supplied identity hash (e.g.
-    ///                    keccak256 of the agent's manifest CID).
-    /// @param peerId libp2p PeerId bytes for off-chain discovery.
-    ///        Daemons resolve this to a current multiaddr via the
-    ///        libp2p Kademlia DHT — the chain stores *who*, the DHT
-    ///        stores *where right now*.
-    function registerAgent(bytes32 lineageHash, bytes calldata peerId) external {
-        if (agents[msg.sender].registeredAt != 0) revert AlreadyRegistered();
-        if (lineageHash == bytes32(0)) revert LineageHashRequired();
-        if (agentByLineage[lineageHash] != address(0)) revert LineageHashAlreadyUsed();
-        if (peerId.length == 0) revert PeerIdRequired();
-
-        agents[msg.sender] = Agent({
-            lineageHash: lineageHash,
-            registeredAt: block.timestamp,
-            active: true,
-            totalTrainingMint: 0,
-            trainingSubmissionCount: 0
-        });
-        agentByLineage[lineageHash] = msg.sender;
-        agentPeerId[msg.sender] = peerId;
-        registeredAgentList.push(msg.sender);
-
-        emit AgentRegistered(msg.sender, lineageHash, peerId, block.timestamp);
-    }
 
     /// @notice Update this agent's libp2p PeerId. Used when a daemon
     ///         rotates its libp2p keypair (e.g. fresh install on a new
     ///         box) without losing on-chain identity / earnings.
     function updatePeerId(bytes calldata peerId) external {
-        if (agents[msg.sender].registeredAt == 0) revert AgentNotActive();
+        if (!isLive(msg.sender)) revert AgentNotActive();
         if (peerId.length == 0) revert PeerIdRequired();
         agentPeerId[msg.sender] = peerId;
         emit PeerIdUpdated(msg.sender, peerId);
@@ -397,7 +365,7 @@ contract Substrate is EIP712 {
     ///         the endpoint differs from what's on-chain (ephemeral tunnels
     ///         change it every restart).
     function updateEndpoint(string calldata wsEndpoint) external {
-        if (agents[msg.sender].registeredAt == 0) revert AgentNotActive();
+        if (!isLive(msg.sender)) revert AgentNotActive();
         agentEndpoint[msg.sender] = wsEndpoint;
         emit EndpointUpdated(msg.sender, wsEndpoint);
     }
@@ -479,8 +447,8 @@ contract Substrate is EIP712 {
     // so a stolen signature can't be redirected to a different agent either.
     // =========================================================================
 
-    /// @dev agent → owner wallet (address(0) = ownerless, the legacy
-    ///      registerAgent path). Rotatable by the agent (custody of the
+    /// @dev agent → owner wallet. Every registered agent has one (there is
+    ///      no unbound registration). Rotatable by the agent (custody of the
     ///      agent key authorizes re-binding to any wallet that signs).
     mapping(address => address) public agentOwner;
     /// @dev agent → parent agent in the fleet tree (address(0) = top-level).
@@ -488,6 +456,16 @@ contract Substrate is EIP712 {
     /// @dev agent → current binding nonce. Incremented on every successful
     ///      bind/rotate; the value a fresh OwnerBinding signature must target.
     mapping(address => uint256) public bindingNonce;
+    /// @dev agent → depth in the fleet tree (0 = top-level). Bounds the
+    ///      ancestor walk in ``isLive``.
+    mapping(address => uint256) public agentDepth;
+
+    /// @notice Deepest allowed fleet tree (a top-level agent is depth 0).
+    uint256 public constant MAX_FLEET_DEPTH = 16;
+
+    /// @dev EIP-712 typehash for the owner's revocation of an agent subtree.
+    bytes32 private constant REVOKE_TYPEHASH =
+        keccak256("RevokeAgent(address agent)");
 
     /// @dev EIP-712 typehash for the owner's owner-binding signature.
     bytes32 private constant OWNER_BINDING_TYPEHASH =
@@ -508,10 +486,17 @@ contract Substrate is EIP712 {
         uint256 nonce
     );
 
+    /// @dev The owner revoked `agent`. Every descendant (via the OwnerBound
+    ///      parent links) is revoked with it: ``isLive`` walks the ancestors.
+    ///      Revocation is final.
+    event AgentRevoked(address indexed agent, address indexed owner);
+
     error OwnerRequired();
     error BadOwnerBindingSignature();
     error ParentNotRegistered();
     error ParentOwnerMismatch();
+    error FleetTooDeep();
+    error BadRevokeSignature();
 
     /// @notice EIP-712 digest the owner wallet signs to bind an agent.
     ///         Exposed for off-chain signers and tests. Bind the CURRENT
@@ -531,122 +516,102 @@ contract Substrate is EIP712 {
         );
     }
 
-    /// @dev Verify the (new) owner's owner-binding signature and the parent/owner
-    ///      constraints, then bind (msg.sender → owner, parent). Shared by the
-    ///      fresh-registration, retrofit, and rotation paths. Consumes the
-    ///      agent's current binding nonce (the signature must target it) and
-    ///      increments it, so no signature is ever accepted twice. Caller must
-    ///      have already ensured the agent is registered.
+    /// @dev Verify the binding signature and the parent/owner constraints, then
+    ///      bind (msg.sender → owner, parent). Shared by registration and
+    ///      rotation. Consumes the agent's current binding nonce (the signature
+    ///      must target it) and increments it, so no signature is ever
+    ///      accepted twice. Caller must have already ensured the agent is
+    ///      registered.
+    ///
+    ///      Signer: the owner wallet, or (``parentMaySign``, registration only)
+    ///      the live parent agent's key. A parent-signed child lands in the
+    ///      parent's household, so agents can spawn registered children
+    ///      without a human, and spawning never adds a household.
     function _bindOwner(
         address owner,
         address parentAgent,
-        bytes calldata ownerSig
+        bytes calldata sig,
+        bool parentMaySign
     ) private {
         if (owner == address(0)) revert OwnerRequired();
 
-        // Recover the (new) owner's EIP-712 signature over
-        // (this agent, parent, current-nonce). Binding the current nonce is
-        // what makes a captured historical signature un-replayable: after any
-        // successful bind the nonce has moved on, so old signatures recover to
-        // a stale binding the contract no longer accepts.
-        uint256 nonce = bindingNonce[msg.sender];
-        bytes32 digestHash = bindingHash(msg.sender, parentAgent, nonce);
-        address signer = digestHash.recover(ownerSig);
-        if (signer != owner) revert BadOwnerBindingSignature();
-
-        // Parent (if any) must be a registered agent under the SAME (new) owner
-        // — the same-fleet constraint. A top-level agent passes parent = 0.
-        // On rotation this is evaluated against the NEW owner: a fleet migrates
-        // agent by agent, so a child rotated before its parent may temporarily
-        // need parent = 0 (or a parent already rotated to the new owner).
+        // Parent (if any) must be a live agent under the SAME owner, the
+        // same-fleet constraint. A top-level agent passes parent = 0.
+        uint256 depth = 0;
         if (parentAgent != address(0)) {
             if (agents[parentAgent].registeredAt == 0) revert ParentNotRegistered();
+            if (!isLive(parentAgent)) revert AgentNotActive();
             if (agentOwner[parentAgent] != owner) revert ParentOwnerMismatch();
+            depth = agentDepth[parentAgent] + 1;
+            if (depth > MAX_FLEET_DEPTH) revert FleetTooDeep();
+        }
+
+        // Recover the signature over (this agent, parent, current nonce).
+        // Binding the current nonce makes a captured historical signature
+        // un-replayable: after any bind the nonce has moved on.
+        uint256 nonce = bindingNonce[msg.sender];
+        address signer = bindingHash(msg.sender, parentAgent, nonce).recover(sig);
+        if (signer != owner
+            && !(parentMaySign && parentAgent != address(0) && signer == parentAgent)) {
+            revert BadOwnerBindingSignature();
         }
 
         address prevOwner = agentOwner[msg.sender];
         agentOwner[msg.sender] = owner;
         agentParent[msg.sender] = parentAgent;
+        agentDepth[msg.sender] = depth;
         bindingNonce[msg.sender] = nonce + 1;
         emit OwnerBound(msg.sender, owner, parentAgent, prevOwner, nonce);
     }
 
-    /// @notice Register the caller as a substrate agent WITH a verified owner
-    ///         and optional parent (registerAgent v2). Identical registration
-    ///         to registerAgent, plus the owner/parent attribution.
-    /// @param lineageHash  Caller-supplied identity hash (see registerAgent).
-    /// @param peerId       libp2p PeerId bytes (see registerAgent).
-    /// @param owner        The owner human wallet. Must have signed the
-    ///                     OwnerBinding — verified on-chain, never trusted as a
-    ///                     bare claim.
+    /// @notice Register the caller as a substrate agent, bound to its owner
+    ///         wallet and optional parent. The only registration path.
+    /// @param peerId       libp2p PeerId bytes for off-chain discovery.
+    ///                     Daemons resolve it to a current multiaddr via the
+    ///                     libp2p DHT: the chain stores who, the DHT where.
+    /// @param owner        The owner human wallet (the household).
     /// @param parentAgent  Optional parent agent (address(0) = top-level).
-    ///                     If set, must be a registered agent whose owner is
-    ///                     the same `owner` (same-fleet constraint).
-    /// @param ownerSig     EIP-712 signature by `owner` over
-    ///                     OwnerBinding{agent: msg.sender, parent: parentAgent,
-    ///                     nonce: bindingNonce[msg.sender]} (0 for a fresh
-    ///                     agent).
+    ///                     If set, must be a live agent of the same `owner`.
+    /// @param sig          EIP-712 OwnerBinding{agent: msg.sender, parent:
+    ///                     parentAgent, nonce: 0}, signed by `owner`, or by
+    ///                     `parentAgent` when it is set.
     function registerAgentBound(
-        bytes32 lineageHash,
         bytes calldata peerId,
         address owner,
         address parentAgent,
-        bytes calldata ownerSig
+        bytes calldata sig
     ) external {
         if (agents[msg.sender].registeredAt != 0) revert AlreadyRegistered();
-        if (lineageHash == bytes32(0)) revert LineageHashRequired();
-        if (agentByLineage[lineageHash] != address(0)) revert LineageHashAlreadyUsed();
         if (peerId.length == 0) revert PeerIdRequired();
 
         agents[msg.sender] = Agent({
-            lineageHash: lineageHash,
             registeredAt: block.timestamp,
             active: true,
             totalTrainingMint: 0,
             trainingSubmissionCount: 0
         });
-        agentByLineage[lineageHash] = msg.sender;
         agentPeerId[msg.sender] = peerId;
         registeredAgentList.push(msg.sender);
 
-        emit AgentRegistered(msg.sender, lineageHash, peerId, block.timestamp);
+        emit AgentRegistered(msg.sender, peerId, block.timestamp);
 
-        // Fresh registration: nonce is 0, owner unset. The shared bind path
-        // runs verification and the (agent→owner) binding.
-        _bindOwner(owner, parentAgent, ownerSig);
+        _bindOwner(owner, parentAgent, sig, true);
     }
 
-    /// @notice Attach owner + parent onto an ALREADY-registered agent — the
-    ///         legacy-agent migration path (first bind) AND the recovery
-    ///         rotation path (re-bind). Thin alias for rotateOwner: first
-    ///         attach is simply a rotation from address(0). Retained as an
-    ///         additive external API for callers that think in "attach" terms.
-    /// @dev    msg.sender is the agent; it must already be registered. Whether
-    ///         owner is currently set or not, the (new) owner's signature at
-    ///         the current nonce authorizes the binding.
-    function attachOwner(
-        address owner,
-        address parentAgent,
-        bytes calldata ownerSig
-    ) external {
-        if (agents[msg.sender].registeredAt == 0) revert AgentNotActive();
-        _bindOwner(owner, parentAgent, ownerSig);
-    }
-
-    /// @notice Rotate (or first-set) the owner+parent of the calling agent to
-    ///         `newOwner`. Authorized by CUSTODY of the agent key (msg.sender)
-    ///         plus the NEW owner's EIP-712 signature at the current nonce. The
-    ///         OLD owner does NOT participate — this is the key-loss recovery
-    ///         path, so requiring the (possibly leaked) old key would defeat
-    ///         the purpose. First bind is the address(0)→newOwner case.
+    /// @notice Rotate the owner+parent of the calling agent to `newOwner`.
+    ///         Authorized by CUSTODY of the agent key (msg.sender) plus the
+    ///         NEW owner's EIP-712 signature at the current nonce. The OLD
+    ///         owner does NOT participate: this is the key-loss recovery path,
+    ///         so requiring the (possibly leaked) old key would defeat it.
+    ///         A revoked agent (or one under a revoked ancestor) cannot rotate,
+    ///         so revocation can't be escaped by re-binding.
     ///
     ///         Per-agent rotation: children keep their own bindings. To migrate
     ///         a fleet after a key leak, rotate each agent; because a child's
     ///         parent must share the child's new owner, rotate parents before
     ///         children (or pass parent = 0 and re-parent afterward).
     /// @param newOwner   The new owner wallet (must sign; != address(0)).
-    /// @param newParent  Parent under newOwner (registered & owned by newOwner)
-    ///                    or address(0) for top-level.
+    /// @param newParent  Live parent under newOwner, or address(0).
     /// @param newOwnerSig EIP-712 signature by newOwner over
     ///                    OwnerBinding{agent: msg.sender, parent: newParent,
     ///                    nonce: bindingNonce[msg.sender]}.
@@ -655,8 +620,45 @@ contract Substrate is EIP712 {
         address newParent,
         bytes calldata newOwnerSig
     ) external {
-        if (agents[msg.sender].registeredAt == 0) revert AgentNotActive();
-        _bindOwner(newOwner, newParent, newOwnerSig);
+        if (!isLive(msg.sender)) revert AgentNotActive();
+        _bindOwner(newOwner, newParent, newOwnerSig, false);
+    }
+
+    /// @notice EIP-712 digest the owner wallet signs to revoke an agent and
+    ///         its whole subtree.
+    function revokeHash(address agent) public view returns (bytes32) {
+        return _hashTypedDataV4(keccak256(abi.encode(REVOKE_TYPEHASH, agent)));
+    }
+
+    /// @notice Revoke `agent` and, through the parent links, every
+    ///         descendant. Final. Authorized by the agent's owner wallet:
+    ///         either it sends the transaction (empty `ownerSig`), or anyone
+    ///         relays its RevokeAgent signature (so the wallet needs no gas).
+    ///         A leaked owner key can therefore destroy its fleet, but never
+    ///         take it: taking needs the agent keys.
+    function revokeAgent(address agent, bytes calldata ownerSig) external {
+        address owner = agentOwner[agent];
+        if (owner == address(0) || !agents[agent].active) revert AgentNotActive();
+        if (msg.sender != owner) {
+            if (ownerSig.length != 65 || revokeHash(agent).recover(ownerSig) != owner) {
+                revert BadRevokeSignature();
+            }
+        }
+        agents[agent].active = false;
+        emit AgentRevoked(agent, owner);
+    }
+
+    /// @notice True iff `agent` is registered, not revoked, and has no
+    ///         revoked ancestor. The gate for every agent action.
+    function isLive(address agent) public view returns (bool) {
+        if (agents[agent].registeredAt == 0) return false;
+        address a = agent;
+        for (uint256 i = 0; i <= MAX_FLEET_DEPTH; i++) {
+            if (!agents[a].active) return false;
+            a = agentParent[a];
+            if (a == address(0)) return true;
+        }
+        return true;
     }
 
     /// @notice Read an agent's owner wallet (address(0) = unset).
@@ -725,7 +727,7 @@ contract Substrate is EIP712 {
     ///         anyone (content-addressed ⇒ same digest is the same blob).
     /// @param manifestDigest sha256 of the canonical manifest blob bytes.
     function registerTool(bytes32 manifestDigest) external {
-        if (!agents[msg.sender].active) revert AgentNotActive();
+        if (!isLive(msg.sender)) revert AgentNotActive();
         if (manifestDigest == bytes32(0)) revert ManifestDigestRequired();
         address existing = toolAuthor[manifestDigest];
         if (existing != address(0)) {
@@ -813,7 +815,7 @@ contract Substrate is EIP712 {
         bytes32 epochIdHash,
         bytes32[] calldata proof
     ) external {
-        if (!agents[msg.sender].active) revert AgentNotActive();
+        if (!isLive(msg.sender)) revert AgentNotActive();
         string storage epochId = epochIdByHash[epochIdHash];
         if (bytes(epochId).length == 0) {
             revert EpochNotAnchored(epochIdHash);

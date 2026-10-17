@@ -1,16 +1,11 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const { registerAgent } = require("./helpers");
 const { anyUint } = require("@nomicfoundation/hardhat-chai-matchers/withArgs");
 
 // Helpers ---------------------------------------------------------------------
 const PEER_ID = ethers.toUtf8Bytes("peer-1234567890");
 const digest = (s) => ethers.keccak256(ethers.toUtf8Bytes(s));
-
-async function registerAgent(substrate, signer, lineage) {
-  return substrate
-    .connect(signer)
-    .registerAgent(digest(lineage), ethers.toUtf8Bytes("peer-" + lineage));
-}
 
 describe("Substrate.registerTool (ToolRegistered)", function () {
   let substrate, owner, agentA, agentB, stranger;

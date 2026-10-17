@@ -32,6 +32,7 @@ from tests.substrate_chain_helpers import (
     ZERO,
     anchor_direct,
     deploy_substrate,
+    register_bound,
     seed_pool,
 )
 
@@ -84,10 +85,7 @@ def chain():
     contract = w3.eth.contract(address=addr, abi=data["abi"])
     agents = w3.eth.accounts[1:4]
     for i, a in enumerate(agents):
-        tx = contract.functions.registerAgent(
-            Web3.keccak(text=f"aa-{i}"), f"peer-{i}".encode(),
-        ).transact({"from": a, "gas": 500_000})
-        assert w3.eth.wait_for_transaction_receipt(tx).status == 1
+        assert register_bound(w3, contract, a, f"peer-{i}".encode()).status == 1
     anchorer = EpochAnchorer(
         config=EpochAnchorerConfig(epoch_anchor_address=addr),
         web3=w3, contract_abi=data["abi"],

@@ -65,7 +65,6 @@ class AttributedPeer:
     """A libp2p peer with its on-chain identity attached."""
     peer_id: str            # libp2p PeerId (base58 string)
     agent_address: str      # 0x... on-chain agent address
-    lineage_hash: str       # bytes32 hex
     registered_at: int      # block timestamp
 
 
@@ -121,7 +120,7 @@ class PeerAttribution:
                 try:
                     peer_id_bytes = self._contract.functions.getAgentPeerId(addr).call()
                     record = self._contract.functions.agents(addr).call()
-                    lineage, registered_at, active, _, _ = record
+                    registered_at, active, _, _ = record
                 except Exception as e:
                     logger.debug("agent metadata read failed for %s: %s", addr, e)
                     continue
@@ -135,7 +134,6 @@ class PeerAttribution:
                 attr = AttributedPeer(
                     peer_id=peer_id_str,
                     agent_address=addr,
-                    lineage_hash=lineage.hex() if isinstance(lineage, bytes) else str(lineage),
                     registered_at=int(registered_at),
                 )
                 new_by_peer[peer_id_str] = attr

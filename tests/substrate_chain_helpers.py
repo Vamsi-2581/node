@@ -113,3 +113,46 @@ def seed_pool(w3: Web3, contract, gross: int = DEFAULT_SEED_GROSS) -> int:
         Web3.keccak(text=f"seed-payload-{n}"), b"\x00" * 32)
     assert r.status == 1, r
     return int(contract.functions.nextMintPool().call())
+
+
+def sign_owner_binding(w3: Web3, substrate: str, signer_key: str, agent: str,
+                       parent: str = ZERO, nonce: int = 0) -> bytes:
+    """EIP-712 OwnerBinding{agent, parent, nonce} signature bytes."""
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+    msg = encode_typed_data(full_message={
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "OwnerBinding": [
+                {"name": "agent", "type": "address"},
+                {"name": "parent", "type": "address"},
+                {"name": "nonce", "type": "uint256"},
+            ],
+        },
+        "primaryType": "OwnerBinding",
+        "domain": {"name": "AutonetSubstrate", "version": "1",
+                   "chainId": int(w3.eth.chain_id),
+                   "verifyingContract": Web3.to_checksum_address(substrate)},
+        "message": {"agent": Web3.to_checksum_address(agent),
+                    "parent": Web3.to_checksum_address(parent),
+                    "nonce": int(nonce)},
+    })
+    return bytes(Account.from_key(signer_key).sign_message(msg).signature)
+
+
+def register_bound(w3: Web3, contract, agent: str, peer_id: bytes, *,
+                   owner: Optional[str] = None, parent: str = ZERO,
+                   gas: int = 500_000):
+    """registerAgentBound for an eth_tester account. ``owner`` defaults to the
+    agent itself (self-owned). Returns the receipt."""
+    owner = agent if owner is None else owner
+    sig = sign_owner_binding(w3, contract.address, account_key(w3, owner),
+                             agent, parent)
+    tx = contract.functions.registerAgentBound(
+        peer_id, owner, parent, sig).transact({"from": agent, "gas": gas})
+    return w3.eth.wait_for_transaction_receipt(tx)

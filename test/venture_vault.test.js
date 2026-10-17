@@ -24,51 +24,12 @@ const {
   deploySubstrate,
   mintATN: _helperMintATN,
   fundATN: _helperFundATN,
+  registerAgent,
 } = require("./helpers");
 
-async function registerAgent(substrate, signer, lineage) {
-  return substrate
-    .connect(signer)
-    .registerAgent(digest(lineage), ethers.toUtf8Bytes("peer-" + lineage));
-}
-
-// EIP-712 OwnerBinding{agent, parent, nonce} signed by `owner` for Substrate.
-async function signBinding(substrate, ownerSigner, agent, parent, nonce) {
-  const net = await ethers.provider.getNetwork();
-  const domain = {
-    name: "AutonetSubstrate",
-    version: "1",
-    chainId: net.chainId,
-    verifyingContract: await substrate.getAddress(),
-  };
-  const types = {
-    OwnerBinding: [
-      { name: "agent", type: "address" },
-      { name: "parent", type: "address" },
-      { name: "nonce", type: "uint256" },
-    ],
-  };
-  if (nonce === undefined) nonce = await substrate.bindingNonce(agent);
-  return ownerSigner.signTypedData(domain, types, { agent, parent, nonce });
-}
-
 // Register `agentSigner` bound to `ownerWallet` (top-level).
-async function registerBound(substrate, agentSigner, ownerWallet, lineage) {
-  const sig = await signBinding(
-    substrate,
-    ownerWallet,
-    agentSigner.address,
-    ethers.ZeroAddress
-  );
-  await substrate
-    .connect(agentSigner)
-    .registerAgentBound(
-      digest(lineage),
-      ethers.toUtf8Bytes("peer-" + lineage),
-      ownerWallet.address,
-      ethers.ZeroAddress,
-      sig
-    );
+async function registerBound(substrate, agentSigner, ownerWallet, label) {
+  await registerAgent(substrate, agentSigner, label, ownerWallet);
 }
 
 // The single-leaf merkle leaf Substrate.recordTrainingForEpoch expects.
@@ -214,26 +175,8 @@ describe("VentureVault", function () {
       ).to.be.revertedWithCustomError(Vault, "AgentNotRegistered");
     });
 
-    it("reverts when the agent has no bound owner", async function () {
-      // faucet is registered but ownerless.
-      const Vault = await ethers.getContractFactory("VentureVault");
-      const now = await time.latest();
-      await expect(
-        Vault.deploy(
-          await substrate.getAddress(),
-          faucet.address,
-          digest("p"),
-          TERMS_BPS,
-          RAISE_MIN,
-          RAISE_MAX,
-          PLANNED_TRANCHES,
-          PERIOD,
-          QUORUM,
-          BigInt(now) + PERIOD,
-          ZERO
-        )
-      ).to.be.revertedWithCustomError(Vault, "AgentOwnerUnset");
-    });
+    // (No "agent has no bound owner" case: every registered agent is owner-bound
+    // now, so AgentOwnerUnset is unreachable for a registered agent.)
 
     it("reverts on bad terms / bounds / tranches / period / quorum / deadline", async function () {
       const Vault = await ethers.getContractFactory("VentureVault");
@@ -448,15 +391,8 @@ describe("VentureVault", function () {
       ).to.be.revertedWithCustomError(vault, "VerifierNotRegistered");
     });
 
-    it("ownerless verifier rejected (VerifierOwnerUnset)", async function () {
-      const vault = await deployVault();
-      await raised(vault);
-      // register a bare ownerless agent
-      await registerAgent(substrate, stranger, "ownerless-verifier");
-      await expect(
-        vault.connect(stranger).attestTrial(true, digest("x"))
-      ).to.be.revertedWithCustomError(vault, "VerifierOwnerUnset");
-    });
+    // (No "ownerless verifier" case: every registered agent is owner-bound
+    // now, so VerifierOwnerUnset can no longer be reached from a registered agent.)
 
     it("greenlight reverts below quorum; failTrials refunds after deadline", async function () {
       const vault = await deployVault();

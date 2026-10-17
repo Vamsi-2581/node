@@ -332,3 +332,61 @@ class TestVoiceStateOwnerMap:
 
         state = read_voice_state(addr, web3=w3)
         assert state["owner_map"].get(agent_addr.lower()) == owner_addr.lower()
+
+
+class TestParentSignedRegistration:
+    """The WS register path without owner_sig: the registered parent signs
+    the child's binding (atn.agent_tools.register_parent_signed)."""
+
+    @staticmethod
+    def _runtime(parent_def, parent_key):
+        agents = {parent_def.id: parent_def}
+        return SimpleNamespace(
+            get_agent=lambda aid: agents.get(aid),
+            registry=SimpleNamespace(get_agent_key=lambda aid: parent_key),
+        )
+
+    def test_parent_signs_child_into_household(self, fx):
+        from atn.agent_tools import register_parent_signed
+        w3, abi, addr, chain_id = fx["w3"], fx["abi"], fx["addr"], fx["chain_id"]
+        accounts = fx["accounts"]
+        keys = _tester_keys(w3)
+        owner_addr, parent_addr, child_addr = accounts[2], accounts[1], accounts[3]
+        svc = _svc_for(w3, abi, addr, chain_id)
+        contract = fx["contract"]
+
+        # Root parent registered under the owner wallet.
+        sig = _sign_binding(w3, addr, chain_id,
+                            Account.from_key(keys[owner_addr.lower()]),
+                            parent_addr, _ZERO, 0)
+        res = asyncio.run(svc.register_agent_bound(
+            identity=_identity(parent_addr), private_key=keys[parent_addr.lower()],
+            peer_id=b"peer-P", owner=owner_addr, owner_sig=sig))
+        assert res["success"], res
+
+        parent_def = SimpleNamespace(
+            id="parent", parent_id=None,
+            identity=SimpleNamespace(address=parent_addr, registered_on_chain=True))
+        child_def = SimpleNamespace(
+            id="child", parent_id="parent", identity=_identity(child_addr))
+        rt = self._runtime(parent_def, keys[parent_addr.lower()])
+
+        res = asyncio.run(register_parent_signed(
+            rt, svc, child_def, keys[child_addr.lower()], b"peer-C"))
+        assert res["success"], res
+        assert (contract.functions.agentOwner(child_addr).call().lower()
+                == owner_addr.lower())
+        assert (contract.functions.agentParent(child_addr).call().lower()
+                == parent_addr.lower())
+        assert contract.functions.isLive(child_addr).call()
+
+    def test_root_agent_without_signature_is_refused(self, fx):
+        from atn.agent_tools import register_parent_signed
+        w3, abi, addr, chain_id = fx["w3"], fx["abi"], fx["addr"], fx["chain_id"]
+        svc = _svc_for(w3, abi, addr, chain_id)
+        child_def = SimpleNamespace(
+            id="root", parent_id=None, identity=_identity(fx["accounts"][1]))
+        rt = SimpleNamespace(get_agent=lambda aid: None,
+                             registry=SimpleNamespace(get_agent_key=lambda a: ""))
+        res = asyncio.run(register_parent_signed(rt, svc, child_def, "0x00", b"p"))
+        assert res["success"] is False

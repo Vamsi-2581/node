@@ -5394,10 +5394,12 @@ class WebSocketBridge:
                          "in a moment.",
             }
 
-        # Owner-rooted path: an owner wallet signature (owner_sig) turns this
-        # into registerAgentBound, attributing the agent to the proven owner
-        # wallet + optional parent. Absent → plain ownerless registerAgent
-        # exactly as before. The contract verifies the signature on-chain.
+        # Every registration is owner-bound (docs/multi_jurisdiction.md
+        # decision 7). With the owner wallet's signature (owner_sig) the agent
+        # binds to that wallet + optional parent. Without one, the agent's
+        # registered parent signs the binding instead (same household); a root
+        # agent with no signature cannot register. The contract verifies the
+        # signature on-chain.
         if owner_sig:
             if not owner:
                 return {"success": False,
@@ -5411,11 +5413,9 @@ class WebSocketBridge:
                 parent=parent,
             )
         else:
-            result = await svc.register_agent(
-                identity=identity,
-                private_key=key,
-                peer_id=peer_id,
-            )
+            from .agent_tools import register_parent_signed
+            result = await register_parent_signed(
+                self.runtime, svc, agent_def, key, peer_id)
         if result.get("success"):
             identity.registered_on_chain = True
             identity.registration_tx = result.get("tx_hash")
