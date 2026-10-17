@@ -75,8 +75,25 @@ extension with exactly one slot).
       landed. Early reviews move the rating most and earn most, and late
       copies of a settled rating earn almost nothing.
     - Inaccurate reviewers lose part of their stake to the accurate ones.
-      No new ATN is minted for it.
-    - Stakes live on chain in ToolBond (trustless-contracts, dao's repo).
+      No new ATN is minted for it. Inside a round, stake settles by
+      accuracy alone; the novelty term (1 / (1 + M / REP supply), M = REP
+      mass already on the axis) scales only the mint share, where it does
+      not cancel out.
+    - Settlement is on chain in ToolBond (trustless-contracts, dao's repo).
+      ToolBond is the single source of ratings: every review is on chain,
+      batched per agent per epoch (one commit, one reveal). The close reads
+      per-tool, per-axis means and M from ToolBond pinned to the previous
+      anchor. Gossip reviews and the off-chain credibility number go away.
+    - Rounds follow epochs, with no REP threshold. Commits during the
+      epoch; one reveal window after it (DAO parameter, about a day). A
+      missed reveal forfeits the whole stake, so revealing always beats
+      withholding, whatever others revealed first. A round with no REP
+      weight leaves stakes withdrawable (pulled, never pushed).
+    - Malware: the side with more REP wins (accusers vs defenders, e.g. the
+      author rallying REP). Stake never decides it. The appeal path stays.
+    - A wrong review costs REP in proportion to how far off it was; REP is
+      the reputation, so no separate credibility. This applies to every
+      reviewer with REP, staked or not.
 11. **Out of scope for this sprint:** the harness add-on (own sprint),
     simultaneous multi-jurisdiction, cross-jurisdiction provenance or
     ratings.
