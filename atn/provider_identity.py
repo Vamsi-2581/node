@@ -35,6 +35,16 @@ TOOLLESS_PROVIDER_IDS = frozenset({"jev"})
 # picks". Only the budget-key migration below may reference it.
 LEGACY_DEFAULT_BUDGET_KEY = "claude_max"
 
+# An agent whose brain is an outside harness (a Claude Code or Codex session
+# driving the daemon over its WS port). The daemon holds its key, registers
+# and reviews for it, but never runs its loop, so it names no model.
+EXTERNAL_PROVIDER = "external"
+
+
+def is_external(defn: Any) -> bool:
+    """Is this agent driven from outside the daemon?"""
+    return getattr(defn, "provider", None) == EXTERNAL_PROVIDER
+
 
 def _usable(pid: str, has_api_key: Callable[[str], bool],
             custom: frozenset[str]) -> bool:
@@ -60,7 +70,7 @@ def routing_error(
     (``service_bound``) and the ``service`` provider. The seller declares the
     served model, so neither needs a model of its own.
     """
-    if service_bound:
+    if service_bound or provider == EXTERNAL_PROVIDER:
         return None
     custom = frozenset(custom_providers or ())
     if isinstance(provider, list):

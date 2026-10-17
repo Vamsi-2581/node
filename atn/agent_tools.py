@@ -2143,6 +2143,50 @@ async def _update_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
     return {"agent_id": agent_id, "status": "updated", "changed": changed}
 
 
+# What an external agent may call unless its creator says otherwise: the
+# tool library (probe, use, review), authoring, publishing, adoption
+# proposals and its own registration. Money beyond its own stakes stays out.
+EXTERNAL_DEFAULT_TOOLS = ["unified_tools", "toolsmith", "publishing",
+                          "adoption", "identity"]
+
+
+async def _create_external_agent(runtime: Runtime, input: dict[str, Any],
+                                 caller_id: str | None) -> dict[str, Any]:
+    """An agent driven by an outside harness (atn/external_agents.md). It
+    gets a key in the vault and an identity like any agent, but no model and
+    no loop: the harness acts as it by naming it as caller_id."""
+    from .provider_identity import EXTERNAL_PROVIDER
+    if input.get("prompt") or input.get("steps") or input.get("schedule"):
+        return {"error": "an external agent runs in its harness: no prompt, "
+                         "steps or schedule"}
+    agent_id = str(input.get("id") or "").strip()
+    if not agent_id:
+        agent_id = str(input.get("name") or "external").lower().replace(" ", "-")
+    if runtime.get_agent(agent_id) is not None:
+        return {"error": f"agent '{agent_id}' already exists"}
+    tools = input["tools"] if "tools" in input else list(EXTERNAL_DEFAULT_TOOLS)
+    parent_id = caller_id or None
+    defn = AgentDefinition(
+        id=agent_id,
+        name=input.get("name", "") or agent_id,
+        mode=AgentMode.COGNITIVE,
+        provider=EXTERNAL_PROVIDER,
+        tools=tools,
+        description=input.get("description", "") or str(input.get("harness") or ""),
+        parent_id=parent_id,
+        created_by=caller_id or "",
+        notify_parent=False,
+    )
+    try:
+        aid = await runtime.register_agent(defn)
+        save_agent(defn, runtime._config.agents_dir)
+    except Exception as exc:
+        return {"error": str(exc)}
+    ident = getattr(defn, "identity", None)
+    return {"agent_id": aid, "status": "registered", "external": True,
+            "address": getattr(ident, "address", "") or "", "tools": tools}
+
+
 async def _create_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
     log.info("create_agent input: %s", json.dumps(input, default=str)[:2000])
 
@@ -2156,6 +2200,10 @@ async def _create_agent(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
     default_mode = "pipeline" if input.get("steps") else "cognitive"
     mode_str = input.get("mode", default_mode)
     caller_id = input.pop("_caller_id", None)
+
+    from .provider_identity import EXTERNAL_PROVIDER
+    if input.get("provider") == EXTERNAL_PROVIDER:
+        return await _create_external_agent(runtime, input, caller_id)
 
     if mode_str == "cognitive":
         # --- Cognitive mode: autonomous LLM session ---
@@ -2847,9 +2895,29 @@ async def _use_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
         return {"error": "Missing required field: 'name'"}
     arguments = input.get("arguments", {})
     caller_id = input.get("_caller_id")
-    return await runtime.tool_registry.call_tool(
+    result = await runtime.tool_registry.call_tool(
         name, arguments, caller_id=caller_id,
     )
+    defn = runtime.get_agent(caller_id) if caller_id else None
+    from .provider_identity import is_external
+    if defn is not None and is_external(defn) and isinstance(result, dict):
+        # An external agent's harness gets no injected review turn; it is
+        # told instead which tools it has used since it last reviewed.
+        due = _review_due(runtime, caller_id)
+        tool = runtime.tool_registry.get_tool(name)
+        digest = getattr(tool, "digest", "") if tool is not None else ""
+        if digest and not result.get("error"):
+            due[digest] = name
+        if due:
+            result = {**result, "review_due": sorted(set(due.values()))}
+    return result
+
+
+def _review_due(runtime: Runtime, agent_id: str) -> dict[str, str]:
+    """digest -> tool name an external agent used and has not reviewed since
+    (in memory: a restart forgets it, which costs only the reminder)."""
+    book = runtime.__dict__.setdefault("_external_review_due", {})
+    return book.setdefault(agent_id, {})
 
 
 async def _register_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
@@ -3163,6 +3231,14 @@ async def _attest_tools(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
     reviews = [r for r in (result.pop("_reviews", None) or [])]
     if reviews:
         result["reviews"] = await _queue_staked_reviews(runtime, caller_id, reviews)
+    if caller_id and caller != OWNER_AUTHOR:
+        due = runtime.__dict__.get("_external_review_due", {}).get(caller_id)
+        if due:
+            for j in judgments:
+                rec = runtime.tool_store.resolve(str((j or {}).get("tool") or ""))
+                if rec is not None:
+                    due.pop(getattr(rec, "digest", ""), None)
+            result["review_due"] = sorted(set(due.values()))
     return result
 
 

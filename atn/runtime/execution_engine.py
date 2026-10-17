@@ -120,6 +120,11 @@ class ExecutionEngine:
         self.registry._require_agent(agent_id)
         defn = self.registry._agents[agent_id]
 
+        # An external agent's loop runs in its harness, never here.
+        from ..provider_identity import is_external
+        if is_external(defn):
+            return None
+
         # Check if agent is budget-paused
         status = self.registry._status.get(agent_id)
         if status == AgentStatus.BUDGET_PAUSED:

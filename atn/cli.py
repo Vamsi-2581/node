@@ -942,8 +942,56 @@ async def _update_poll_loop(runtime: Runtime, config: ATNConfig) -> None:
             slept += 60
 
 
+def _send_main(argv: list[str]) -> int:
+    """`atn send '<json>' [--url ws://...]`: send one message to the running
+    daemon, print its reply, exit 0 if ok. For harnesses that would rather
+    not write a WebSocket client (atn/external_agents.md)."""
+    import json as _json
+    import uuid as _uuid
+
+    url = "ws://127.0.0.1:7700"
+    if "--url" in argv:
+        i = argv.index("--url")
+        url = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    if len(argv) != 1:
+        sys.stderr.write("usage: atn send '<json message>' [--url ws://...]\n")
+        return 2
+    try:
+        msg = _json.loads(argv[0])
+    except ValueError as exc:
+        sys.stderr.write(f"not JSON: {exc}\n")
+        return 2
+    msg.setdefault("msg_id", _uuid.uuid4().hex)
+
+    async def _go() -> dict:
+        import websockets
+        async with websockets.connect(url, max_size=None) as ws:
+            await ws.send(_json.dumps(msg))
+            while True:
+                reply = _json.loads(await ws.recv())
+                if isinstance(reply, dict) and reply.get("msg_id") == msg["msg_id"]:
+                    return reply
+
+    try:
+        reply = asyncio.run(asyncio.wait_for(_go(), 600))
+    except OSError as exc:
+        sys.stderr.write(f"no daemon at {url}: {exc}\n")
+        return 3
+    sys.stdout.write(_json.dumps(reply, indent=1, default=str) + "\n")
+    return 0 if reply.get("ok") else 1
+
+
 def main() -> None:
     # Offline subcommands: run and exit without booting the daemon.
+    if len(sys.argv) > 1 and sys.argv[1] == "guide":
+        # How an outside harness (Claude Code, Codex) drives this daemon.
+        from pathlib import Path
+        sys.stdout.write((Path(__file__).parent / "external_agents.md")
+                         .read_text(encoding="utf-8"))
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "send":
+        sys.exit(_send_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "integration-token":
         from .integration_token_cli import main as _token_main
         sys.exit(_token_main(sys.argv[2:]))

@@ -3126,10 +3126,12 @@ class WebSocketBridge:
             owner = msg.get("owner", "")
             parent = msg.get("parent", "")
             owner_sig = msg.get("owner_sig", "")
+            self_owned = bool(msg.get("self_owned", False))
             if not agent_id:
                 return {"msg_id": msg_id, "ok": False, "error": "Missing 'agent_id'"}
             try:
                 result = await self._handle_register_on_chain(
+                    self_owned=self_owned,
                     agent_id=agent_id,
                     is_root=is_root,
                     private_key=private_key,
@@ -5341,6 +5343,7 @@ class WebSocketBridge:
         owner: str = "",
         parent: str = "",
         owner_sig: str = "",
+        self_owned: bool = False,
     ) -> dict[str, Any]:
         """Handle agent registration on the RPB contract.
 
@@ -5455,6 +5458,18 @@ class WebSocketBridge:
         # registered parent signs the binding instead (same household); a root
         # agent with no signature cannot register. The contract verifies the
         # signature on-chain.
+        if self_owned and not owner_sig:
+            # The daemon's own owner key signs (atn/external_agents.md): a
+            # signature is all the contract needs, whoever holds the key.
+            try:
+                owner_key = self.runtime.registry.local_owner_key()
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+            from eth_account import Account
+            owner = Account.from_key(owner_key).address
+            parent = ""
+            nonce = await svc.binding_nonce(identity.address)
+            owner_sig = svc.sign_binding(owner_key, identity.address, "", nonce)
         if owner_sig:
             if not owner:
                 return {"success": False,

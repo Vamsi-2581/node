@@ -863,6 +863,28 @@ class AgentRegistry:
             })
         return ads
 
+    LOCAL_OWNER_SECRET = "owner-key.local"
+
+    def local_owner_key(self) -> str:
+        """The daemon's own owner wallet key, made on first use and kept in
+        the vault. Self-owned agents (external harness sessions, or any agent
+        with no human wallet) bind to it, so every one on this daemon is one
+        household. The owner can later move them to a wallet of their own
+        with rotateOwner."""
+        ks = self._keystore()
+        if ks is None:
+            raise RuntimeError("vault unavailable; cannot hold an owner key")
+        try:
+            key = ks.get_secret(self.LOCAL_OWNER_SECRET)
+        except Exception:
+            key = None
+        if key:
+            return key
+        from eth_account import Account
+        key = "0x" + Account.create().key.hex().removeprefix("0x")
+        ks.put_secret(self.LOCAL_OWNER_SECRET, key)
+        return key
+
     def get_agent_key(self, agent_id: str) -> str | None:
         """Get the private key for an agent (parent holds child's key)."""
         return self._agent_keys.get(agent_id)

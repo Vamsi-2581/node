@@ -645,6 +645,30 @@ async def amain() -> int:
         check(sub_a.functions.getAgentParent(addrs["child"]).call() == addrs["root"],
               "child's parent link = root")
 
+        # External agents (atn/external_agents.md): a harness session creates
+        # its agent over WS and registers it self-owned; the daemon's own
+        # owner key signs, and every self-owned agent shares that household.
+        from atn.ws_server import WebSocketBridge
+        WebSocketBridge._read_libp2p_peer_id = staticmethod(lambda _a: "12D3KooWExtAgentPeer")
+        ext_owner = ""
+        for eid in ("ext1", "ext2"):
+            cr = await ws_call(rt, {"type": "create_agent", "id": eid,
+                                    "provider": "external", "harness": "e2e"})
+            check(cr.get("ok") and cr["result"].get("external"),
+                  f"{eid}: external agent created: {cr.get('error', '')}")
+            addrs[eid] = Web3.to_checksum_address(cr["result"]["address"])
+            fund_eth(w3, addrs[eid])
+            rg = await ws_call(rt, {"type": "register_agent_on_chain",
+                                    "agent_id": eid, "self_owned": True})
+            check(rg.get("ok") is True,
+                  f"{eid}: self-owned registration: {rg.get('error') or rg.get('result', {}).get('error', '')}")
+            check(sub_a.functions.isLive(addrs[eid]).call(), f"A: isLive({eid})")
+            o = sub_a.functions.getAgentOwner(addrs[eid]).call()
+            ext_owner = ext_owner or o
+            check(o == ext_owner and o != owner,
+                  f"{eid}: bound to the daemon's own owner key ({o})")
+        check(await rt.trigger_run("ext1") is None, "the daemon never runs an external agent")
+
         # An authored tool (stays usable everywhere).
         reg = await execute_tool("register_tool", {
             "name": "upper_case", "description": "Upper-cases a string.",

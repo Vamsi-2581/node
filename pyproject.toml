@@ -146,7 +146,7 @@ include = ["atn*", "nodes*", "bridge", "world_model*"]
 # The network registry (chain addresses + public RPC), pinned per release.
 # Copy of the repo-root registry.json of record; a test keeps them identical.
 # Read when the daemon joins the network, never fetched at boot.
-"atn" = ["registry.json"]
+"atn" = ["registry.json", "external_agents.md"]
 "atn.connectors" = ["*/connector.json"]
 # The bundled Chrome extension Browser Control loads with --load-extension.
 # Keyed on the child package: package-data patterns resolve relative to the
