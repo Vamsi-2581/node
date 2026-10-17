@@ -14,7 +14,10 @@ penalty, so revealing always beats withholding.
 
 This module is the daemon's half: encoding, the commitment (computed locally,
 identical to ToolBond.commitmentOf), a per-agent per-epoch batch store, and
-the chain calls. Wiring it into the review step and the close is separate.
+the chain calls. The review step queues entries (``queue_reviews``, called
+from attest_tools and vet_tool in atn/agent_tools.py), atn/review_driver.py
+commits, reveals, finalizes and claims, and the close reads the settled
+ratings from ToolBond's logs (nodes/common/voice_state.py).
 """
 from __future__ import annotations
 
@@ -49,8 +52,41 @@ def _fn(name: str, inputs: list, outputs: list = (), mutability: str = "nonpayab
             "outputs": [{"name": n, "type": t} for n, t in outputs]}
 
 
+REVIEW_TUPLE = [
+    ("reviewer", "address"), ("harm", "uint8"), ("claimed", "bool"),
+    ("accuracy", "uint64"), ("scores", "bytes16"), ("stake", "uint128"),
+    ("weight", "uint128"), ("harmAccuracy", "uint64"),
+]
+
+
+def _review_fn(name: str, inputs: list) -> dict[str, Any]:
+    return {"name": name, "type": "function", "stateMutability": "view",
+            "inputs": [{"name": n, "type": t} for n, t in inputs],
+            "outputs": [{"name": "", "type": "tuple", "components": [
+                {"name": n, "type": t} for n, t in REVIEW_TUPLE]}]}
+
+
+# ToolBond.Stage
+STAGE_NONE, STAGE_OPEN, STAGE_COOLING, STAGE_FINALIZING, STAGE_DONE = range(5)
+STAGES = ("none", "open", "cooling", "finalizing", "done")
+# Review.accuracy when nothing could be scored (refunded, no gain or loss).
+UNINFORMATIVE = 2 ** 64 - 1
+
 TOOL_BOND_REVIEW_ABI = [
     _fn("currentEpoch", [], [("", "uint256")], "view"),
+    _fn("epochInfo", [("epoch", "uint256")],
+        [("started", "bool"), ("charterHash", "bytes32"), ("axisIds", "bytes32[]"),
+         ("snapshot", "uint48"), ("supply", "uint256"), ("revealDeadline", "uint256")], "view"),
+    _fn("getRound", [("digest", "bytes32"), ("epoch", "uint256")],
+        [("stage", "uint8"), ("overruled", "bool"), ("appealEnds", "uint48"),
+         ("weight", "uint256"), ("harmSum", "uint256"), ("harmMass", "uint256"),
+         ("settledHarm", "uint256"), ("stakes", "uint256"), ("reviewCount", "uint256")], "view"),
+    _fn("roundAxis", [("digest", "bytes32"), ("epoch", "uint256"), ("i", "uint256")],
+        [("sum", "int256"), ("mass", "uint256")], "view"),
+    _review_fn("reviewAt", [("digest", "bytes32"), ("epoch", "uint256"), ("i", "uint256")]),
+    _review_fn("reviewOf", [("digest", "bytes32"), ("epoch", "uint256"), ("reviewer", "address")]),
+    _fn("isBonded", [("digest", "bytes32")], [("", "bool")], "view"),
+    _fn("reviewerShareBps", [], [("", "uint256")], "view"),
     _fn("revealEnds", [("epoch", "uint256")], [("", "uint256")], "view"),
     _fn("commits", [("", "uint256"), ("", "address")],
         [("commitment", "bytes32"), ("stake", "uint128"), ("weight", "uint128"),
@@ -146,6 +182,16 @@ class EpochBatch:
     commitment: str = ""             # hex, set at commit
     committed_tx: str = ""
     revealed_tx: str = ""
+    # Driver bookkeeping (atn/review_driver.py): "" pending, "committing"
+    # (salt on disk, commit tx not confirmed), "committed", "revealed",
+    # "settled" (every round claimed or nothing left to do), "forfeited"
+    # (the reveal window closed unrevealed), "rolled" (reviews moved to a
+    # later epoch because this one was anchored before a commit).
+    status: str = ""
+    # digest -> the round state this agent last saw: "open", "cooling",
+    # "finalizing", "done", "claimed", or "none" (the review did not count).
+    rounds: dict[str, str] = field(default_factory=dict)
+    last_error: str = ""
 
     @property
     def total_stake(self) -> int:
@@ -181,7 +227,10 @@ class ReviewBatchStore:
                           reviews=[ReviewEntry(**r) for r in d.get("reviews", [])],
                           salt=d.get("salt", ""), commitment=d.get("commitment", ""),
                           committed_tx=d.get("committed_tx", ""),
-                          revealed_tx=d.get("revealed_tx", ""))
+                          revealed_tx=d.get("revealed_tx", ""),
+                          status=d.get("status", ""),
+                          rounds=dict(d.get("rounds") or {}),
+                          last_error=d.get("last_error", ""))
 
     def save(self, batch: EpochBatch) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -202,16 +251,23 @@ class ReviewBatchStore:
         self.save(batch)
         return batch
 
-    def unrevealed(self) -> list[EpochBatch]:
-        """Committed batches not yet revealed (oldest first)."""
+    def all(self) -> list[EpochBatch]:
+        """Every stored batch, oldest epoch first."""
         out = []
         if not self._dir.is_dir():
             return out
         for p in sorted(self._dir.glob("*.json")):
-            d = json.loads(p.read_text(encoding="utf-8"))
-            if d.get("commitment") and not d.get("revealed_tx"):
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
                 out.append(self.load(d["agent"], d["epoch"], d["axis_ids"]))
-        return sorted(out, key=lambda b: b.epoch)
+            except (OSError, ValueError, KeyError) as exc:
+                log.warning("unreadable review batch %s: %s", p.name, exc)
+        return sorted(out, key=lambda b: (b.epoch, b.agent.lower()))
+
+    def unrevealed(self) -> list[EpochBatch]:
+        """Committed batches not yet revealed (oldest first)."""
+        return [b for b in self.all()
+                if b.commitment and not b.revealed_tx and b.status != "forfeited"]
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +320,44 @@ class ReviewBondClient:
     async def reveal_ends(self, epoch: int) -> Optional[int]:
         return await self._read(lambda b, s: int(b.functions.revealEnds(int(epoch)).call()))
 
+    async def chain_time(self) -> Optional[int]:
+        """The latest block's timestamp: the clock ToolBond's windows use."""
+        def run():
+            return int(self._base._w3().eth.get_block("latest")["timestamp"])
+        try:
+            return await asyncio.to_thread(run)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("chain time read failed: %s", exc)
+            return None
+
+    async def commit_of(self, epoch: int, agent: str) -> Optional[dict[str, Any]]:
+        def fn(b, s):
+            from web3 import Web3
+            c, stake, weight, revealed, forfeited = b.functions.commits(
+                int(epoch), Web3.to_checksum_address(agent)).call()
+            return {"commitment": c.hex(), "stake": int(stake), "weight": int(weight),
+                    "revealed": bool(revealed), "forfeited": bool(forfeited)}
+        return await self._read(fn)
+
+    async def round_of(self, digest: str, epoch: int) -> Optional[dict[str, Any]]:
+        def fn(b, s):
+            r = b.functions.getRound(_b32(digest), int(epoch)).call()
+            return {"stage": int(r[0]), "overruled": bool(r[1]), "appeal_ends": int(r[2]),
+                    "weight": int(r[3]), "harm_sum": int(r[4]), "harm_mass": int(r[5]),
+                    "settled_harm": int(r[6]), "stakes": int(r[7]), "reviews": int(r[8])}
+        return await self._read(fn)
+
+    async def review_of(self, digest: str, epoch: int,
+                        reviewer: str) -> Optional[dict[str, Any]]:
+        def fn(b, s):
+            from web3 import Web3
+            v = b.functions.reviewOf(_b32(digest), int(epoch),
+                                     Web3.to_checksum_address(reviewer)).call()
+            return {"reviewer": v[0], "harm": int(v[1]), "claimed": bool(v[2]),
+                    "accuracy": int(v[3]), "stake": int(v[5]), "weight": int(v[6]),
+                    "harm_accuracy": int(v[7])}
+        return await self._read(fn)
+
     async def commit(self, private_key: str, batch: EpochBatch) -> dict[str, Any]:
         """Seal and commit ``batch`` (approving its stake first). The salt is
         fresh per batch; the caller saves the batch so the reveal survives a
@@ -285,7 +379,8 @@ class ReviewBondClient:
                     b.address, int(stake)))
                 if not res.get("success"):
                     return {**res, "step": "approve"}
-        res = await self._write(private_key, lambda b, s, a: b.functions.commit(c, int(stake)))
+        res = await self._write(private_key, lambda b, s, a: b.functions.commit(c, int(stake)),
+                                gas_floor=400_000)
         if res.get("success"):
             batch.committed_tx = res["tx_hash"]
         return res
@@ -312,3 +407,127 @@ class ReviewBondClient:
                     reviewer: str) -> dict[str, Any]:
         return await self._write(private_key, lambda b, s, a: b.functions.claim(
             _b32(digest), int(epoch), reviewer))
+
+
+# ---------------------------------------------------------------------------
+# Queueing from the review step
+# ---------------------------------------------------------------------------
+
+def store_for(runtime: Any) -> ReviewBatchStore:
+    """The runtime's batch store: root = its data dir, keyed by its
+    jurisdiction (tests pre-set ``review_batch_store``)."""
+    store = getattr(runtime, "review_batch_store", None)
+    if isinstance(store, ReviewBatchStore):
+        return store
+    jurisdiction = ""
+    try:
+        jurisdiction = str(getattr(runtime, "jurisdiction", "") or "")
+    except Exception:  # noqa: BLE001
+        jurisdiction = ""
+    store = ReviewBatchStore(Path(runtime._config.data_dir), jurisdiction)
+    try:
+        setattr(runtime, "review_batch_store", store)
+    except Exception:  # noqa: BLE001
+        pass
+    return store
+
+
+def client_for(runtime: Any) -> Any:
+    """The runtime's review client (tests pre-set ``review_bond_client``)."""
+    client = getattr(runtime, "review_bond_client", None)
+    return client if client is not None else ReviewBondClient(runtime)
+
+
+def normalize_review(raw: dict[str, Any], axis_ids: list[str]) -> Optional[ReviewEntry]:
+    """A review step's {digest, axes?, harm?, stake?, evidence_hash?} as a
+    ReviewEntry, or None when it carries nothing ToolBond can settle (no
+    charter axis scored and no harm). Axes outside the charter are dropped;
+    scores clamp to [-1, 1], harm to [0, 1], stake to a non-negative int."""
+    axes: dict[str, float] = {}
+    for axis_id, value in (raw.get("axes") or {}).items():
+        if str(axis_id) not in axis_ids or isinstance(value, bool):
+            continue
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            continue
+        if v == v:
+            axes[str(axis_id)] = max(-1.0, min(1.0, v))
+    harm: Optional[float] = None
+    raw_harm = raw.get("harm")
+    if raw_harm is not None and not isinstance(raw_harm, bool):
+        try:
+            h = float(raw_harm)
+            if h == h:
+                harm = max(0.0, min(1.0, h))
+        except (TypeError, ValueError):
+            harm = None
+    if not axes and harm is None:
+        return None
+    stake = 0
+    try:
+        stake = max(0, int(raw.get("stake") or 0))
+    except (TypeError, ValueError):
+        stake = 0
+    evidence = str(raw.get("evidence_hash") or "").lower().removeprefix("0x")
+    if len(evidence) != 64 or any(c not in "0123456789abcdef" for c in evidence):
+        evidence = "00" * 32
+    return ReviewEntry(digest=str(raw["digest"]).lower().removeprefix("0x"),
+                       axes=dict(sorted(axes.items())), harm=harm, stake=stake,
+                       evidence_hash=evidence)
+
+
+async def queue_reviews(runtime: Any, agent_id: str,
+                        reviews: list[dict[str, Any]]) -> dict[str, Any]:
+    """Queue the reviewing agent's reviews into its batch for ToolBond's
+    current epoch. Never raises; returns {queued, epoch, skipped, note}.
+    Each review is {digest, axes?, harm?, stake?, evidence_hash?, author?};
+    ``author`` (the manifest author) lets the agent's own tools be skipped.
+
+    The agent must be registered on chain with a daemon-held key (the batch
+    is committed with its key), and ToolBond must be reachable to read the
+    epoch. Reviews carrying no charter axis score and no harm are skipped:
+    ToolBond would refund them as uninformative."""
+    from nodes.common.world_model_substrate.charter import active_charter
+
+    out: dict[str, Any] = {"queued": 0, "epoch": None, "skipped": []}
+    if not reviews:
+        return out
+    defn = runtime.get_agent(agent_id) if agent_id else None
+    identity = getattr(defn, "identity", None) if defn else None
+    address = str(getattr(identity, "address", "") or "")
+    if not address or not getattr(identity, "registered_on_chain", False):
+        out["note"] = ("reviews go on chain from a registered agent; this "
+                       "caller is not registered, so nothing was queued")
+        return out
+    client = client_for(runtime)
+    if not client.available():
+        out["note"] = "no ToolBond configured; reviews were not queued"
+        return out
+    epoch = await client.current_epoch()
+    if epoch is None:
+        out["note"] = "ToolBond unreachable; reviews were not queued"
+        return out
+    axis_ids = list(active_charter().ids)
+    store = store_for(runtime)
+    batch = None
+    for raw in reviews:
+        if str(raw.get("author") or "").lower() == address.lower():
+            # ToolBond never counts an author's review of their own tool;
+            # queueing it would only lock the stake until the reveal.
+            out["skipped"].append({"digest": raw.get("digest"),
+                                   "error": "you cannot review your own tool"})
+            continue
+        try:
+            entry = normalize_review(raw, axis_ids)
+        except Exception as exc:  # noqa: BLE001
+            out["skipped"].append({"digest": raw.get("digest"), "error": str(exc)})
+            continue
+        if entry is None:
+            out["skipped"].append({"digest": raw.get("digest"),
+                                   "error": "no charter axis or harm scored"})
+            continue
+        batch = store.add(address, int(epoch), axis_ids, entry)
+        out["queued"] += 1
+    out["epoch"] = int(batch.epoch) if batch is not None else int(epoch)
+    return out

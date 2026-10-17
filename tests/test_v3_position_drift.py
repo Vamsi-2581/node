@@ -1,18 +1,16 @@
-"""v3 position drift (docs/tool_substrate.md, Decision 2026-07-08).
+"""Tool positions (docs/multi_jurisdiction.md decision 10, replacing the
+v3 gossip-review drift of Decision 2026-07-08).
 
-A tool's charter head is the per-axis mint-weighted running centroid of
-review scores: prior = zero head with 1.0 damped unit of mass per axis;
-`head' = (mass·head + Σ w·mean) / (mass + Σ w)` with w = log1p(caller's
-axis review count), same exclusions as the usage damper. Covers: entry,
-drift math, partial-axis safety, copy-through, cross-epoch continuity,
-exclusions, world application (claim anchors + observation coords), and
-bit-identical replay.
+A tool's charter head is its ToolBond rating pinned to the previous anchor:
+per axis the REP-weighted mean (sum / mass / 100), mass = REP mass / REP
+supply. Gossiped review axes no longer move it. Covers: entry, ratings in,
+gossip axes ignored, world application (claim anchors + observation coords),
+and bit-identical replay through the close.
 """
 
 from __future__ import annotations
 
 import json
-import math
 from typing import Any, Dict, List
 
 import pytest
@@ -90,89 +88,50 @@ def _world_with_registration():
 REGS = {DIGEST: {"trust_class": "pinned", "author": AUTHOR}}
 
 
-class TestDriftMath:
-    def test_new_tool_enters_at_neutral_prior(self):
+SUPPLY = 1000
+
+
+def _snap(sum_: int, mass: int, axis: str = "correctness") -> Dict[str, Any]:
+    return {"supply": SUPPLY, "tools": {DIGEST: {
+        "axes": {axis: {"sum": sum_, "mass": mass}}, "harm": {"sum": 0, "mass": 0}}}}
+
+
+class TestPositionsFromRatings:
+    def test_new_tool_enters_at_zero(self):
         world = _world_with_registration()
         out = compute_tool_mint(world, [], registrations=REGS)
         pos = out["positions_next"][DIGEST]
         assert pos["head"] == [0.0] * N_DIMS
-        assert pos["mass"] == [1.0] * N_DIMS
+        assert pos["mass"] == [0.0] * N_DIMS
 
-    def test_single_review_drifts_scored_axis_only(self):
+    def test_rating_sets_scored_axis_only(self):
         world = _world_with_registration()
-        out = compute_tool_mint(
-            world,
-            [_receipt(1, "caller-1", axes={"correctness": 0.8})],
-            registrations=REGS,
-        )
+        out = compute_tool_mint(world, [], registrations=REGS,
+                                review_snapshot=_snap(80 * 300, 300))
         pos = out["positions_next"][DIGEST]
-        w = math.log1p(1)
         # correctness is axis_index 4 (adapter CHARTER order).
-        expected = (1.0 * 0.0 + w * 0.8) / (1.0 + w)
-        assert pos["head"][4] == pytest.approx(expected, abs=1e-9)
-        assert pos["mass"][4] == pytest.approx(1.0 + w, abs=1e-9)
-        # Unscored axes untouched (partial scoring is safe).
+        assert pos["head"][4] == pytest.approx(0.8)
+        assert pos["mass"][4] == pytest.approx(0.3)
         for i in range(N_DIMS):
-            if i == 4:
-                continue
-            assert pos["head"][i] == 0.0
-            assert pos["mass"][i] == 1.0
+            if i != 4:
+                assert pos["head"][i] == 0.0 and pos["mass"][i] == 0.0
 
-    def test_heavily_reviewed_tool_has_inertia(self):
+    def test_gossip_review_axes_do_not_drift(self):
         world = _world_with_registration()
-        carried = {DIGEST: {"head": [0, 0, 0, 0, 0.9, 0],
-                            "mass": [1, 1, 1, 1, 100.0, 1]}}
         out = compute_tool_mint(
-            world,
-            [_receipt(1, "caller-1", axes={"correctness": -1.0})],
-            registrations=REGS, positions=carried,
-        )
-        head = out["positions_next"][DIGEST]["head"]
-        # One negative review barely moves 100 units of accumulated mass.
-        assert head[4] > 0.85
+            world, [_receipt(1, "caller-1", axes={"correctness": 0.8})],
+            registrations=REGS)
+        assert out["positions_next"][DIGEST]["head"] == [0.0] * N_DIMS
 
-    def test_copy_through_without_reviews(self):
+    def test_carried_head_is_replaced_by_the_rating(self):
         world = _world_with_registration()
         carried = {DIGEST: {"head": [0.1] * N_DIMS, "mass": [5.0] * N_DIMS}}
-        out = compute_tool_mint(
-            world, [_receipt(1, "caller-1")],   # usage, no axes
-            registrations=REGS, positions=carried,
-        )
+        out = compute_tool_mint(world, [_receipt(1, "caller-1")],
+                                registrations=REGS, positions=carried,
+                                review_snapshot=_snap(-40 * 10, 10))
         pos = out["positions_next"][DIGEST]
-        assert pos["head"] == [0.1] * N_DIMS
-        assert pos["mass"] == [5.0] * N_DIMS
-
-    def test_author_and_same_owner_reviews_excluded(self):
-        world = _world_with_registration()
-        out = compute_tool_mint(
-            world,
-            [
-                _receipt(1, AUTHOR, axes={"correctness": 1.0}),
-                _receipt(2, "sibling", axes={"correctness": 1.0}),
-            ],
-            registrations=REGS,
-            agent_owner_map={AUTHOR: "0xOwner", "sibling": "0xOwner"},
-        )
-        pos = out["positions_next"][DIGEST]
-        assert pos["head"] == [0.0] * N_DIMS   # nothing counted
-
-    def test_cross_epoch_continuity(self):
-        world = _world_with_registration()
-        out1 = compute_tool_mint(
-            world, [_receipt(1, "caller-1", axes={"correctness": 0.8})],
-            registrations=REGS,
-        )
-        out2 = compute_tool_mint(
-            world, [_receipt(1, "caller-2", axes={"correctness": -0.4})],
-            registrations=REGS,
-            positions=out1["positions_next"],
-        )
-        w = math.log1p(1)
-        h1 = (w * 0.8) / (1.0 + w)
-        m1 = 1.0 + w
-        expected = (m1 * h1 + w * -0.4) / (m1 + w)
-        assert out2["positions_next"][DIGEST]["head"][4] == pytest.approx(
-            expected, abs=1e-8)
+        assert pos["head"][4] == pytest.approx(-0.4)
+        assert pos["head"][0] == 0.0
 
 
 class TestWorldApplication:
@@ -241,32 +200,30 @@ class TestCloseIntegration:
 
     def test_close_returns_and_replays_positions(self):
         batches = self._standard()
+        snap = _snap(90 * 50, 50)
         r1 = federated_epoch_close(canonical_order(list(batches)),
-                                   embedding_dim=EMBED_DIM)
+                                   embedding_dim=EMBED_DIM, review_snapshot=snap)
         r2 = federated_epoch_close(canonical_order(list(batches)),
-                                   embedding_dim=EMBED_DIM)
+                                   embedding_dim=EMBED_DIM, review_snapshot=snap)
         assert DIGEST in r1["tool_positions"]
-        assert r1["tool_positions"][DIGEST]["head"][4] > 0.0
+        assert r1["tool_positions"][DIGEST]["head"][4] == pytest.approx(0.9)
         assert json.dumps(r1["tool_positions"]) == json.dumps(
             r2["tool_positions"])
 
-    def test_carry_threads_across_closes(self):
+    def test_next_close_reads_the_next_snapshot(self):
         batches = self._standard()
         r1 = federated_epoch_close(canonical_order(list(batches)),
-                                   embedding_dim=EMBED_DIM)
-        # Epoch 2: registration carried, one more review.
+                                   embedding_dim=EMBED_DIM,
+                                   review_snapshot=_snap(90 * 50, 50))
         kp_c = Keypair.generate()
-        b2 = self._batches(
-            [_receipt(1, "caller-2", axes={"correctness": -0.9})], kp_c)
+        b2 = self._batches([_receipt(1, "caller-2")], kp_c)
+        # A later round finalized: the rating on chain moved.
         r2 = federated_epoch_close(
             canonical_order(b2),
             embedding_dim=EMBED_DIM,
             tool_registrations=r1["tool_registrations"],
             tool_positions=r1["tool_positions"],
+            review_snapshot=_snap(90 * 50 - 90 * 50, 100),
         )
-        h1 = r1["tool_positions"][DIGEST]["head"][4]
-        h2 = r2["tool_positions"][DIGEST]["head"][4]
-        assert h2 < h1                       # dragged down by the -0.9
-        m1 = r1["tool_positions"][DIGEST]["mass"][4]
-        m2 = r2["tool_positions"][DIGEST]["mass"][4]
-        assert m2 == pytest.approx(m1 + math.log1p(1), abs=1e-8)
+        assert r2["tool_positions"][DIGEST]["head"][4] == 0.0
+        assert r2["tool_positions"][DIGEST]["mass"][4] == pytest.approx(0.1)

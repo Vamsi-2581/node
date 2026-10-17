@@ -877,8 +877,6 @@ class AutonetService:
         tool_regs_path = None
         tool_vetting_path = None
         tool_positions_path = None
-        tool_credibility_path = None
-        tool_review_book_path = None
         try:
             state_dir = getattr(
                 getattr(self._world_service, "_persistence", None), "_dir", None,
@@ -886,21 +884,16 @@ class AutonetService:
             if state_dir is not None:
                 tool_regs_path = state_dir / "tool_registrations.json"
                 tool_vetting_path = state_dir / "tool_vetting.json"
-                # v4.1 carry-over: position centroids, reviewer
-                # credibility and the review book are close INPUTS. A
-                # daemon that restarts without them closes against an
+                # Positions carry the own_share estimates, a close INPUT.
+                # A daemon that restarts without them closes against an
                 # empty prior while its peers carry the accumulated one
-                # — a deterministic fork. Same rebuildable-cache
-                # contract as the registration map above.
+                # (a deterministic fork). Same rebuildable-cache contract
+                # as the registration map above.
                 tool_positions_path = state_dir / "tool_positions.json"
-                tool_credibility_path = state_dir / "tool_credibility.json"
-                tool_review_book_path = state_dir / "tool_review_book.json"
         except Exception:
             tool_regs_path = None
             tool_vetting_path = None
             tool_positions_path = None
-            tool_credibility_path = None
-            tool_review_book_path = None
         self._federated_close_driver = FederatedCloseDriver(
             gossip=self._event_gossip,
             embedding_dim=embedding_dim,
@@ -909,8 +902,6 @@ class AutonetService:
             tool_registrations_path=tool_regs_path,
             tool_vetting_path=tool_vetting_path,
             tool_positions_path=tool_positions_path,
-            tool_credibility_path=tool_credibility_path,
-            tool_review_book_path=tool_review_book_path,
         )
         # Refuse (log + skip) any close this daemon can't compute
         # identically to its peers: no chain read access below, or no
@@ -942,8 +933,8 @@ class AutonetService:
             # REP (voice) now lives DAO-side in RepToken (Decision
             # 2026-07-10). Empty => genesis regime: fees-only pool, no rep.
             rep_token_addr = getattr(bc, "rep_token_address", "") or ""
-            # ToolBond (Decision 2026-10-13): vetted tools' auditors share
-            # their mint; read pinned on the same snapshot as the voices.
+            # ToolBond (docs/multi_jurisdiction.md decision 10): ratings
+            # and the reviewer share, pinned on the same snapshot.
             tool_bond_addr = getattr(bc, "tool_bond_address", "") or ""
             # DAO Registry: the charter in force, pinned to the same anchor
             # (docs/multi_jurisdiction.md decision 5).

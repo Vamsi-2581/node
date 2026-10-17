@@ -328,11 +328,10 @@ class WorldService:
         self._tool_positions: Dict[str, Dict[str, Any]] = {}
         # True once a FEDERATED close has handed us its authoritative
         # positions. The local projection computes its own positions with
-        # NO rep_shares / credibility (every household, sybil included,
-        # gets full drift weight), so once the real thing is available the
-        # projection must stop overwriting the world's coords — otherwise
-        # library ranking silently contradicts the v4.1 sybil defense
-        # ("zero-reputation reviews move nothing"). A daemon with no peers
+        # NO ToolBond review snapshot (every tool sits at the zero head),
+        # so once the real thing is available the projection must stop
+        # overwriting the world's coords: ratings come from ToolBond only
+        # (docs/multi_jurisdiction.md decision 10). A daemon with no peers
         # never sets this and keeps the projection as its only signal.
         self._federated_positions_seen = False
         try:
@@ -690,13 +689,12 @@ class WorldService:
     ) -> int:
         """Adopt the federated close's authoritative tool positions.
 
-        The federated close is the one that weights review drift by
-        ``rep_share × credibility`` (federated_close_driver passes
-        ``rep_shares``/``tool_credibility``; the local projection passes
-        neither). Writing its result onto the live world is what makes
-        library ranking — ``infer_artifacts`` reads the drifted head off
-        the observation coords — agree with the documented rule that a
-        zero-reputation review moves nothing.
+        The federated close is the one that reads the ToolBond ratings
+        pinned to the previous anchor (federated_close_driver passes the
+        review snapshot; the local projection has none). Writing its result
+        onto the live world is what makes library ranking
+        (``infer_artifacts`` reads the head off the observation coords)
+        agree with the on-chain ratings.
 
         Returns the number of positions applied.
         """
@@ -2495,19 +2493,14 @@ class WorldService:
         )
         self._tool_registrations = dict(tool_result["registrations_next"])
         self._tool_vetting = dict(tool_result.get("vetting_next") or {})
-        # v3 position drift: write the reviewed charter heads onto the
-        # live world (claim anchors + observation coords) so retrieval
-        # ranking and the viz surfaces see the drifted positions.
+        # Write the tool positions onto the live world (claim anchors +
+        # observation coords) so retrieval ranking and the viz surfaces see
+        # them.
         #
         # ONLY while this daemon has no federated close to defer to. This
-        # projection calls compute_tool_mint with no rep_shares and no
-        # credibility, so every household — a zero-reputation sybil
-        # included — gets full drift weight (federated_reconcile:
-        # ``if rep_shares is None: base_w = 1.0``). Letting that overwrite
-        # the world would make library ranking contradict the v4.1 sybil
-        # defense. Once apply_federated_tool_positions has run, the
-        # authoritative (rep- and credibility-weighted) positions stand
-        # and the projection's own drift stays a diagnostic.
+        # projection has no ToolBond review snapshot, so its positions are
+        # the zero head. Once apply_federated_tool_positions has run, the
+        # authoritative (ToolBond-rated) positions stand.
         if not self._federated_positions_seen:
             self._tool_positions = dict(tool_result.get("positions_next") or {})
             from .federated_reconcile import apply_tool_positions

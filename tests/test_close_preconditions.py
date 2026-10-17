@@ -27,8 +27,6 @@ CARRY = [
     "tool_registrations",
     "tool_vetting",
     "tool_positions",
-    "tool_credibility",
-    "tool_review_book",
 ]
 
 
@@ -102,12 +100,12 @@ def test_refuses_missing_carry_over_after_genesis(tmp_path, caplog):
 
 def test_refuses_partial_carry_over(tmp_path):
     _write_all(tmp_path)
-    (tmp_path / "tool_review_book.json").unlink()
+    (tmp_path / "tool_positions.json").unlink()
     d = _driver(tmp_path, voice_state=ANCHORED)
     assert d.run({"epoch_id": "e2"}) is None
     d._refresh_voice()
     assert d.participation_blockers() == [
-        "missing carry-over files (chain has prior anchors): tool_review_book"
+        "missing carry-over files (chain has prior anchors): tool_positions"
     ]
 
 
@@ -189,7 +187,7 @@ def test_joiner_installs_verified_carry_and_closes(tmp_path):
         assert (me_dir / f"{k}.json").exists()
     assert me.participation_blockers() == []
     assert me._tool_positions == peer._tool_positions
-    assert me._tool_review_book == peer._tool_review_book
+    assert me._tool_vetting == peer._tool_vetting
 
 
 def test_joiner_first_epoch_only_observes(tmp_path, caplog):

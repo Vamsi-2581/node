@@ -42,9 +42,10 @@ class BlockchainConfig:
     # anchoring + authoritative mint submission (Phase 10.3b/c).
     # Empty = chain submission disabled (offline mode).
     substrate_address: str = ""
-    # Deployed ToolBond.sol (Decision 2026-10-13). The federated close reads
-    # vetted tools + their auditors from its logs, pinned to the previous
-    # anchor. Empty => no auditor shares (seeded from registry.json).
+    # Deployed ToolBond.sol. The federated close reads the staked-review
+    # ratings and reviewer shares from its logs, pinned to the previous
+    # anchor (docs/multi_jurisdiction.md decision 10). Empty => zero
+    # ratings and no reviewer shares (seeded from registry.json).
     tool_bond_address: str = ""
     # The jurisdiction's RepToken (Decision 2026-07-10): the close weights
     # reviews and voice by REP read from it, pinned to the previous anchor.

@@ -169,6 +169,11 @@ class AutonetBridge:
         # Background drain of remote tool manifests into the discovery
         # index (network tool search). Spawned once gossip is wired.
         self._manifest_pull_task: asyncio.Task | None = None
+        # Staked review driver (atn/review_driver.py): commits, reveals,
+        # finalizes and claims this daemon's agents' ToolBond review
+        # batches. Runs while the bridge runs.
+        self._review_driver: Any = None
+        self._review_driver_task: asyncio.Task | None = None
         self._autonet_config = None  # Will hold nodes.common.config.AutonetConfig
         # Standards publication state (Story 3.2)
         self._published_standards_hash: str = ""
@@ -947,6 +952,7 @@ class AutonetBridge:
             asyncio.create_task(self._wire_event_gossip_when_ready())
             asyncio.create_task(self._wire_chain_submission_when_ready())
             asyncio.create_task(self._wire_peer_attribution_when_ready())
+            self._start_review_driver()
             await self._emit("AUTONET_STARTED")
             return {"status": "started"}
 
@@ -960,6 +966,28 @@ class AutonetBridge:
             self.state.last_error = str(e)
             log.exception("Failed to start autonet service")
             return {"status": "error", "error": str(e)}
+
+    def _start_review_driver(self) -> None:
+        if self._runtime is None or self._review_driver_task is not None:
+            return
+        try:
+            from .review_driver import start_driver
+            started = start_driver(self._runtime)
+        except Exception:  # noqa: BLE001 (reviews wait, nothing else does)
+            log.warning("review driver failed to start", exc_info=True)
+            return
+        if started is not None:
+            self._review_driver, self._review_driver_task = started
+
+    async def _stop_review_driver(self) -> None:
+        task, self._review_driver_task = self._review_driver_task, None
+        self._review_driver = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: B014
+                pass
 
     def _build_agent_chain_resolver(self):
         """Return a zero-arg callable producing AgentChainIdentity list
@@ -1295,6 +1323,14 @@ class AutonetBridge:
         self._service.add_epoch_close_subscriber(_on_close)
 
         def _on_federated_close(fed) -> None:
+            # The epoch's close fired here: commit this epoch's staked
+            # review batches (atn/review_driver.py) before its anchor.
+            driver = self._review_driver
+            if driver is not None:
+                try:
+                    driver.on_local_close()
+                except Exception:  # noqa: BLE001
+                    log.debug("review driver close hook failed", exc_info=True)
             # FederatedCloseResult → the winner-reveal payload the
             # epochs UI animates (EPOCH_OBSERVABILITY_SPEC.md §4b).
             try:
@@ -1355,6 +1391,7 @@ class AutonetBridge:
                 except asyncio.CancelledError:
                     pass
             self._manifest_pull_task = None
+            await self._stop_review_driver()
             if self._task and not self._task.done():
                 self._task.cancel()
                 try:

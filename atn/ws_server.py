@@ -229,7 +229,7 @@ INTEGRATION_DENIED_MESSAGES = frozenset({
     "list_distros", "core_replacement_evidence",
     "grant_tool", "revoke_tool", "set_tool_enabled", "set_tool_published",
     "list_tool_run_optins", "set_tool_run_optin", "tool_bond_status",
-    "vet_tool", "flag_tool", "tool_flags_list", "tool_security_status",
+    "vet_tool", "tool_security_status", "review_batches",
     # Tool AUTHORING is allowed (register_tool, above) only because guest
     # records are flagged origin="integration" and never run on the authored
     # path (daemon env + cwd). See _integration_register_args.
@@ -2023,10 +2023,10 @@ class WebSocketBridge:
                         "error": "adoption approval is owner-only and not "
                                  "available to a scoped session"}
 
-        # Run gate for network tools (Decision 2026-10-13): an adopted tool
-        # runs only while bonded AND (vetted OR the owner opted in for that
-        # exact digest). Opting in is the owner's per-tool risk call, so it
-        # is owner-only like adoption approval.
+        # Run gate for network tools: an adopted tool runs only while
+        # bonded (there is no vetted flag since staked reviews, decision
+        # 10). The opt-in list is the owner's per-tool note, owner-only like
+        # adoption approval; the view carries the ToolBond rating numbers.
         if msg_type in ("list_tool_run_optins", "set_tool_run_optin",
                         "tool_bond_status"):
             if session.scope_ids is not None:
@@ -2042,8 +2042,14 @@ class WebSocketBridge:
             client = client_for(self.runtime)
 
             async def _bond_view(d: str) -> dict:
+                from nodes.common.world_model_substrate.charter import active_charter
+                from .tool_security import rating_view
                 rec = self.runtime.tool_store.resolve(d)
+                reader = getattr(client, "rating", None)
+                rating = (await reader(d, list(active_charter().ids))
+                          if reader is not None else None)
                 view = {"digest": d, "status": await client.status(d),
+                        **rating_view(rating),
                         "optin": optins.allows(d),
                         "network_tool": bool(rec is not None and rec.origin == "adopted")}
                 if rec is not None:
@@ -2129,23 +2135,35 @@ class WebSocketBridge:
             return {"msg_id": msg_id, "ok": True,
                     "result": {"evidence": rows}}
 
-        # Auditor flags (atn/tool_flags.py, Decision 2026-10-13). Owner-only:
-        # a flag's report and transcript path are this daemon's audit
-        # evidence. The salt is never sent.
-        if msg_type in ("tool_flags_list", "tool_security_status"):
+        # Staked reviews (docs/multi_jurisdiction.md decision 10).
+        # Owner-only: ``review_batches`` lists this daemon's agents' ToolBond
+        # review batches with status and the sealed reveal (salt included),
+        # so the owner can back them up; a reveal is relayable, so whoever
+        # holds a copy can reveal if this daemon dies. ``tool_security_status``
+        # is one tool's bond plus its settled ToolBond rating.
+        if msg_type in ("review_batches", "tool_security_status"):
             if session.scope_ids is not None:
                 return {"msg_id": msg_id, "ok": False,
-                        "error": "tool flags are owner-only and not "
-                                 "available to a scoped session"}
-            from . import tool_flags
-            if msg_type == "tool_flags_list":
-                rows = tool_flags.list_flags(self.runtime, str(msg.get("digest") or ""))
-                return {"msg_id": msg_id, "ok": True, "result": {"flags": rows}}
-            result = await tool_flags.security_status(
-                self.runtime, str(msg.get("digest") or ""))
-            if "error" in result:
-                return {"msg_id": msg_id, "ok": False, "error": result["error"]}
-            return {"msg_id": msg_id, "ok": True, "result": result}
+                        "error": "review batches and tool security status are "
+                                 "owner-only and not available to a scoped "
+                                 "session"}
+            if msg_type == "review_batches":
+                from .review_driver import batch_rows
+                return {"msg_id": msg_id, "ok": True,
+                        "result": {"batches": batch_rows(self.runtime)}}
+            d = str(msg.get("digest") or "").strip().lower().removeprefix("0x")
+            if len(d) != 64 or any(c not in "0123456789abcdef" for c in d):
+                return {"msg_id": msg_id, "ok": False,
+                        "error": "digest must be a 64-hex manifest digest"}
+            from nodes.common.world_model_substrate.charter import active_charter
+            from .tool_security import client_for, rating_view
+            client = client_for(self.runtime)
+            reader = getattr(client, "rating", None)
+            rating = (await reader(d, list(active_charter().ids))
+                      if reader is not None else None)
+            return {"msg_id": msg_id, "ok": True,
+                    "result": {"digest": d, "status": await client.status(d),
+                               "rating": rating, **rating_view(rating)}}
 
         if msg_type == "reject_adoption":
             digest = msg.get("digest", "")

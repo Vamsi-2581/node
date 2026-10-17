@@ -660,16 +660,7 @@ class ExecutionEngine:
     async def route_tool_call(
         self, name: str, tool_input: dict, agent_id: str,
     ) -> dict:
-        result = await self._route_tool_call(name, tool_input, agent_id)
-        # Audit trail: an auditor's flag_tool transcript covers the calls of
-        # the run in progress (atn/tool_flags.py), which are not in the
-        # stored conversation until the run ends. Worker-local shell/web
-        # calls never reach here; authority tools (vet_tool's code read
-        # among them) always do.
-        from ..tool_flags import record_tool_call
-        record_tool_call(getattr(self, "_runtime_ref", None), agent_id, name,
-                         tool_input, result)
-        return result
+        return await self._route_tool_call(name, tool_input, agent_id)
 
     async def _route_tool_call(
         self, name: str, tool_input: dict, agent_id: str,

@@ -1,6 +1,8 @@
 """Tool security rail, part A (docs/tool_substrate.md, Decision 2026-10-13):
 novelty claims, same-author successors, stake on publish, the run gate for
-network tools (bonded AND vetted-or-opt-in) and probe_tools bond context.
+network tools (bonded; there is no vetted flag since staked reviews,
+docs/multi_jurisdiction.md decision 10) and probe_tools bond + rating
+context.
 
 No chain: ToolBond is a fake client / checker-backed gate throughout.
 """
@@ -72,8 +74,9 @@ async def _register(rt, caller, name="echo_tool", **extra):
 class FakeClient:
     """ToolBondClient stand-in: records stakes, serves canned status."""
 
-    def __init__(self, statuses=None, *, available=True, ok=True):
+    def __init__(self, statuses=None, *, available=True, ok=True, ratings=None):
         self.statuses = statuses or {}
+        self.ratings = ratings or {}
         self._available = available
         self.ok = ok
         self.bonds: list[tuple[str, str]] = []
@@ -97,10 +100,22 @@ class FakeClient:
             raise st
         return st
 
+    async def rating(self, digest, axis_ids):
+        return self.ratings.get(digest)
 
-def _st(bonded=True, vetted=False, slashed=False, stage="none", verdict="none"):
-    return {"bonded": bonded, "vetted": vetted, "slashed": slashed,
-            "stage": stage, "verdict": verdict, "stake": 100}
+
+def _st(bonded=True):
+    return {"bonded": bonded, "stake": 100, "author": AUTH,
+            "unbond_requested_at": 0, "unbond_epoch": 0, "pending_rounds": 0}
+
+
+def _rating(harm=None, correctness=None, mass=300):
+    axes = {"correctness": {"sum": int(correctness * 100 * mass) if correctness is not None else 0,
+                            "mass": mass if correctness is not None else 0,
+                            "mean": correctness}}
+    return {"axes": axes, "harm": {"sum": int((harm or 0) * 100 * mass),
+                                   "mass": mass if harm is not None else 0,
+                                   "mean": harm}}
 
 
 # ---------------------------------------------------------------------------
@@ -313,8 +328,7 @@ async def _adopted(tmp_path):
     async def _fetch(digest):
         return blobs.get_bytes(digest)
     rt.tool_store.blob_fetcher = _fetch
-    rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: True,
-                                     vetted_checker=lambda d: True)
+    rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: True)
     await rt.tool_store.propose_adoption("worker", res["digest"], reason="need it")
     approved = await rt.tool_store.approve_adoption(res["digest"])
     assert "error" not in approved, approved
@@ -322,36 +336,31 @@ async def _adopted(tmp_path):
 
 
 class TestRunGate:
-    async def test_vetted_runs(self, tmp_path):
+    async def test_bonded_runs(self, tmp_path):
         rt, rec = await _adopted(tmp_path)
         out = await rt.tool_store.call(rec, {"x": "hi"}, caller_id="worker")
         assert out == {"result": {"echo": "hi"}}
+        assert await run_clearance(rt, rec) == (True, "bonded")
 
     async def test_unbonded_never_runs_even_opted_in(self, tmp_path):
         rt, rec = await _adopted(tmp_path)
-        rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: False,
-                                         vetted_checker=lambda d: True)
+        rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: False)
         rt.tool_store.run_optins = RunOptIns(tmp_path / "optins.json")
         rt.tool_store.run_optins.set(rec.digest, True)
         out = await rt.tool_store.call(rec, {"x": "hi"}, caller_id="worker")
         assert "not cleared to run" in out["error"]
         assert out["run_gate"].startswith("not bonded")
 
-    async def test_unvetted_needs_owner_optin(self, tmp_path):
+    async def test_optin_is_a_note_not_a_gate(self, tmp_path):
+        """No vetted flag: a bonded tool runs with or without the owner's
+        opt-in note, which persists per digest."""
         rt, rec = await _adopted(tmp_path)
-        rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: True)  # no vetted answer
-        out = await rt.tool_store.call(rec, {"x": "hi"}, caller_id="worker")
-        assert out["run_gate"].startswith("not vetted")
         from atn.tool_security import run_optins
         run_optins(rt.tool_store).set(rec.digest, True, name=rec.name)
-        assert await run_clearance(rt, rec) == (True, "unvetted, owner opt-in")
-        assert (await rt.tool_store.call(rec, {"x": "hi"}, caller_id="worker")) == {
-            "result": {"echo": "hi"}}
-        # Persisted per digest; withdrawing it closes the gate again.
         reloaded = RunOptIns(Path(rt.tool_store._dir) / "run_optins.json")
         assert reloaded.allows(rec.digest)
         run_optins(rt.tool_store).set(rec.digest, False)
-        assert (await run_clearance(rt, rec))[0] is False
+        assert await run_clearance(rt, rec) == (True, "bonded")
 
     async def test_no_chain_fails_closed(self, tmp_path, monkeypatch):
         rt, rec = await _adopted(tmp_path)
@@ -376,15 +385,15 @@ class TestRunGate:
         with pytest.raises(ValueError):
             RunOptIns(p).set("short", True)
 
-    async def test_gate_is_vetted_cached_and_dev_override(self, monkeypatch):
+    async def test_gate_cached_and_dev_override_and_no_vetted_flag(self, monkeypatch):
         calls = []
-        g = ToolBondGate(None, checker=lambda d: True,
-                         vetted_checker=lambda d: calls.append(d) or True)
-        assert (await g.is_vetted(D1))[0] is True
-        assert (await g.is_vetted(D1))[1].endswith("(cached)")
+        g = ToolBondGate(None, checker=lambda d: calls.append(d) or True)
+        assert (await g.is_bonded(D1))[0] is True
+        assert (await g.is_bonded(D1))[1].endswith("(cached)")
         assert calls == [D1]
+        assert not hasattr(g, "is_vetted")
         monkeypatch.setenv(DEV_OVERRIDE_ENV, "1")
-        assert await ToolBondGate(None).is_vetted(D2) == (True, "dev override")
+        assert await ToolBondGate(None).is_bonded(D2) == (True, "dev override")
 
 
 # ---------------------------------------------------------------------------
@@ -403,19 +412,20 @@ class TestProbeContext:
     async def test_drops_unbonded_and_annotates(self, tmp_path):
         rt = _make_runtime(tmp_path)
         rt.tool_bond_client = FakeClient({
-            D1: _st(vetted=True, stage="done", verdict="clean"),
-            D2: _st(bonded=False, slashed=True),
+            D1: _st(),
+            D2: _st(bonded=False),
             D3: RuntimeError("rpc down"),
-        })
+        }, ratings={D1: _rating(harm=0.1, correctness=0.8), D2: _rating(harm=0.9)})
         rows = await annotate_probe_rows(rt, _rows())
         assert [r["digest"] for r in rows] == [D1, D3]
         one, three = rows
-        assert (one["bonded"], one["vetted"], one["stage"], one["verdict"]) == (
-            True, True, "done", "clean")
-        assert three["bonded"] is None and three["vetted"] is None  # fault: unknown
+        assert one["bonded"] is True and "vetted" not in one
+        assert one["harm"] == 0.1 and one["harm_mass"] == "300"
+        assert one["chain_rating"]["correctness"] == 0.8
+        assert three["bonded"] is None and three["harm"] is None  # fault: unknown
         ctx = one["author_context"]
         assert {o["digest"] for o in ctx["other_tools"]} == {D2, D3}
-        assert ctx["slashed_tools"] == [D2] and ctx["any_slashed"] is True
+        assert ctx["max_other_harm"] == 0.9
         assert ctx["rep"] is None          # no RepToken configured here
 
     async def test_status_cached(self, tmp_path):
@@ -431,7 +441,7 @@ class TestProbeContext:
         rt.tool_bond_client = FakeClient(available=False)
         rows = await annotate_probe_rows(rt, _rows())
         assert len(rows) == 3 and all(r["bonded"] is None for r in rows)
-        assert rows[0]["author_context"]["any_slashed"] is None
+        assert rows[0]["author_context"]["max_other_harm"] is None
 
     async def test_author_rep_read(self, tmp_path, monkeypatch):
         rt = _make_runtime(tmp_path)
@@ -442,7 +452,7 @@ class TestProbeContext:
         monkeypatch.setattr("atn.tool_security._rep_reader", lambda r: _rep)
         rows = await annotate_probe_rows(rt, _rows()[:1])
         assert rows[0]["author_context"]["rep"] == str(5 * 10**18)
-        assert rows[0]["author_context"]["any_slashed"] is False
+        assert rows[0]["author_context"]["max_other_harm"] is None
 
     async def test_probe_tools_substrate_path(self, tmp_path):
         rt = _make_runtime(tmp_path)
@@ -485,16 +495,17 @@ class TestWsSurface:
         r = await srv._handle_message({"type": "set_tool_run_optin", "msg_id": "1",
                                        "digest": rec.digest, "allowed": True}, _sess())
         assert r["ok"] and r["result"] == {"digest": rec.digest, "allowed": True,
-                                           "runnable": True,
-                                           "reason": "unvetted, owner opt-in"}
+                                           "runnable": True, "reason": "bonded"}
         r = await srv._handle_message({"type": "list_tool_run_optins", "msg_id": "2"},
                                       _sess())
         assert [o["digest"] for o in r["result"]["optins"]] == [rec.digest]
         assert r["result"]["optins"][0]["name"] == "net_tool"
-        rt.tool_bond_client = FakeClient({rec.digest: _st()})
+        rt.tool_bond_client = FakeClient({rec.digest: _st()},
+                                         ratings={rec.digest: _rating(harm=0.25)})
         r = await srv._handle_message({"type": "tool_bond_status", "msg_id": "3",
                                        "digest": rec.digest}, _sess())
         assert r["result"]["status"]["bonded"] is True
+        assert r["result"]["harm"] == 0.25 and r["result"]["harm_mass"] == "300"
         assert r["result"]["optin"] is True and r["result"]["network_tool"] is True
         assert r["result"]["runnable"] is True
         r = await srv._handle_message({"type": "tool_bond_status", "msg_id": "3b",

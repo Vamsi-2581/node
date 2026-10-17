@@ -104,8 +104,8 @@ def _epoch_batches(epoch: int) -> List[EventBatch]:
     batches: List[EventBatch] = []
     if epoch == 1:
         batches += _chain([_registration(1)], Keypair.generate(), t0)
-    # Reviewers disagree a bit so positions, the review book and (with
-    # enough mass) credibility all move.
+    # Review events from an old daemon: their axes no longer move anything
+    # (ratings come from ToolBond), the receipts still count as usage.
     reviews = {
         "rev_a": {"correctness": 0.9, "simplicity": 0.4},
         "rev_b": {"correctness": 0.7 - 0.1 * epoch, "simplicity": -0.2},
@@ -173,7 +173,8 @@ def test_two_daemons_produce_identical_bundle(tmp_path):
     # The fixture actually exercises the carried maps.
     carry = decode_carry_bundle(fa.carry_bundle_blob)["carry"]
     assert carry["tool_registrations"] and carry["tool_positions"]
-    assert carry["tool_review_book"]
+    assert set(carry) == set(CARRY_KEYS)
+    assert "tool_credibility" not in carry and "tool_review_book" not in carry
 
 
 def test_bundle_bytes_ignore_key_insertion_order(tmp_path):
@@ -194,7 +195,7 @@ def test_bundle_round_trips_exact_floats():
     carry = {k: {} for k in CARRY_KEYS}
     carry["tool_positions"] = {DIGEST: {"head": [0.1 + 0.2, -0.0, 1e-9],
                                         "mass": [1.0, 2.5, 3.0]}}
-    carry["tool_credibility"] = {"h": 0.123456789}
+    carry["tool_vetting"] = {"h": 0.123456789}
     blob = encode_carry_bundle(carry, epoch_id="e9")
     out = decode_carry_bundle(blob)
     assert out["epoch_id"] == "e9"
@@ -204,7 +205,7 @@ def test_bundle_round_trips_exact_floats():
 
 def test_bundle_rejects_nan_and_missing_maps():
     carry = {k: {} for k in CARRY_KEYS}
-    carry["tool_credibility"] = {"h": float("nan")}
+    carry["tool_vetting"] = {"h": float("nan")}
     with pytest.raises(ValueError):
         encode_carry_bundle(carry, epoch_id="e1")
     with pytest.raises(ValueError):
@@ -446,7 +447,7 @@ def test_tampered_bundle_is_rejected(network, tmp_path, caplog):
     carry_cid = fetch_carry_over_from_chain(contract, real).carry_cid
     good = real.get(carry_cid)
     bundle = decode_carry_bundle(good)
-    bundle["carry"]["tool_credibility"] = {"attacker": 1.0}
+    bundle["carry"]["tool_vetting"] = {"attacker": 1.0}
     forged = encode_carry_bundle(bundle["carry"], epoch_id=bundle["epoch_id"])
 
     class LyingPeer:

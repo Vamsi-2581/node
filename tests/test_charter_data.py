@@ -240,34 +240,34 @@ def _registration(n_dims: int) -> Dict[str, Any]:
     }
 
 
-def test_drift_under_custom_charter(seven_axis):
+def test_ratings_under_custom_charter(seven_axis):
+    """Positions follow the active charter's axes: a ToolBond rating on a
+    custom axis lands in its slot, an axis outside the charter is dropped,
+    and a carried 6-length (v1) position is replaced by the 7-axis one."""
     from nodes.common.federated_reconcile import compute_tool_mint
     from nodes.common.world_model_substrate.adapter import build_charter_world
     from nodes.common.world_model_substrate.aggregate import apply_events
 
     world = build_charter_world(embedding_dim=EMBED_DIM)
     apply_events(world, [_registration(7)], equilibrate_after=False)
-    receipt = {
-        "kind": "tool_used", "seq": 2, "author_agent": "caller-1",
-        "manifest_digest": DIGEST, "tool_author": AUTHOR,
-        "receipt_digest": "r1" * 32, "ok": True, "fee_atn": 0.0,
-        "attested": True, "score": 0.8,
-        "axes": {"kindness": 0.6, "correctness": 0.8},
-    }
     regs = {DIGEST: {"trust_class": "pinned", "author": AUTHOR}}
-    # A carried 6-length (v1) position is reset to the 7-axis prior.
-    out = compute_tool_mint(world, [receipt], registrations=regs,
+    snap = {"supply": 100, "tools": {DIGEST: {
+        "axes": {"kindness": {"sum": 60 * 10, "mass": 10},
+                 "correctness": {"sum": 80 * 20, "mass": 20},
+                 "honesty": {"sum": 50, "mass": 1}},
+        "harm": {"sum": 0, "mass": 0}}}}
+    out = compute_tool_mint(world, [], registrations=regs, review_snapshot=snap,
                             positions={DIGEST: {"head": [0.1] * 6, "mass": [2.0] * 6}})
     pos = out["positions_next"][DIGEST]
     assert len(pos["head"]) == 7 and len(pos["mass"]) == 7
-    w = math.log1p(1)
     k = seven_axis.axis_index["kindness"]
     c = seven_axis.axis_index["correctness"]
-    assert pos["head"][k] == pytest.approx(w * 0.6 / (1 + w), abs=1e-9)
-    assert pos["head"][c] == pytest.approx(w * 0.8 / (1 + w), abs=1e-9)
+    assert pos["head"][k] == pytest.approx(0.6)
+    assert pos["head"][c] == pytest.approx(0.8)
+    assert pos["mass"][k] == pytest.approx(0.1) and pos["mass"][c] == pytest.approx(0.2)
     for i in range(7):
         if i not in (k, c):
-            assert pos["head"][i] == 0.0 and pos["mass"][i] == 1.0
+            assert pos["head"][i] == 0.0 and pos["mass"][i] == 0.0
 
 
 # ---------------------------------------------------------------------------

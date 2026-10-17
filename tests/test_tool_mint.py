@@ -310,8 +310,9 @@ class TestComputeToolMint:
 
 def _vet_event_axes(seq: int, vetter: str, axes: Dict[str, float],
                     *, digest: str = DIGEST) -> Dict[str, Any]:
-    """An INSPECTION REVIEW (v4.1 [R2]): a vet event carrying per-axis
-    scores. Drifts position, mints nothing."""
+    """A v4.1 inspection-review vet event carrying per-axis scores. Since
+    staked reviews (docs/multi_jurisdiction.md 10) it moves nothing and
+    mints nothing; daemons no longer emit it."""
     ev = _vet_event(seq, vetter, digest=digest)
     ev["axes"] = dict(axes)
     return ev
@@ -354,11 +355,11 @@ class TestVetGateRemoved:
         assert node == {AUTHOR: pytest.approx(entry["mint"])}
         assert list(node.keys()) == [AUTHOR]
 
-    def test_vet_inspection_review_drifts_but_mints_nothing(self):
-        """v4.1 [R2]: a vet carrying axes moves the tool's charter head
-        (position drift) but contributes ZERO usage/mint."""
+    def test_vet_inspection_event_moves_and_mints_nothing(self):
+        """A vet event carrying axes (an old daemon's gossip review) mints
+        nothing and no longer moves the tool's position: inspections are
+        staked ToolBond reviews now (docs/multi_jurisdiction.md 10)."""
         world = self._world()
-        # A vet with a correctness score, from a rep-holding reviewer.
         vet = _vet_event_axes(1, "reviewer-1", {"correctness": 1.0})
         vet["sender"] = "aa01"
         out = compute_tool_mint(
@@ -366,15 +367,9 @@ class TestVetGateRemoved:
             registrations=self.REGS,
             rep_shares={"reviewer-1": 0.5},
         )
-        # No usage -> no mint at all.
         assert out["per_digest"] == {}
-        # ...but position drifted toward the inspection score.
-        head = out["positions_next"][DIGEST]["head"]
-        assert head[4] > 0.0     # correctness axis moved positive
-        # And the review is recorded in the carried book for later
-        # credibility re-scoring.
-        assert DIGEST in out["tool_review_book_next"]
-        assert "reviewer-1" in out["tool_review_book_next"][DIGEST]
+        assert out["positions_next"][DIGEST]["head"][4] == 0.0
+        assert "tool_review_book_next" not in out
 
     def test_vet_state_carried_tolerantly(self):
         """v4.1 [R1]: old carried vetting state (greenlit/royalty fields)
@@ -592,8 +587,9 @@ class TestDriverCarryOver:
 # v4.1 "gradient trust" (ratified 2026-07-09), amended by fees-only +
 # REP-from-earnings (Decision 2026-07-10):
 #   DELETED: R4 supply-pegged beta cap, R6 rep/ATN split (mint is money only)
-#   SURVIVES: R5 continuous reversal-aware credibility (drift-weight
-#             multiplier), rep_shares drives DRIFT weight only.
+#   DELETED 2026-10-17 (docs/multi_jurisdiction.md decision 10): R5
+#             reversal-aware credibility and gossip review drift; ratings
+#             come from ToolBond. rep_shares weighs own_share only.
 # ---------------------------------------------------------------------------
 
 
@@ -700,78 +696,3 @@ class TestFeesOnlyPool:
         assert sum(result["agent_mint"].values()) == pytest.approx(
             pool, rel=1e-9)
         assert result["total_mint"] == pytest.approx(pool, rel=1e-9)
-
-
-class TestCredibility:
-    """R5: continuous reversal-aware credibility carried across closes;
-    a reversal retroactively docks the capturers."""
-
-    REGS = {DIGEST: {"trust_class": "pinned", "author": AUTHOR}}
-
-    def _world(self):
-        world = build_charter_world(embedding_dim=EMBED_DIM)
-        apply_events(world, [_registration_event(1)], equilibrate_after=False)
-        return world
-
-    def _many(self, caller: str, axis_val: float, n: int, seq0: int):
-        """n attested receipts from one caller, each scoring correctness
-        — high n lifts log1p(n) so review mass clears CRED_MASS_FLOOR and
-        the drift centroid is well-defined."""
-        return [_receipt_axes(seq0 + i, caller, {"correctness": axis_val})
-                for i in range(n)]
-
-    def test_credibility_carries_and_reversal_docks(self):
-        world = self._world()
-        # Heavy honest majority + a lone capturer. rep shares near 1 so
-        # drift mass is large (rep_shares drives drift weight only now).
-        rep_shares = {"honest-1": 0.9, "honest-2": 0.9, "capturer": 0.9}
-        # Epoch 1: EVERYONE (incl. capturer) asserts strongly POSITIVE,
-        # many reviews each so total mass >> CRED_MASS_FLOOR.
-        ev1 = (self._many("honest-1", 1.0, 30, 1)
-               + self._many("honest-2", 1.0, 30, 100)
-               + self._many("capturer", 1.0, 30, 200))
-        out1 = compute_tool_mint(
-            world, ev1, registrations=self.REGS,
-            rep_shares=rep_shares,
-        )
-        cred1 = out1["credibility_next"]
-        book1 = out1["tool_review_book_next"]
-        assert DIGEST in book1
-        # Agreement so far: nobody docked.
-        for h in ("honest-1", "honest-2", "capturer"):
-            assert cred1.get(h, 1.0) >= 0.9
-
-        # Epoch 2: the honest majority REVERSES hard to strongly negative
-        # with overwhelming mass, dragging the head far below the
-        # capturer's stored +1.0 review -> the capturer is retroactively
-        # docked (its carried centroid now deviates > delta from the head).
-        ev2 = (self._many("honest-1", -1.0, 200, 1)
-               + self._many("honest-2", -1.0, 200, 300))
-        out2 = compute_tool_mint(
-            world, ev2,
-            registrations=self.REGS,
-            rep_shares=rep_shares,
-            positions=out1["positions_next"],
-            credibility=cred1,
-            tool_review_book=book1,
-        )
-        head2 = out2["positions_next"][DIGEST]["head"][4]
-        assert head2 < 0.0, "honest reversal should push head negative"
-        cred2 = out2["credibility_next"]
-        assert cred2.get("capturer", 1.0) < 1.0
-
-    def test_credibility_floor_and_recovery(self):
-        """A docked household recovers toward 1.0 in a later quiet epoch,
-        never below CRED_FLOOR."""
-        from nodes.common.federated_reconcile import CRED_FLOOR
-        world = self._world()
-        cred_in = {"stale": CRED_FLOOR}
-        out = compute_tool_mint(
-            world, [_receipt_event(1, "someone")],
-            registrations=self.REGS,
-            rep_shares={"someone": 0.5},
-            credibility=cred_in,
-        )
-        c = out["credibility_next"].get("stale", CRED_FLOOR)
-        assert CRED_FLOOR <= c <= 1.0
-        assert c > CRED_FLOOR

@@ -1,5 +1,6 @@
 """Tool security rail, daemon side (docs/tool_substrate.md, Decision
-2026-10-13: staked tools, flagged audits, REP-settled verdicts).
+2026-10-13: staked tools; docs/multi_jurisdiction.md decision 10: staked
+reviews rate them, with no verdict flag).
 
 Three pieces live here; the chain surface is ``runtime/tool_bond.py``:
 
@@ -8,16 +9,21 @@ Three pieces live here; the chain surface is ``runtime/tool_bond.py``:
     only by the same author, and ``ToolBondClient.register_and_bond`` signed
     with the AUTHOR AGENT's key. No ToolBond configured = refused (fail
     closed), except under the dev override ``ATN_TOOL_BOND_DEV_OVERRIDE=1``.
-  - RUN (``run_clearance`` / ``RunOptIns``): a network tool (authored
-    elsewhere, i.e. an adopted record) runs only while ``isBonded`` and
-    either ``isVetted`` or the owner opted in for that exact digest.
-    Locally authored tools are not gated. Enforced in ``ToolStore.call``
-    (the one dispatch choke point) and ahead of a core swap in
+  - RUN (``run_clearance``): a network tool (authored elsewhere, i.e. an
+    adopted record the owner approved for that exact digest) runs only
+    while ``isBonded``. There is no vetted flag any more: whether a rating
+    is trustworthy enough is the owner's and agent's gradient call, so the
+    numbers are exposed (``rating_view``), never gated on. Locally authored
+    tools are not gated. Enforced in ``ToolStore.call`` (the one dispatch
+    choke point) and ahead of a core swap in
     ``runtime/shell_provider.dispatch_shell`` so a refused swap falls back.
+    ``RunOptIns`` is kept as the owner's per-digest note list for the UI; it
+    no longer changes what runs.
   - DISCOVERY (``annotate_probe_rows``): probe_tools drops tools that are
-    known not to be bonded and adds bond/verdict state plus author context
-    (REP, other tools, past slashes). Context only: ranking stays
-    review-driven. A chain fault marks a row unknown, never breaks probe.
+    known not to be bonded and adds the bond, the ToolBond rating (per-axis
+    REP-weighted means, harm, and the REP mass behind each) plus author
+    context (REP, other tools and their harm). Context only: ranking stays
+    the close's. A chain fault marks a row unknown, never breaks probe.
 """
 from __future__ import annotations
 
@@ -66,8 +72,10 @@ def client_for(runtime: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 class RunOptIns:
-    """Per-digest allowlist the owner sets (WS ``set_tool_run_optin``).
-    Persisted as JSON; an unreadable file reads as empty (fail closed)."""
+    """Per-digest list the owner sets (WS ``set_tool_run_optin``). Since
+    staked reviews replaced the vetted flag it no longer gates a run; the
+    UI keeps it as the owner's explicit trust notes. Persisted as JSON; an
+    unreadable file reads as empty."""
 
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
@@ -132,27 +140,46 @@ def run_optins(tool_store: Any) -> RunOptIns:
 async def run_clearance(runtime: Any, record: Any) -> tuple[bool, str]:
     """May this node run ``record``? ``(ok, reason)``, never raises.
 
-    Own tools: always (not gated). Network tools: bonded AND (vetted OR
-    owner opt-in for this digest). Reasons start with "not bonded" /
-    "not vetted" so callers can tell the two refusals apart."""
+    Own tools: always (not gated). Network tools: bonded on ToolBond (the
+    author's stake stands behind the code; a settled harm slashes it in
+    proportion, so a tool rated harmful loses its bond). Refusals start with
+    "not bonded"."""
     if not is_network_tool(record):
         return True, "locally authored"
     digest = str(getattr(record, "digest", "") or "")
     try:
-        gate = gate_for(runtime)
-        bonded, why = await gate.is_bonded(digest)
+        bonded, why = await gate_for(runtime).is_bonded(digest)
         if not bonded:
             return False, f"not bonded ({why}): unstaked, unbonding or slashed"
-        vetted, why_v = await gate.is_vetted(digest)
-        if vetted:
-            return True, "vetted"
-        if run_optins(runtime.tool_store).allows(digest):
-            return True, "unvetted, owner opt-in"
-        return False, (f"not vetted ({why_v}); the owner can opt in to run "
-                       "this exact digest")
+        return True, "bonded"
     except Exception as exc:  # noqa: BLE001 — fail closed
         log.warning("run clearance for %s failed: %s", digest[:16], exc)
         return False, f"not bonded (clearance check failed: {exc})"
+
+
+def rating_view(rating: Optional[dict[str, Any]],
+                rep_supply: Optional[int] = None) -> dict[str, Any]:
+    """A ToolBond rating (``ToolBondClient.rating``) as display numbers:
+    per-axis mean in -1..1 and REP mass, harm mean in 0..1 and its mass,
+    and the mass as a share of REP supply when known. None values mean no
+    REP has rated that axis yet."""
+    if not rating:
+        return {"chain_rating": None, "harm": None, "harm_mass": None}
+    axes = rating.get("axes") or {}
+    harm = rating.get("harm") or {}
+
+    def share(mass: Any) -> Optional[float]:
+        if not rep_supply:
+            return None
+        return round(int(mass or 0) / int(rep_supply), 9)
+    return {
+        "chain_rating": {a: v.get("mean") for a, v in sorted(axes.items())},
+        "rating_mass": {a: str(v.get("mass", 0)) for a, v in sorted(axes.items())},
+        "rating_mass_share": ({a: share(v.get("mass")) for a, v in sorted(axes.items())}
+                              if rep_supply else None),
+        "harm": harm.get("mean"),
+        "harm_mass": str(harm.get("mass", 0)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -296,16 +323,34 @@ async def _guarded(sem: asyncio.Semaphore, coro_fn, *args) -> Any:
             return None
 
 
+async def _bond_view(client: Any, digest: str) -> Optional[dict[str, Any]]:
+    """The bond plus the settled ToolBond rating on the active charter's
+    axes, or None when the bond read fails."""
+    st = await client.status(digest)
+    if st is None:
+        return None
+    st = dict(st)
+    reader = getattr(client, "rating", None)
+    if reader is not None:
+        from nodes.common.world_model_substrate.charter import active_charter
+        try:
+            st["rating"] = await reader(digest, list(active_charter().ids))
+        except Exception as exc:  # noqa: BLE001 (the rating is context)
+            log.debug("ToolBond rating read failed: %s", exc)
+            st["rating"] = None
+    return st
+
+
 async def cached_status(runtime: Any, client: Any, digest: str,
                         sem: asyncio.Semaphore) -> Optional[dict[str, Any]]:
-    """``ToolBondClient.status`` with a short cache; None = unknown."""
+    """Bond + rating (``_bond_view``) with a short cache; None = unknown."""
     key = str(digest).lower()
     cache = _status_cache(runtime)
     now = time.monotonic()
     hit = cache.get(key)
     if hit is not None and hit[1] > now:
         return hit[0]
-    st = await _guarded(sem, client.status, digest)
+    st = await _guarded(sem, _bond_view, client, digest)
     cache[key] = (st, now + (_STATUS_TTL_S if st is not None else _STATUS_FAULT_TTL_S))
     return st
 
@@ -339,9 +384,10 @@ def _is_address(value: str) -> bool:
 
 async def annotate_probe_rows(runtime: Any, rows: list[dict[str, Any]],
                               ) -> list[dict[str, Any]]:
-    """Add bond state + author context to probe rows; drop rows whose
-    digest is known NOT to be bonded. Unknown (no ToolBond configured, RPC
-    fault) keeps the row with ``bonded: None``. Never raises; order kept."""
+    """Add bond state, the ToolBond rating and author context to probe rows;
+    drop rows whose digest is known NOT to be bonded. Unknown (no ToolBond
+    configured, RPC fault) keeps the row with ``bonded: None``. Never
+    raises; order kept."""
     if not rows:
         return rows
     try:
@@ -350,8 +396,13 @@ async def annotate_probe_rows(runtime: Any, rows: list[dict[str, Any]],
         log.debug("probe bond annotation failed: %s", exc)
         for row in rows:
             row.setdefault("bonded", None)
-            row.setdefault("vetted", None)
+            row.setdefault("harm", None)
         return rows
+
+
+def _harm_of(st: Optional[dict[str, Any]]) -> Optional[float]:
+    harm = ((st or {}).get("rating") or {}).get("harm") or {}
+    return harm.get("mean")
 
 
 async def _annotate(runtime: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -396,33 +447,27 @@ async def _annotate(runtime: Any, rows: list[dict[str, Any]]) -> list[dict[str, 
         if st is not None and not st.get("bonded"):
             continue  # unstaked / unbonding / slashed: not in the economy
         if st is not None:
-            row.update({"bonded": True, "vetted": bool(st.get("vetted")),
-                        "stage": st.get("stage"), "verdict": st.get("verdict"),
-                        "stake": str(st.get("stake", ""))})
+            row.update({"bonded": True, "stake": str(st.get("stake", "")),
+                        **rating_view(st.get("rating"))})
         else:
-            row.update({"bonded": True if override else None, "vetted": None,
-                        "stage": None, "verdict": None})
+            row.update({"bonded": True if override else None,
+                        **rating_view(None)})
         author = str(row.get("author") or "").lower()
         others = {d: n for d, n in by_author.get(author, {}).items() if d != digest}
         other_rows = []
-        slashed: list[str] = []
         for d, n in list(others.items())[:_AUTHOR_TOOLS_MAX]:
             ost = statuses.get(d)
             other_rows.append({"digest": d, "name": n,
                                "bonded": None if ost is None else bool(ost.get("bonded")),
-                               "slashed": None if ost is None else bool(ost.get("slashed"))})
-            if ost is not None and ost.get("slashed"):
-                slashed.append(d)
+                               "harm": _harm_of(ost)})
+        harms = [o["harm"] for o in other_rows if o["harm"] is not None]
         r = rep.get(author)
         row["author_context"] = {
             "rep": None if r is None else str(r),
             "other_tools": other_rows,
-            "slashed_tools": slashed,
-            # None = unknown (no chain read); False = none of the tools
-            # this node can see was slashed.
-            "any_slashed": True if slashed else (
-                False if chain and all(o["slashed"] is not None
-                                       for o in other_rows) else None),
+            # The highest settled harm among the author's other tools this
+            # node can see; None = unknown or none rated yet.
+            "max_other_harm": max(harms) if harms else None,
         }
         out.append(row)
     return out

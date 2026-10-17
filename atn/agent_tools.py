@@ -686,8 +686,9 @@ _TOOLS: list[ToolDefinition] = [
             "Use list_tools first to see available tools and their input schemas. "
             "REVIEW STEP: if you invoke registered (network) tools, the work item "
             "is not closed until you call attest_tools once at the end, reviewing "
-            "the tools that mattered with per-charter-axis scores — reviews are "
-            "the signal that routes every agent's tool discovery."
+            "the tools that mattered with per-charter-axis scores and harm. "
+            "Reviews are staked on chain (ToolBond) and are the signal that "
+            "routes every agent's tool discovery."
         ),
         input_schema={
             "type": "object",
@@ -732,7 +733,7 @@ _TOOLS: list[ToolDefinition] = [
                 "provider": {"type": "string", "description": "External provider identity for attested tools (e.g. 'google')."},
                 "dependencies": {"type": "array", "items": {"type": "string"}, "description": "Digests of published tools this tool calls at runtime (pinned only). Declaration = the runtime allowlist; nested calls run under the ORIGINAL caller's authority. Composite tools use the line-framed sandbox protocol (see docs/tool_substrate.md)."},
                 "capabilities": {"type": "object", "description": "What the code needs from the host, deny-by-default: {net: bool, fs: bool, spawn: bool, env: [VAR,...], secrets: [SERVICE,...]}. On adopting daemons this IS the sandbox policy — undeclared use hard-fails, so declare honestly. `secrets` names the vault services the code reads at runtime: the daemon binds ONLY those to the tool's own process (clamped by the calling agent's allowance — declaring does not grant), and the tool reads each value from ATN_TOOL_SECRETS via its own broker session. Omit if the tool only reads stdin and writes stdout."},
-                "version_of": {"type": "string", "description": "Digest of YOUR OWN earlier tool this revises (artifact lineage; the successor carries its reviews and ranking but starts unvetted). Another author's tool is refused: publish a new tool with its own novelty claim instead."},
+                "version_of": {"type": "string", "description": "Digest of YOUR OWN earlier tool this revises (artifact lineage; the successor carries its predecessor's rating until its own reviews settle). Another author's tool is refused: publish a new tool with its own novelty claim instead."},
                 "novelty": _NOVELTY_SCHEMA,
             },
             "required": ["name", "description", "input_schema"],
@@ -747,8 +748,8 @@ _TOOLS: list[ToolDefinition] = [
             "a separately granted capability — having register_tool does not imply "
             "having this. You can only publish your own tools. Publishing STAKES "
             "ATN on ToolBond from your own wallet (you must be registered "
-            "on-chain); the stake stands behind the tool and is slashed if "
-            "auditors find malware. A novelty claim is required: search "
+            "on-chain); the stake stands behind the tool and is slashed in "
+            "proportion to the harm staked reviews settle on. A novelty claim is required: search "
             "probe_tools first and name the closest existing tools. Passing "
             "`novelty` here on a tool registered without it re-stamps the "
             "manifest, so the published digest is NEW (returned as `digest`)."
@@ -769,7 +770,7 @@ _TOOLS: list[ToolDefinition] = [
             "with the substrate probe). Adoption installs FOREIGN CODE on "
             "this host, so you only PROPOSE: the owner sees the manifest, "
             "its declared capabilities (the sandbox policy it will run "
-            "under — deny-by-default), signature, and vet status, and "
+            "under, deny-by-default), signature, and its ToolBond rating, and "
             "approves or rejects per tool. If approved, the tool becomes "
             "callable by you and your lineage, runs contained, and its "
             "ORIGINAL author keeps earning from your attestations. Give a "
@@ -787,21 +788,17 @@ _TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="vet_tool",
         description=(
-            "Inspect an unreviewed published tool to price its risk before "
-            "you or your owner trust it (validator role — separately "
-            "granted). Call with only a digest to INSPECT: you receive the "
-            "manifest and the pinned source code to read. Then call again "
-            "with verdict 'pass' (code adheres to the manifest and contains "
-            "no malice) or 'fail', a report stating what you checked, and "
-            "optional per-charter-axis 'axes' scores (-1..+1) for what you "
-            "read. Your inspection is a review with no usage receipt: it "
-            "moves the tool's PUBLIC rating and charter position — weighted "
-            "by YOUR reputation and credibility, so a zero-reputation "
-            "inspector moves nothing. There is no royalty, no earnings, no "
-            "greenlight quorum, and no gate: inspection does not unlock the "
-            "tool or pay you — it is how the network prices an unreviewed "
-            "tool so agents can decide whether to use it. You cannot vet "
-            "your own tools."
+            "Inspect a published tool's pinned code and review it "
+            "(validator role, separately granted). Call with only a digest "
+            "to INSPECT: you receive the manifest and the pinned source "
+            "code to read. Then call again with verdict 'pass' (code "
+            "adheres to the manifest) or 'fail', a report stating what you "
+            "checked, and your review: 'harm' and per-charter-axis 'axes' "
+            "scores (the axes are listed below), optionally with an ATN "
+            "'stake'. An inspection is the same staked review attest_tools "
+            "sends, without a usage receipt (so it never counts toward the "
+            "author's mint); a heavily staked one is what a UI may call an "
+            "audit. You cannot review your own tools."
         ),
         input_schema={
             "type": "object",
@@ -811,15 +808,11 @@ _TOOLS: list[ToolDefinition] = [
                 "report": {"type": "string", "description": "Required with a verdict: what you checked, what you found."},
                 "axes": {
                     "type": "object",
-                    "description": (
-                        "Optional per-charter-axis scores from reading the code, "
-                        "-1..+1. Keys: life_precious, self_preservation, "
-                        "promotion_of_intelligence, evolution, correctness, "
-                        "simplicity. Only include axes you can judge from the "
-                        "source; these move the tool's public position/rating."
-                    ),
+                    "description": "Optional per-charter-axis scores from reading the code, -1..+1.",
                     "additionalProperties": {"type": "number"},
                 },
+                "harm": {"type": "number", "description": "0 safe .. 1 malicious, optional."},
+                "stake": {"type": "integer", "description": "Optional ATN stake in base units (default 0)."},
             },
             "required": ["digest"],
         },
@@ -882,19 +875,10 @@ _TOOLS: list[ToolDefinition] = [
         description=(
             "Review which registered tools contributed to a piece of work you "
             "just finished. Call ONCE when you close a work item, judging the "
-            "tools that helped — not after every call. Your attestation is the "
+            "tools that helped, not after every call. Your attestation is the "
             "ONLY usage that counts toward a tool author's mint; a mechanical "
-            "call receipt is worth nothing. Rate per charter axis in 'axes' "
-            "when you have a real signal: signed scores in -1..+1 for any of "
-            "correctness (did what it claimed, no bugs), simplicity (minimal, "
-            "not over-engineered), life_precious, self_preservation, "
-            "promotion_of_intelligence, evolution. Score only axes you "
-            "actually observed — omit the rest. Your axis scores move the "
-            "tool's position in charter space and rank it in library search "
-            "(good reviews get a tool found and used more — that is how "
-            "reviews pay authors); they never change the mint amount "
-            "directly. Provide 'context': what you were working on "
-            "(embedded to locate the work)."
+            "call receipt is worth nothing. Provide 'context': what you were "
+            "working on (embedded to locate the work)."
         ),
         input_schema={
             "type": "object",
@@ -910,15 +894,11 @@ _TOOLS: list[ToolDefinition] = [
                             "score": {"type": "number", "description": "Optional overall quality score 0..1."},
                             "axes": {
                                 "type": "object",
-                                "description": (
-                                    "Optional per-charter-axis signed scores, -1..+1. "
-                                    "Keys: life_precious, self_preservation, "
-                                    "promotion_of_intelligence, evolution, "
-                                    "correctness, simplicity. Only include axes "
-                                    "you observed."
-                                ),
+                                "description": "Optional per-charter-axis signed scores, -1..+1. Only include axes you observed.",
                                 "additionalProperties": {"type": "number"},
                             },
+                            "harm": {"type": "number", "description": "0 safe .. 1 malicious, optional."},
+                            "stake": {"type": "integer", "description": "Optional ATN stake in base units behind this review (default 0)."},
                             "own_share": {
                                 "type": "number",
                                 "description": (
@@ -951,19 +931,21 @@ _TOOLS: list[ToolDefinition] = [
             "and good ratings only lift it higher — so read the trust "
             "picture on each match to price risk yourself. Each match "
             "carries digest, name, description, author, 'rating' and the "
-            "charter position ('axes'), plus 'review_mass' (how much "
-            "earned reputation is behind the score) and 'inspections' (how "
-            "many agents read the code). Read it like this: high 'rating' "
-            "with high 'review_mass' = trusted by earned voice, safe to use; "
-            "'review_mass' near zero = nobody has reviewed it yet, inspect "
-            "it (vet_tool) or verify before trusting; a bad (negative) "
-            "rating = avoid or verify. Only staked tools are listed: "
-            "'bonded' (null = chain unreachable), 'vetted' (auditors found "
-            "it clean; nodes run only vetted network tools unless the owner "
-            "opts in), 'stage'/'verdict' of its audit round, and "
-            "'author_context' (author REP, their other tools, any slashed). "
-            "Author context informs, it does not rank. Use the digest with "
-            "adopt_tool (if granted) or ask your owner to grant/adopt it."
+            "charter position ('axes'), plus 'review_mass' (the share of "
+            "REP behind the settled scores, per axis in 'mass'). Ratings "
+            "come from staked reviews settled on chain (ToolBond) by REP "
+            "weight. Read it like this: high 'rating' with high "
+            "'review_mass' = trusted by earned voice; 'review_mass' near "
+            "zero = nobody has reviewed it yet, inspect it (vet_tool) or "
+            "verify before trusting; a bad (negative) rating or a high "
+            "'harm' (0 safe .. 1 malicious, with 'harm_mass' REP behind it) "
+            "= avoid or verify. There is no vetted flag: how much backing "
+            "is enough is your call. Only staked tools are listed: 'bonded' "
+            "(null = chain unreachable), 'stake', the live 'chain_rating' "
+            "per axis, and 'author_context' (author REP, their other tools "
+            "and the highest harm among them). Author context informs, it "
+            "does not rank. Use the digest with adopt_tool (if granted) or "
+            "ask your owner to grant/adopt it."
         ),
         input_schema={
             "type": "object",
@@ -3051,15 +3033,13 @@ async def _adopt_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]
 
 
 async def _vet_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
-    """Inspection-review rail (v4.1 gradient trust — memory
-    tool-economy-v4-gradient-trust).
+    """Inspection review (docs/multi_jurisdiction.md decision 10).
 
-    Inspect (no verdict) → manifest + pinned code; attest (verdict +
-    report + optional per-axis scores) → local inspection row +
-    consensus tool_used event with vet=True. The inspection moves the
-    tool's public position/rating (weighted by the caller's reputation
-    × credibility) and mints NOTHING. The caller is derived, never
-    accepted as input.
+    Inspect (no verdict) returns the manifest and pinned code; a verdict
+    plus report records the inspection locally and queues the caller's
+    staked review (axes, harm, stake) into its ToolBond epoch batch. No
+    usage receipt and no gossip: it mints nothing. The caller is derived,
+    never accepted as input.
     """
     from .tool_store import OWNER_AUTHOR
     digest = str(input.get("digest") or "").strip()
@@ -3071,14 +3051,38 @@ async def _vet_tool(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
     raw_axes = input.get("axes")
     axes = raw_axes if isinstance(raw_axes, dict) else None
     try:
-        return await runtime.tool_store.vet_tool(
+        result = await runtime.tool_store.vet_tool(
             caller, digest,
             verdict=str(verdict) if verdict is not None else None,
             report=str(input.get("report") or ""),
             axes=axes,
+            harm=input.get("harm"),
         )
     except Exception as exc:
         return {"error": str(exc)}
+    if verdict is not None and "error" not in result and result.get("digest"):
+        review = {"digest": result["digest"], "axes": axes or {},
+                  "harm": input.get("harm"), "stake": input.get("stake"),
+                  "evidence_hash": result.get("review_digest") or "",
+                  "author": result.get("tool_author") or ""}
+        result["review"] = await _queue_staked_reviews(runtime, caller_id, [review])
+    return result
+
+
+async def _queue_staked_reviews(runtime: Runtime, caller_id: Any,
+                                reviews: list[dict[str, Any]]) -> dict[str, Any]:
+    """Queue reviews into the caller's ToolBond epoch batch (never raises)."""
+    if not reviews:
+        return {"queued": 0}
+    if caller_id is None or is_owner_caller(caller_id):
+        return {"queued": 0, "note": "the owner has no agent key: staked "
+                                     "reviews are sent by registered agents"}
+    try:
+        from .runtime.review_batch import queue_reviews
+        return await queue_reviews(runtime, str(caller_id), reviews)
+    except Exception as exc:  # noqa: BLE001 (the attestation itself stands)
+        log.warning("queueing staked reviews failed: %s", exc)
+        return {"queued": 0, "note": f"reviews not queued: {exc}"}
 
 
 async def _check_evidence(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
@@ -3150,9 +3154,16 @@ async def _attest_tools(runtime: Runtime, input: dict[str, Any]) -> dict[str, An
     caller = OWNER_AUTHOR if is_owner_caller(caller_id) else str(caller_id)
 
     try:
-        return runtime.tool_store.attest_usage(caller, judgments, context)
+        result = runtime.tool_store.attest_usage(caller, judgments, context)
     except Exception as exc:
         return {"error": str(exc)}
+    # Usage receipts stay as they are (they mint); the review half goes on
+    # chain: each judgment's axes / harm / stake become a staked review in
+    # the caller's ToolBond epoch batch (docs/multi_jurisdiction.md 10).
+    reviews = [r for r in (result.pop("_reviews", None) or [])]
+    if reviews:
+        result["reviews"] = await _queue_staked_reviews(runtime, caller_id, reviews)
+    return result
 
 
 async def _probe_tools(runtime: Runtime, input: dict[str, Any]) -> dict[str, Any]:
@@ -4301,6 +4312,7 @@ def resolve_tool_surface(tool_spec: list[str]) -> list[dict[str, Any]]:
 
     Returns a list of tool dicts ready for the bridge.
     """
+    _refresh_review_tools()
     if not tool_spec:
         # Default: delegate subset
         return _get_delegate_tools()
@@ -5291,11 +5303,6 @@ _EXECUTORS: dict[str, ToolExecutor] = {
     "reject_task": _reject_task,
 }
 
-# Auditor flags on staked tools (atn/tool_flags.py; vetting bundle).
-from .tool_flags import FLAG_TOOL_DEFINITION, flag_tool as _flag_tool  # noqa: E402
-_TOOLS.append(FLAG_TOOL_DEFINITION)
-_EXECUTORS["flag_tool"] = _flag_tool
-_TOOL_CATEGORIES["vetting"].add("flag_tool")
 
 
 # Agent-callable confinement (H2). The tools a sub-agent may invoke via
@@ -5311,8 +5318,46 @@ _TOOL_CATEGORIES["vetting"].add("flag_tool")
 _AGENT_CALLABLE_TOOLS: frozenset[str] = frozenset(t.name for t in _TOOLS)
 
 
+_REVIEW_TOOL_BASE: dict[str, str] = {
+    t.name: t.description for t in _TOOLS if t.name in ("attest_tools", "vet_tool")}
+
+
+def review_axes_text() -> str:
+    """The active charter's axes, harm and stake, as the review tools
+    describe them (docs/multi_jurisdiction.md decisions 5 and 10)."""
+    try:
+        from nodes.common.world_model_substrate.charter import active_charter
+        axes = active_charter().axes
+    except Exception:  # noqa: BLE001 (standalone atn install)
+        return ""
+    listed = "; ".join(f"{aid} ({thesis})" for aid, thesis in axes)
+    return (
+        " REVIEW: rate per charter axis in 'axes' when you have a real "
+        f"signal, signed scores -1..+1 keyed by axis id: {listed}. Score only "
+        "axes you actually observed; omit the rest. 'harm': 0 safe .. 1 "
+        "malicious, optional. 'stake': optional ATN in base units (default "
+        "0). Reviews are staked on chain (ToolBond): committed hidden in your "
+        "epoch batch and revealed by this daemon after the epoch's anchor. "
+        "The rating settles by REP weight; it ranks the tool in library "
+        "search, and the author's bond is slashed in proportion to the "
+        "settled harm. Reviews close to the settled rating earn part of the "
+        "tool's mint (stake x accuracy, early reviews most) and win the "
+        "inaccurate reviewers' lost stake; a far-off review loses stake and "
+        "REP. You cannot review your own tools.")
+
+
+def _refresh_review_tools() -> None:
+    """Rewrite the review tools' descriptions for the active charter."""
+    text = review_axes_text()
+    for t in _TOOLS:
+        base = _REVIEW_TOOL_BASE.get(t.name)
+        if base is not None:
+            t.description = base + text
+
+
 def get_tool_definitions() -> list[ToolDefinition]:
     """Return all core ATN tool definitions (for the LLM)."""
+    _refresh_review_tools()
     return list(_TOOLS)
 
 
@@ -5322,6 +5367,7 @@ def get_tool_definitions_for_bridge() -> list[dict[str, Any]]:
     The bridge expects: {name, description, input_schema} for each tool.
     These are converted to Zod schemas at runtime in the TypeScript bridge.
     """
+    _refresh_review_tools()
     return [
         {
             "name": t.name,
@@ -5334,6 +5380,7 @@ def get_tool_definitions_for_bridge() -> list[dict[str, Any]]:
 
 def get_all_tool_defs() -> list[dict[str, Any]]:
     """Return all core tool definitions (name, description, input_schema)."""
+    _refresh_review_tools()
     return [
         {"name": t.name, "description": t.description, "input_schema": t.input_schema}
         for t in _TOOLS
@@ -5342,6 +5389,7 @@ def get_all_tool_defs() -> list[dict[str, Any]]:
 
 def get_core_tool_def(name: str) -> dict[str, Any] | None:
     """Return a single core tool definition by name, or None."""
+    _refresh_review_tools()
     for t in _TOOLS:
         if t.name == name:
             return {"name": t.name, "description": t.description, "input_schema": t.input_schema}

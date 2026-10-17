@@ -541,6 +541,15 @@ with the timelock as governor.
 
 ## Decision (2026-10-13): staked tools, flagged audits, REP-settled verdicts
 
+> **Audit half superseded (2026-10-17).** The flagged audits, the vetted
+> flag, the auditor share and the off-chain credibility number are replaced
+> by staked reviews (docs/multi_jurisdiction.md decision 10, ToolBond
+> 448023a): one review type with per-axis scores and harm, committed and
+> revealed per agent per epoch, settled on chain by REP weight. The close
+> reads ratings and the reviewer share from ToolBond pinned to the previous
+> anchor. The author stake, novelty, successor and run-gate (bonded only)
+> rules below still stand.
+
 User-ratified 2026-10-13, NOT BUILT. Addresses the open problem of
 malicious tools: someone else's code running on your machine. Design
 principle: never assume honest actors are the majority; the network may go

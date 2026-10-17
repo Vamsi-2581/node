@@ -65,7 +65,7 @@ class FederatedCloseResult:
     world_cid: str = ""
     world_checkpoint_blob: bytes = b""
     # Verifiable carry-over (payload schema 4). Every daemon computes the
-    # same canonical bundle of the five tool maps this close produced
+    # same canonical bundle of the three tool maps this close produced
     # (the next close's inputs); its cid rides the payload's carry_cid
     # field and every daemon publishes the blob, so a joiner can fetch
     # and verify it against the anchor instead of trusting a peer.
@@ -119,8 +119,6 @@ class FederatedCloseDriver:
         tool_registrations_path: Optional[Any] = None,
         tool_vetting_path: Optional[Any] = None,
         tool_positions_path: Optional[Any] = None,
-        tool_credibility_path: Optional[Any] = None,
-        tool_review_book_path: Optional[Any] = None,
     ):
         self.gossip = gossip
         self.pricing = pricing
@@ -164,21 +162,6 @@ class FederatedCloseDriver:
         self._tool_positions: Dict[str, Dict[str, Any]] = (
             self._load_tool_positions()
         )
-        # v4.1 gradient-trust carry-over (memory/tool_economy_v4_gradient_trust.md):
-        # household -> credibility multiplier (drift-weight), and the
-        # per-household review book (digest -> household -> axis -> {sum,n}).
-        # Same rebuildable-cache contract as positions: derived purely from
-        # canonical events + carried state, identical on every honest daemon.
-        self._tool_credibility_path: Optional[Path] = (
-            Path(tool_credibility_path) if tool_credibility_path else None
-        )
-        self._tool_credibility: Dict[str, float] = (
-            self._load_tool_credibility()
-        )
-        self._tool_review_book_path: Optional[Path] = (
-            Path(tool_review_book_path) if tool_review_book_path else None
-        )
-        self._tool_review_book: Dict[str, Any] = self._load_tool_review_book()
         # Owner-rooted damper exclusion (spec: Owner-rooted registration):
         # agent id -> owner wallet, sourced from chain owner-binding data
         # (OwnerBound events / getAgentOwner). Every daemon reading
@@ -210,11 +193,12 @@ class FederatedCloseDriver:
         self.emission_pool: Optional[float] = None
         # anchorCount at the last successful voice/pool refresh.
         self.snapshot_anchor_count: Optional[int] = None
-        # ToolBond vetting snapshot (Decision 2026-10-13): vetted tools and
-        # their auditors, rebuilt from ToolBond logs pinned to the same
-        # snapshot anchor block, by the same voice_source refresh. None
-        # (no chain source / no ToolBond) = no auditor shares.
-        self.vetting_snapshot: Optional[Dict[str, Any]] = None
+        # ToolBond review snapshot (docs/multi_jurisdiction.md decision 10):
+        # tool ratings and the reviewer-share rounds, rebuilt from ToolBond
+        # logs pinned to the same snapshot anchor block, by the same
+        # voice_source refresh. None (no chain source / no ToolBond) = zero
+        # ratings and no reviewer shares.
+        self.review_snapshot: Optional[Dict[str, Any]] = None
         # The jurisdiction's charter text pinned to the snapshot anchor
         # (docs/multi_jurisdiction.md decision 5), read by the same
         # voice_source refresh. None = no pinned read (no DAO Registry
@@ -264,8 +248,6 @@ class FederatedCloseDriver:
             "tool_registrations": self._tool_registrations_path,
             "tool_vetting": self._tool_vetting_path,
             "tool_positions": self._tool_positions_path,
-            "tool_credibility": self._tool_credibility_path,
-            "tool_review_book": self._tool_review_book_path,
         }
 
     def carry_over_maps(self) -> Dict[str, Any]:
@@ -274,12 +256,10 @@ class FederatedCloseDriver:
             "tool_registrations": self._tool_registrations,
             "tool_vetting": self._tool_vetting,
             "tool_positions": self._tool_positions,
-            "tool_credibility": self._tool_credibility,
-            "tool_review_book": self._tool_review_book,
         }
 
     def install_carry_over(self, carry: Dict[str, Any]) -> None:
-        """Install a VERIFIED carry-over bundle (all five maps) as this
+        """Install a VERIFIED carry-over bundle (all three maps) as this
         daemon's close inputs: persist every file, then reload the
         in-memory maps through the normal loaders so the joiner holds
         exactly what an always-on daemon would after a restart.
@@ -297,15 +277,9 @@ class FederatedCloseDriver:
         self._save_tool_vetting()
         self._tool_positions = dict(carry["tool_positions"])
         self._save_tool_positions()
-        self._tool_credibility = dict(carry["tool_credibility"])
-        self._save_tool_credibility()
-        self._tool_review_book = dict(carry["tool_review_book"])
-        self._save_tool_review_book()
         self._tool_registrations = self._load_tool_registrations()
         self._tool_vetting = self._load_tool_vetting()
         self._tool_positions = self._load_tool_positions()
-        self._tool_credibility = self._load_tool_credibility()
-        self._tool_review_book = self._load_tool_review_book()
 
     def _carry_files_missing(self) -> bool:
         paths = self.carry_over_paths()
@@ -436,9 +410,9 @@ class FederatedCloseDriver:
             if state.get("snapshot_anchor_count") is not None:
                 self.snapshot_anchor_count = int(
                     state["snapshot_anchor_count"])
-            vetting = state.get("vetting_snapshot")
-            if isinstance(vetting, dict):
-                self.vetting_snapshot = vetting
+            reviews = state.get("review_snapshot")
+            if isinstance(reviews, dict):
+                self.review_snapshot = reviews
             if "charter_text" in state:
                 text = state.get("charter_text")
                 self.pinned_charter_text = str(text) if text else None
@@ -548,10 +522,8 @@ class FederatedCloseDriver:
                 tool_positions=dict(self._tool_positions),
                 rep_shares=(dict(self.rep_shares)
                             if self.rep_shares else None),
-                tool_credibility=dict(self._tool_credibility),
-                tool_review_book=dict(self._tool_review_book),
-                vetting_snapshot=(dict(self.vetting_snapshot)
-                                  if self.vetting_snapshot else None),
+                review_snapshot=(dict(self.review_snapshot)
+                                 if self.review_snapshot else None),
             )
         except Exception as e:
             logger.error(
@@ -581,13 +553,11 @@ class FederatedCloseDriver:
         self._save_tool_vetting()
         self._tool_positions = dict(close_result.get("tool_positions") or {})
         self._save_tool_positions()
-        # These are the AUTHORITATIVE positions: this close weighted review
-        # drift by rep_share × credibility (see the tool_positions=... /
-        # rep_shares=... arguments above), which the daemon's own local
-        # projection does not. Push them onto the live world so library
-        # ranking (infer_artifacts reads the drifted head off the
-        # observation coords) matches consensus instead of an unweighted
-        # local view in which zero-reputation reviews still move rankings.
+        # These are the AUTHORITATIVE positions: the ToolBond ratings pinned
+        # to the previous anchor (review_snapshot above), which the daemon's
+        # own local projection does not read. Push them onto the live world
+        # so library ranking (infer_artifacts reads the head off the
+        # observation coords) matches consensus.
         try:
             world_service = getattr(self.gossip, "world_service", None)
             applier = getattr(
@@ -596,20 +566,13 @@ class FederatedCloseDriver:
                 applier(self._tool_positions)
         except Exception as e:
             logger.warning("applying federated tool positions failed: %s", e)
-        # v4.1 carried gradient-trust state (rebuildable cache).
-        self._tool_credibility = dict(
-            close_result.get("tool_credibility") or {})
-        self._save_tool_credibility()
-        self._tool_review_book = dict(
-            close_result.get("tool_review_book") or {})
-        self._save_tool_review_book()
 
         # Inherit epoch_id from the local close so on-chain dedup
         # (isAnchored(epoch_id)) can reject duplicate submissions.
         epoch_id = str(local_close_result.get("epoch_id") or "")
         close_result["epoch_id"] = epoch_id
 
-        # Verifiable carry-over (payload schema 4): commit the five maps
+        # Verifiable carry-over (payload schema 4): commit the three maps
         # this close produced (the next close's inputs) as one canonical
         # bundle whose cid rides the payload. Pure function of the close
         # output, so identical on every honest daemon.
@@ -757,59 +720,3 @@ class FederatedCloseDriver:
             os.replace(tmp, path)
         except OSError as e:
             logger.warning("failed to persist tool positions: %s", e)
-
-    def _load_tool_credibility(self) -> Dict[str, float]:
-        path = self._tool_credibility_path
-        if path is None or not path.exists():
-            return {}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return {str(k): float(v) for k, v in data.items()}
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
-            logger.warning("tool credibility cache unreadable (%s); starting "
-                           "empty — it rebuilds from canonical events", e)
-        return {}
-
-    def _save_tool_credibility(self) -> None:
-        path = self._tool_credibility_path
-        if path is None:
-            return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(
-                json.dumps(dict(sorted(self._tool_credibility.items()))),
-                encoding="utf-8",
-            )
-            os.replace(tmp, path)
-        except OSError as e:
-            logger.warning("failed to persist tool credibility: %s", e)
-
-    def _load_tool_review_book(self) -> Dict[str, Any]:
-        path = self._tool_review_book_path
-        if path is None or not path.exists():
-            return {}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("tool review book cache unreadable (%s); starting "
-                           "empty — it rebuilds from canonical events", e)
-        return {}
-
-    def _save_tool_review_book(self) -> None:
-        path = self._tool_review_book_path
-        if path is None:
-            return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(
-                json.dumps(self._tool_review_book, sort_keys=True),
-                encoding="utf-8",
-            )
-            os.replace(tmp, path)
-        except OSError as e:
-            logger.warning("failed to persist tool review book: %s", e)

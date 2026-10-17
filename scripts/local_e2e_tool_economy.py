@@ -43,6 +43,16 @@ REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+# Isolation before ANY atn / nodes import: the keystore resolves
+# KEYSTORE_DIR at import time and several modules read Path.home(), so the
+# run's agent keys must never land in the real ~/.atn vault. Child
+# processes (npx / hardhat) get the original environment.
+_ORIG_ENV = dict(os.environ)
+_TMP_HOME = Path(tempfile.mkdtemp(prefix="e2e_econ_home_"))
+os.environ["KEYSTORE_DIR"] = str(_TMP_HOME / "keystore")
+os.environ["USERPROFILE"] = str(_TMP_HOME)
+os.environ["HOME"] = str(_TMP_HOME)
+
 # E2E_HARDHAT_PORT moves the run off 8545 when another chain lives there.
 HARDHAT_PORT = int(os.environ.get("E2E_HARDHAT_PORT", "8545"))
 RPC_URL = f"http://127.0.0.1:{HARDHAT_PORT}"
@@ -117,7 +127,7 @@ def _run(cmd: List[str], cwd: Path, timeout: int = 300) -> subprocess.CompletedP
     log(f"$ {' '.join(cmd)}")
     return subprocess.run(
         cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
-        shell=(os.name == "nt"),
+        shell=(os.name == "nt"), env=_ORIG_ENV,
     )
 
 
@@ -151,7 +161,7 @@ def start_hardhat(cwd: Path) -> subprocess.Popen:
     # HeadersTimeoutError on the deploy side). DEVNULL keeps it draining.
     proc = subprocess.Popen(
         [_npx(), "hardhat", "node", "--port", str(HARDHAT_PORT)],
-        cwd=str(cwd),
+        cwd=str(cwd), env=_ORIG_ENV,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         shell=(os.name == "nt"),
         creationflags=creationflags,
@@ -271,7 +281,7 @@ def deploy_contracts(cwd: Path) -> Dict[str, Optional[str]]:
     out_json.parent.mkdir(parents=True, exist_ok=True)
     tmp_js.write_text(DEPLOY_JS, encoding="utf-8")
     try:
-        env = dict(os.environ)
+        env = dict(_ORIG_ENV)
         env["DEPLOY_OUT"] = str(out_json)
         env["HARDHAT_LOCAL_URL"] = RPC_URL
         log("deploying Substrate + ServiceMarket via hardhat run…")
@@ -705,10 +715,11 @@ async def amain() -> int:
             rt_a, caller_id="caller-1")
         assert att.get("attested") == 1, att
 
-        # Vetting (spec: Vetting section): a published manifest is a
-        # CANDIDATE — no mint until greenlit by vets from distinct
-        # fleets. Two validators inspect (manifest + pinned code back)
-        # then attest pass with a report.
+        # Inspections: two validators read the manifest + pinned code,
+        # then record a pass with a report. Since staked reviews
+        # (docs/multi_jurisdiction.md decision 10) an inspection is a
+        # ToolBond review, recorded locally and never gossiped; these
+        # vetters are not registered on chain, so nothing is queued.
         await register_local_agent(rt_a, "vetter-1")
         await register_local_agent(rt_a, "vetter-2")
         for v in ("vetter-1", "vetter-2"):
@@ -722,9 +733,13 @@ async def amain() -> int:
                            "no fs/net/env access"},
                 rt_a, caller_id=v)
             assert vet.get("verdict") == "pass", vet
-        n_vets = sum(1 for e in captured_events if e.get("vet"))
+        n_vets = store.vet_summary().get(tool_digest, {}).get("pass_count", 0)
         s4.note("vets", n_vets)
         assert n_vets == 2
+        assert not any(e.get("vet") for e in captured_events), \
+            "inspections no longer ride the consensus rail"
+        assert not any("axes" in e for e in captured_events), \
+            "review axes no longer ride the consensus rail"
 
         # Pull the registration sprout events out of the WorldService's
         # epoch buffer (the manifest sink routed them there). These are the
@@ -1148,7 +1163,7 @@ async def amain() -> int:
     try:
         kill_hardhat(hh_proc)
         hh_proc = None
-        for d in (tmp_a, tmp_b):
+        for d in (tmp_a, tmp_b, _TMP_HOME):
             shutil.rmtree(d, ignore_errors=True)
         # Leave no trace: the inline deployer writes a deployment record.
         try:

@@ -63,7 +63,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from .federated_reconcile import AUDITOR_SHARE_BPS_DEFAULT, VOICE_EPSILON
+from .federated_reconcile import VOICE_EPSILON
 
 logger = logging.getLogger(__name__)
 
@@ -237,27 +237,36 @@ def _get_logs(event, w3, address: str, to_block: int):
 
 
 # ---------------------------------------------------------------------------
-# ToolBond vetting snapshot (docs/tool_substrate.md, Decision 2026-10-13).
+# ToolBond review snapshot (docs/multi_jurisdiction.md decision 10).
 #
-# The close gives a VETTED tool's auditors (the green flaggers of the round
-# that vetted it) ``auditorShareBps`` of the tool's mint, split by flag
-# weight. That needs ToolBond state AS OF the same snapshot as the voice
-# weights. ToolBond keeps no checkpoints, and an eth_call at the anchor
-# block needs archive state (a non-archive daemon would fall back and fork
-# from an archive one), so the state is REBUILT from ToolBond's event logs
-# up to the snapshot block, exactly like the owner map above: deterministic
-# chain history, served by non-archive nodes. The fold mirrors the
-# contract's storage writes:
+# ToolBond (trustless-contracts 448023a) is the single source of tool
+# ratings: staked reviews, committed and revealed per agent per epoch, settle
+# per tool round by REP weight. The close reads, pinned to the SAME snapshot
+# block as the voice weights:
 #
-#   isBonded  = !slashed && no pending unbond && stake > 0 && stake >= minStake
-#   isVetted  = isBonded && vetted && no Malware verdict pending on the
-#               current round (VerdictReached/Overruled Malware, not yet
-#               Finalized: isVetted turns false as soon as it settles)
-#   auditors  = revealed green flaggers of the latest round Finalized Clean,
-#               weight = FlagCommitted.weight (== flags(...).weight)
-#   bps       = auditorShareBps of the last ParamsSet (the constructor emits
-#               one); older deployments have no such event => default.
+#   - each tool's rating per charter axis and its harm over every round
+#     finalized at or before the block (what toolRating / toolHarm return at
+#     that block), and
+#   - the rounds finalized in the window since the anchor before it, with
+#     each review's stake, accuracy and the axes it scored, for the reviewer
+#     share of the tool's mint.
+#
+# An eth_call at the anchor block needs archive state, so the state is
+# REBUILT from ToolBond's logs up to the snapshot block, like the owner map:
+# a round's per-axis sums and masses are the sums of its Reviewed events
+# (the contract's _record writes exactly these), and a round joins the
+# tool's rating when its Finalized event lands. Two facts the logs do not
+# carry are read from immutable views at the latest block: an epoch's axis
+# ids and REP supply (epochInfo, fixed once the epoch starts, which precedes
+# any reveal) and a finalized review's accuracy (reviewAt, fixed once the
+# round is Done). Any daemon, archive or not, derives the same snapshot.
 # ---------------------------------------------------------------------------
+
+REVIEWER_SHARE_BPS_DEFAULT = 4000
+_NO_SCORE = -128
+_NO_HARM = 255
+_UNINFORMATIVE = 2 ** 64 - 1
+
 
 def _ev(name: str, fields: list) -> Dict[str, Any]:
     return {
@@ -268,34 +277,37 @@ def _ev(name: str, fields: list) -> Dict[str, Any]:
 
 
 _TOOL_BOND_EVENTS_ABI = [
-    _ev("Bonded", [("digest", "bytes32", True), ("author", "address", True),
-                   ("amount", "uint256", False), ("stake", "uint256", False)]),
-    _ev("UnbondRequested", [("digest", "bytes32", True),
-                            ("availableAt", "uint256", False)]),
-    _ev("Unbonded", [("digest", "bytes32", True), ("author", "address", True),
-                     ("amount", "uint256", False)]),
-    _ev("FlagCommitted", [("digest", "bytes32", True), ("round", "uint32", True),
-                          ("auditor", "address", True), ("weight", "uint256", False)]),
-    _ev("FlagRevealed", [("digest", "bytes32", True), ("round", "uint32", True),
-                         ("auditor", "address", True), ("red", "bool", False),
-                         ("evidenceHash", "bytes32", False)]),
-    _ev("VerdictReached", [("digest", "bytes32", True), ("round", "uint32", True),
-                           ("verdict", "uint8", False), ("appealEnds", "uint48", False)]),
-    _ev("Overruled", [("digest", "bytes32", True), ("round", "uint32", True),
-                      ("verdict", "uint8", False)]),
-    _ev("Finalized", [("digest", "bytes32", True), ("round", "uint32", True),
-                      ("verdict", "uint8", False), ("repPool", "uint256", False),
-                      ("atnPool", "uint256", False)]),
-    _ev("ParamsSet", [("minStake", "uint256", False), ("thresholdBps", "uint256", False),
-                      ("reviewWindow", "uint256", False), ("revealWindow", "uint256", False),
-                      ("finderBps", "uint256", False), ("degradeBps", "uint256", False),
-                      ("authorSlashBps", "uint256", False), ("unbondDelay", "uint256", False),
-                      ("auditorShareBps", "uint256", False)]),
+    _ev("Reviewed", [("digest", "bytes32", True), ("epoch", "uint256", True),
+                     ("reviewer", "address", True), ("scores", "bytes", False),
+                     ("harm", "uint8", False), ("stake", "uint256", False),
+                     ("weight", "uint256", False), ("evidenceHash", "bytes32", False)]),
+    _ev("Finalized", [("digest", "bytes32", True), ("epoch", "uint256", True),
+                      ("harm", "uint256", False), ("bondSlashed", "uint256", False),
+                      ("lossPool", "uint256", False), ("repPool", "uint256", False)]),
+    _ev("ParamsSet", [("minStake", "uint256", False), ("revealWindow", "uint256", False),
+                      ("degradeBps", "uint256", False), ("authorSlashBps", "uint256", False),
+                      ("unbondDelay", "uint256", False), ("reviewerShareBps", "uint256", False),
+                      ("harmWeightBps", "uint256", False)]),
 ]
 
-# ToolBond.Verdict enum
-_VERDICT_CLEAN = 1
-_VERDICT_MALWARE = 2
+_REVIEW_COMPONENTS = [
+    {"name": "reviewer", "type": "address"}, {"name": "harm", "type": "uint8"},
+    {"name": "claimed", "type": "bool"}, {"name": "accuracy", "type": "uint64"},
+    {"name": "scores", "type": "bytes16"}, {"name": "stake", "type": "uint128"},
+    {"name": "weight", "type": "uint128"}, {"name": "harmAccuracy", "type": "uint64"},
+]
+
+_TOOL_BOND_VIEWS_ABI = [
+    {"name": "epochInfo", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "epoch", "type": "uint256"}],
+     "outputs": [{"name": "started", "type": "bool"}, {"name": "charterHash", "type": "bytes32"},
+                 {"name": "axisIds", "type": "bytes32[]"}, {"name": "snapshot", "type": "uint48"},
+                 {"name": "supply", "type": "uint256"}, {"name": "revealDeadline", "type": "uint256"}]},
+    {"name": "reviewAt", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "digest", "type": "bytes32"}, {"name": "epoch", "type": "uint256"},
+                {"name": "i", "type": "uint256"}],
+     "outputs": [{"name": "", "type": "tuple", "components": _REVIEW_COMPONENTS}]},
+]
 
 
 def _hex32(value: Any) -> str:
@@ -303,103 +315,132 @@ def _hex32(value: Any) -> str:
     return str(raw).lower().removeprefix("0x")
 
 
-def tool_vetting_snapshot_from_logs(
+def _int8(b: int) -> int:
+    return b - 256 if b > 127 else b
+
+
+def tool_review_snapshot_from_logs(
     records: List[Dict[str, Any]],
     *,
-    default_bps: int = AUDITOR_SHARE_BPS_DEFAULT,
+    block: int,
+    since_block: int,
+    epochs: Dict[int, Dict[str, Any]],
+    accuracies: Dict[Tuple[str, int, int], Optional[int]],
+    axis_ids: List[str],
+    default_bps: int = REVIEWER_SHARE_BPS_DEFAULT,
 ) -> Dict[str, Any]:
-    """Fold ToolBond event records into the close's vetting snapshot.
+    """Fold ToolBond records into the close's review snapshot. Pure, so it is
+    testable without a chain.
 
     ``records``: ``{"block", "index", "event", "args"}`` dicts (any order;
-    folded in (block, logIndex) order). Pure, so it is testable without a
-    chain. Returns {"auditor_share_bps": int, "tools": {digest: {"round":
-    int, "auditors": {address_lower: weight}}}} listing only vetted tools
-    with at least one weighted green auditor.
+    folded in (block, logIndex) order). ``epochs``: epoch -> {"axis_ids":
+    [hex keccak of each charter axis id, in that epoch's order], "supply":
+    int}. ``accuracies``: (digest, epoch, review index) -> accuracy (1e18
+    scale, None when uninformative), needed only for rounds finalized in
+    (since_block, block]. ``axis_ids``: the active charter's axis ids; a
+    ToolBond axis key outside it is dropped (a removed axis).
+
+    Returns::
+
+      {"reviewer_share_bps": int,
+       "tools": {digest: {"axes": {axis_id: {"sum": int, "mass": int}},
+                          "harm": {"sum": int, "mass": int}}},
+       "rounds": {digest: [{"epoch", "supply", "prior_mass": {axis_id|"harm": int},
+                            "reviews": [{"reviewer", "stake", "accuracy",
+                                         "axes": [axis ids scored], "harm": bool}]}]}}
     """
+    from eth_utils import keccak
+
+    key_to_axis = {keccak(text=a).hex().lower().removeprefix("0x"): a for a in axis_ids}
     ordered = sorted(records, key=lambda r: (int(r["block"]), int(r["index"])))
-    min_stake = 0
     bps: Optional[int] = None
-    bonds: Dict[str, Dict[str, Any]] = {}
-    weights: Dict[Tuple[str, int, str], int] = {}
-    green: Dict[Tuple[str, int], set] = {}
-
-    def bond(d: str) -> Dict[str, Any]:
-        return bonds.setdefault(d, {
-            "stake": 0, "unbond": False, "slashed": False, "vetted": False,
-            "round": 0, "clean_round": None, "verdicts": {}, "finalized": set(),
-        })
-
+    reviews: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    finalized: List[Tuple[str, int, int]] = []   # (digest, epoch, block), in order
     for r in ordered:
+        if int(r["block"]) > int(block):
+            break
         name, a = r["event"], r["args"]
         if name == "ParamsSet":
-            min_stake = int(a["minStake"])
-            bps = int(a["auditorShareBps"])
-            continue
-        d = _hex32(a["digest"])
-        b = bond(d)
-        if "round" in a:
-            b["round"] = max(b["round"], int(a["round"]))
-        if name == "Bonded":
-            b["stake"] = int(a["stake"])
-            b["unbond"] = False
-        elif name == "UnbondRequested":
-            b["unbond"] = True
-        elif name == "Unbonded":
-            b["stake"], b["unbond"], b["vetted"] = 0, False, False
-        elif name == "FlagCommitted":
-            key = (d, int(a["round"]), str(a["auditor"]).lower())
-            weights[key] = int(a["weight"])
-        elif name == "FlagRevealed":
-            if not bool(a["red"]):
-                green.setdefault((d, int(a["round"])), set()).add(
-                    str(a["auditor"]).lower())
-        elif name in ("VerdictReached", "Overruled"):
-            b["verdicts"][int(a["round"])] = int(a["verdict"])
+            bps = int(a["reviewerShareBps"])
+        elif name == "Reviewed":
+            reviews.setdefault((_hex32(a["digest"]), int(a["epoch"])), []).append({
+                "reviewer": str(a["reviewer"]).lower(),
+                "scores": bytes(a["scores"]), "harm": int(a["harm"]),
+                "stake": int(a["stake"]), "weight": int(a["weight"]),
+            })
         elif name == "Finalized":
-            rnd, verdict = int(a["round"]), int(a["verdict"])
-            b["finalized"].add(rnd)
-            if verdict == _VERDICT_MALWARE:
-                b["stake"], b["unbond"] = 0, False
-                b["slashed"], b["vetted"] = True, False
-            elif verdict == _VERDICT_CLEAN:
-                b["vetted"] = True
-                b["clean_round"] = rnd
+            finalized.append((_hex32(a["digest"]), int(a["epoch"]), int(r["block"])))
 
-    tools: Dict[str, Any] = {}
-    for d in sorted(bonds):
-        b = bonds[d]
-        bonded = (not b["slashed"] and not b["unbond"] and b["stake"] > 0
-                  and b["stake"] >= min_stake)
-        cur = b["round"]
-        malware_pending = (b["verdicts"].get(cur) == _VERDICT_MALWARE
-                           and cur not in b["finalized"])
-        if not (bonded and b["vetted"]) or malware_pending:
-            continue
-        rnd = b["clean_round"]
-        auditors = {
-            addr: weights.get((d, rnd, addr), 0)
-            for addr in sorted(green.get((d, rnd), set()))
-        }
-        auditors = {k: v for k, v in auditors.items() if v > 0}
-        if auditors:
-            tools[d] = {"round": int(rnd), "auditors": auditors}
+    tools: Dict[str, Dict[str, Any]] = {}
+    rounds: Dict[str, List[Dict[str, Any]]] = {}
+    for digest, epoch, fin_block in finalized:
+        revs = reviews.get((digest, epoch), [])
+        info = epochs.get(epoch) or {}
+        keys = [str(k).lower().removeprefix("0x") for k in (info.get("axis_ids") or [])]
+        sums: Dict[str, List[int]] = {}
+        h_sum = h_mass = 0
+        for v in revs:
+            w = v["weight"]
+            for i, b in enumerate(v["scores"][:len(keys)]):
+                s = _int8(b)
+                axis = key_to_axis.get(keys[i])
+                if s == _NO_SCORE or w == 0 or axis is None:
+                    continue
+                cell = sums.setdefault(axis, [0, 0])
+                cell[0] += w * s
+                cell[1] += w
+            if v["harm"] != _NO_HARM and w > 0:
+                h_sum += w * v["harm"]
+                h_mass += w
+        tool = tools.setdefault(digest, {"axes": {}, "harm": {"sum": 0, "mass": 0}})
+        prior = {a: int(c["mass"]) for a, c in tool["axes"].items()}
+        prior["harm"] = int(tool["harm"]["mass"])
+        if fin_block > int(since_block):
+            entries = []
+            for i, v in enumerate(revs):
+                scored = [key_to_axis[keys[j]] for j, b in enumerate(v["scores"][:len(keys)])
+                          if _int8(b) != _NO_SCORE and keys[j] in key_to_axis]
+                acc = accuracies.get((digest, epoch, i))
+                entries.append({
+                    "reviewer": v["reviewer"], "stake": v["stake"],
+                    "accuracy": None if acc is None or int(acc) == _UNINFORMATIVE else int(acc),
+                    "axes": sorted(scored), "harm": v["harm"] != _NO_HARM,
+                })
+            rounds.setdefault(digest, []).append({
+                "epoch": epoch, "supply": int(info.get("supply") or 0),
+                "prior_mass": dict(sorted(prior.items())), "reviews": entries,
+            })
+        for axis, (sm, ms) in sums.items():
+            cell = tool["axes"].setdefault(axis, {"sum": 0, "mass": 0})
+            cell["sum"] += sm
+            cell["mass"] += ms
+        tool["harm"]["sum"] += h_sum
+        tool["harm"]["mass"] += h_mass
+
     return {
-        "auditor_share_bps": int(default_bps if bps is None else bps),
-        "tools": tools,
+        "reviewer_share_bps": int(default_bps if bps is None else bps),
+        "tools": {d: {"axes": dict(sorted(t["axes"].items())), "harm": dict(t["harm"])}
+                  for d, t in sorted(tools.items())},
+        "rounds": {d: rs for d, rs in sorted(rounds.items())},
     }
 
 
-def read_tool_vetting_snapshot(
-    w3: Any, tool_bond_address: str, block: int,
+def read_tool_review_snapshot(
+    w3: Any, tool_bond_address: str, block: int, *, since_block: int = 0,
+    axis_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """ToolBond vetting snapshot as of ``block`` (the snapshot anchor's
-    block), rebuilt from event logs. Raises on RPC failure, like the rest
-    of the voice read: the driver keeps its previous snapshot."""
+    """ToolBond review snapshot as of ``block`` (the snapshot anchor's
+    block), with the reviewer-share rounds finalized after ``since_block``
+    (the anchor before it). Raises on RPC failure, like the rest of the
+    voice read: the driver keeps its previous snapshot."""
     from web3 import Web3
 
+    if axis_ids is None:
+        from .world_model_substrate.charter import active_charter
+        axis_ids = list(active_charter().ids)
     contract = w3.eth.contract(
         address=Web3.to_checksum_address(tool_bond_address),
-        abi=_TOOL_BOND_EVENTS_ABI,
+        abi=_TOOL_BOND_EVENTS_ABI + _TOOL_BOND_VIEWS_ABI,
     )
     records: List[Dict[str, Any]] = []
     for spec in _TOOL_BOND_EVENTS_ABI:
@@ -411,7 +452,29 @@ def read_tool_vetting_snapshot(
                 "event": spec["name"],
                 "args": dict(log["args"]),
             })
-    return tool_vetting_snapshot_from_logs(records)
+    epochs: Dict[int, Dict[str, Any]] = {}
+    review_counts: Dict[Tuple[str, int], int] = {}
+    window: List[Tuple[str, int]] = []
+    for r in records:
+        if r["event"] == "Reviewed":
+            k = (_hex32(r["args"]["digest"]), int(r["args"]["epoch"]))
+            review_counts[k] = review_counts.get(k, 0) + 1
+        elif r["event"] == "Finalized":
+            e = int(r["args"]["epoch"])
+            if e not in epochs:
+                info = contract.functions.epochInfo(e).call()
+                epochs[e] = {"axis_ids": [_hex32(x) for x in info[2]],
+                             "supply": int(info[4])}
+            if int(r["block"]) > int(since_block):
+                window.append((_hex32(r["args"]["digest"]), e))
+    accuracies: Dict[Tuple[str, int, int], Optional[int]] = {}
+    for digest, e in sorted(set(window)):
+        for i in range(review_counts.get((digest, e), 0)):
+            v = contract.functions.reviewAt(bytes.fromhex(digest), e, i).call()
+            accuracies[(digest, e, i)] = int(v[3])
+    return tool_review_snapshot_from_logs(
+        records, block=block, since_block=since_block, epochs=epochs,
+        accuracies=accuracies, axis_ids=axis_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -497,12 +560,14 @@ def read_voice_state(
 ) -> Dict[str, Any]:
     """Read {owner_map, voice_weights, rep_shares, rep_supply, supply,
     snapshot_block, emission_pool, recycled, weight_source,
-    vetting_snapshot} as of the previous epoch's anchor.
+    review_snapshot} as of the previous epoch's anchor.
 
-    ``vetting_snapshot`` (Decision 2026-10-13): ToolBond vetted tools and
-    their auditors, rebuilt from ToolBond logs up to the SAME snapshot
-    block as the owner map (``read_tool_vetting_snapshot``). Empty
-    (``tools == {}``) when ``tool_bond_address`` is unset or at genesis.
+    ``review_snapshot`` (docs/multi_jurisdiction.md decision 10): ToolBond
+    ratings and the reviewer-share rounds, rebuilt from ToolBond logs up to
+    the SAME snapshot block as the owner map (``read_tool_review_snapshot``),
+    with the rounds finalized since the anchor before it. ``supply`` (REP)
+    rides along for the close's mass normalization. Empty (``tools == {}``)
+    when ``tool_bond_address`` is unset or at genesis.
 
     ``charter_text`` (docs/multi_jurisdiction.md decision 5): the DAO
     Registry's ``jurisdiction.autonet.charter`` value as of the SAME
@@ -548,8 +613,9 @@ def read_voice_state(
             "emission_pool_raw": 0,
             "snapshot_anchor_count": 0,
             "weight_source": "reputation",
-            "vetting_snapshot": {
-                "auditor_share_bps": AUDITOR_SHARE_BPS_DEFAULT, "tools": {}},
+            "review_snapshot": {
+                "reviewer_share_bps": REVIEWER_SHARE_BPS_DEFAULT,
+                "tools": {}, "rounds": {}, "supply": 0},
             "charter_text": None,
         }
     anchor = contract.functions.getAnchor(anchor_count - 1).call()
@@ -651,12 +717,19 @@ def read_voice_state(
             voice_weights[house] = round(epsilon + share, 9)
             rep_shares[house] = round(share, 9)
 
-    # ToolBond vetting snapshot, pinned to the same anchor block.
-    vetting_snapshot: Dict[str, Any] = {
-        "auditor_share_bps": AUDITOR_SHARE_BPS_DEFAULT, "tools": {}}
+    # ToolBond review snapshot, pinned to the same anchor block; the
+    # reviewer-share window opens at the anchor before it (block 0 = since
+    # deployment when this is the first anchor).
+    review_snapshot: Dict[str, Any] = {
+        "reviewer_share_bps": REVIEWER_SHARE_BPS_DEFAULT,
+        "tools": {}, "rounds": {}}
     if tool_bond_address:
-        vetting_snapshot = read_tool_vetting_snapshot(
-            w3, tool_bond_address, block)
+        since_block = 0
+        if anchor_count >= 2:
+            since_block = int(contract.functions.getAnchor(anchor_count - 2).call()[7])
+        review_snapshot = read_tool_review_snapshot(
+            w3, tool_bond_address, block, since_block=since_block)
+    review_snapshot["supply"] = int(supply)
 
     # The charter in force, pinned to the same anchor block.
     charter_text: Optional[str] = None
@@ -682,6 +755,6 @@ def read_voice_state(
         "emission_pool_raw": burned_raw,
         "snapshot_anchor_count": int(anchor_count),
         "weight_source": "reputation",
-        "vetting_snapshot": vetting_snapshot,
+        "review_snapshot": review_snapshot,
         "charter_text": charter_text,
     }

@@ -428,8 +428,7 @@ async def test_bonded_swap_runs_and_leaves_signed_evidence(tmp_path, monkeypatch
     rt, digest, fork = await _bound_swap(tmp_path)
     rt.get_agent("worker").loadout = fork
     seen: list[str] = []
-    rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: seen.append(d) or True,
-                                     vetted_checker=lambda d: True)
+    rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: seen.append(d) or True)
 
     out = await rt.engine.route_tool_call("bash", {"command": "echo hi"}, "worker")
     assert out == {"output": "swapped:echo hi", "exit_code": 0}
@@ -546,8 +545,7 @@ async def test_fallback_notice_fires_once_per_transition(tmp_path, monkeypatch):
 
     # Bond lands: active again, the notice clears.
     bonded["v"] = True
-    rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: bonded["v"],
-                                     vetted_checker=lambda d: True)
+    rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: bonded["v"])
     detail = await execute_tool("get_agent", {"agent_id": "worker"}, rt)
     assert detail["core_swap"][0]["state"] == "active"
     assert [e["state"] for e in seen] == ["fallback", "active"]

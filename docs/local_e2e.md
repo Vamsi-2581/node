@@ -546,11 +546,12 @@ is reachable from such a session.
     `PYTHONPATH`, but on a box with a pip-installed daemon, verify with
     `python -c "import atn; print(atn.__file__)"` before trusting a run.
 
-# Local end-to-end: the tool security rail
+# Local end-to-end: the tool security rail (staked reviews)
 
-`scripts/local_e2e_tool_security.py` proves the staked-tool rail
-(docs/tool_substrate.md, Decision 2026-10-13) against real contracts on a
-local hardhat node, driving the daemon code paths.
+`scripts/local_e2e_tool_security.py` proves staked reviews
+(docs/multi_jurisdiction.md decision 10, trustless-contracts ToolBond
+448023a) against real contracts on a local hardhat node, driving the daemon
+code paths.
 
 ## Run
 
@@ -561,54 +562,50 @@ python scripts/local_e2e_tool_security.py
 Needs `node_modules` with hardhat + `@openzeppelin/contracts` at or above
 the repo root, and a trustless-contracts checkout (env
 `TRUSTLESS_CONTRACTS_DIR`, default `C:/code/dao/trustless-contracts`). The
-jurisdiction sources it needs (ToolBond, RepToken + Registry and their
-interfaces) are COPIED into a scratch hardhat project at
-`build/e2e_tool_security/` (gitignored) next to this repo's `Substrate.sol`
-and a one-line `EconomyStub` (ToolBond reads only `effectiveAppealPeriod`),
+jurisdiction sources it needs (ToolBond, ProposalLifecycle, RepToken,
+Registry and their interfaces) are COPIED into a scratch hardhat project at
+`build/e2e_tool_security/` (gitignored) next to this repo's `Substrate.sol`,
 compiled with solc 0.8.26 and served on port 8557
-(`E2E_TOOL_SECURITY_PORT`). The checkout is never written. Runs in about a
-minute once compiled.
+(`E2E_TOOL_SECURITY_PORT`). The checkout is never written. HOME,
+USERPROFILE and KEYSTORE_DIR point at a temp dir for the whole run.
 
 ## What it proves
 
-1. **Chain up**: RepToken (deployer is admin, a hardhat account is the
-   timelock), Substrate (deployer as governor and vaultMinter for test
-   ATN), EconomyStub (30s appeal window), ToolBond
-   (minStake 1000 ATN, threshold 80% of REP, review 120s, reveal 30s,
-   finder 50%, degrade 10%, author slash 100%, auditor share 40%), and
+1. **Chain up**: a Registry holding the default charter text, RepToken
+   (deployer is admin, a hardhat account is the timelock), Substrate
+   (deployer as governor and vaultMinter for test ATN), ToolBond (minStake
+   1000 ATN, reveal window 300s, degrade 10%, author slash 100%, reviewer
+   share 40%, harm weight 2x, appeal window at its 2-day floor), and
    `setSlasher(ToolBond)`.
-2. **Fleet**: two real `Runtime`s. Daemon A hosts `author-1`, `aud-1`,
-   `aud-3`; daemon B hosts `aud-2` and fetches manifests and code from A
-   through `tool_store.blob_fetcher` (the p2p blob rail). Agents register
-   on Substrate; REP 100/300/200/100; 5000 ATN to the author.
-3. **Publish**: `register_tool` (with a novelty claim) + `publish_tool` ->
-   `publish_with_stake` -> `ToolBondClient.register_and_bond`, for a clean
-   tool and a malware tool. Checks `toolAuthor`, `isBonded`, not
-   `isVetted`, the stakes moved, and the daemon `ToolBondGate`.
-4. **Clean verdict**: `flag_tool` green (aud-1), red with a `code_ref`
-   (aud-3, the minority), then green from daemon B (aud-2) crosses the
-   threshold. `ToolFlagKeeper.tick` on both daemons, on the chain clock,
-   reveals (on-chain `evidenceHash` equals the daemon's `evidence_hash`),
-   settles, finalizes and claims as `evm_increaseTime` passes the windows.
-   `isVetted` true; aud-3 loses 10 REP, reassigned 6/4 to the greens; REP
-   supply plus unreassigned slasher credit is conserved.
-5. **Malware verdict**: red from aud-3 (the finder, first commit), red
-   from aud-1, a wrong green from daemon B. After finalize: the finder gets
-   50% of the stake plus its weight share, aud-1 its weight share, all
-   through `payForService` net of the 2.5% fee (half to treasury); the
-   author's REP is slashed in full and the wrong green degraded, both
-   reassigned to the reds by weight; the bond is slashed, `isBonded` is
-   false, and `register_and_bond` again reverts at `bond`.
-6. **Close**: `read_tool_vetting_snapshot` over this chain's ToolBond logs
-   lists the clean tool with auditors {aud-1: 300, aud-2: 200} REP,
-   omits the malware tool, and (pinned one block before the clean
-   `Finalized`) omits the clean tool too. `federated_epoch_close` with
-   three attested uses of the clean tool and a 10 ATN pool: the author
-   keeps 60%, the auditors 24% and 16%, sum <= pool with sub-unit dust;
-   without the snapshot the author takes 100%.
-7. **Teardown**: kills the node, removes the runtime temp dirs.
+2. **Fleet**: two real `Runtime`s. Daemon A hosts `author-1` and `rev-1`;
+   daemon B hosts `rev-2` and fetches manifests and code from A through
+   `tool_store.blob_fetcher`. REP 100/300/200, ATN 5000/500/500.
+3. **Publish**: `register_tool` + `publish_tool` -> `publish_with_stake`
+   -> `ToolBondClient.register_and_bond`, for a clean tool and a malware
+   tool.
+4. **Genesis anchor**: the governor anchors epoch 0 so REP weighs from
+   epoch 1 (an epoch's REP snapshot is its start).
+5. **Review step**: `attest_tools` (rev-1 on the clean tool, owner-granted)
+   and `vet_tool` (rev-1 on the malware tool with harm 1 and a 100 ATN
+   stake; rev-2 on both from daemon B with scores and small stakes) queue
+   entries into each reviewer's epoch batch.
+6. **Commit and reveal**: `ReviewDriver.tick` commits nothing until the
+   epoch's local close fires, then commits each batch (commitment + total
+   stake); the governor anchors epoch 1 and the next tick reveals both.
+7. **Finalize**: after the reveal window the clean round settles at once
+   (harm 0) and the malware round waits out the appeal window. Settled
+   harm 0.68 (the REP-weighted mean); the author's bond is slashed by 68%
+   and their REP by 68%; stakes, winnings (paid through `payForService`)
+   and REP move by accuracy; REP is conserved; every batch ends `settled`.
+8. **Ratings**: `ToolBondClient.rating` reads toolRating/toolHarm; WS
+   `tool_security_status` and `review_batches` show them.
+9. **Close**: pinned to anchor 1 the review snapshot is empty; after anchor
+   2 `read_voice_state` returns both ratings and both rounds, and
+   `federated_epoch_close` with three attested uses of the clean tool and a
+   10 ATN pool gives the reviewers 40% split by stake x accuracy and the
+   author 60%; `tool_positions` is the on-chain rating.
+10. **Teardown**: kills the node, removes the temp dirs.
 
-Not covered: `read_voice_state(tool_bond_address=...)` (it needs an
-anchored epoch, and anchors need REP-signed approvals), DAO overrule,
-lapse, unbond/withdraw, successor versions, and `run_clearance` for an
-adopted tool.
+Not covered: anchoring through a real DAO proposal (the governor is an EOA
+here), DAO overrule (`daoOverrule` is timelock-only), forfeit of a missed
+reveal, unbond/withdraw.

@@ -164,9 +164,8 @@ async def dispatch_shell(runtime: Any, agent_id: str, name: str,
     from .tool_bond import gate_for
     bonded, reason = await gate_for(runtime).is_bonded(record.digest)
     if bonded:
-        # Network tools also need vetted or owner opt-in (Decision
-        # 2026-10-13); refuse here so the swap falls back to the built-in
-        # instead of surfacing ToolStore.call's run-gate error.
+        # ToolStore.call's run gate for network tools; refuse here so the
+        # swap falls back to the built-in instead of surfacing its error.
         from ..tool_security import run_clearance
         bonded, why = await run_clearance(runtime, record)
         if not bonded:
@@ -231,9 +230,7 @@ def _row(record: Any, reason: str = "", detail: str = "",
 def _bond_row(record: Any, bonded: bool, reason: str) -> dict[str, Any]:
     if bonded:
         return _row(record, state="active", detail=reason)
-    code = ("not_bonded" if reason.startswith("not bonded")
-            else "not_vetted" if reason.startswith("not vetted")
-            else "bond_check_error")
+    code = "not_bonded" if reason.startswith("not bonded") else "bond_check_error"
     return _row(record, code, reason)
 
 

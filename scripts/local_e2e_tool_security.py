@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
-"""End-to-end proof that the tool security rail composes on a local chain.
+"""End-to-end proof that staked reviews compose on a local chain.
 
-docs/tool_substrate.md, "Decision (2026-10-13): staked tools, flagged
-audits, REP-settled verdicts". Stands up a LOCAL hardhat node with the
-autonet Substrate plus the jurisdiction contracts the rail needs (RepToken
-with slasher rights, ToolBond v2 (appeal window = one proposal lifecycle
-+ 2 days; the governor and timelock here are EOAs, so 2 days)), then
-drives the DAEMON code paths against them:
+docs/multi_jurisdiction.md decision 10 (one staked review type, commit-
+reveal per agent per epoch, ratings settled on chain by REP weight, harm as
+a gradient). Stands up a LOCAL hardhat node with the autonet Substrate plus
+the jurisdiction contracts the rail needs (a Registry holding the charter,
+RepToken with ToolBond as slasher, ToolBond 448023a with short windows; the
+governor and timelock are EOAs, so the appeal window is its 2-day floor and
+the deployer anchors as the governor), then drives the DAEMON code paths
+against them:
 
   - publish: ``register_tool`` + ``publish_tool`` -> ``publish_with_stake``
     -> ``ToolBondClient.register_and_bond`` (registerTool + approve + bond);
-  - audit: ``flag_tool`` (commit, daemon evidence hash, salt on disk) on two
-    daemons, then ``ToolFlagKeeper.tick`` (reveal, settle, finalize, claim)
-    with the chain clock, windows advanced by evm_increaseTime;
-  - close: ``read_tool_vetting_snapshot`` over this chain's ToolBond logs,
-    then ``federated_epoch_close`` with a usage of the vetted tool.
+  - review: ``attest_tools`` and ``vet_tool`` queue staked reviews into each
+    reviewer's ToolBond epoch batch (two daemons; B fetches the code over
+    the blob rail);
+  - driver: ``ReviewDriver.tick`` on each daemon commits at the epoch's
+    close, reveals after the governor anchors it, finalizes after the
+    reveal and appeal windows (evm_increaseTime) and claims;
+  - close: ``read_voice_state`` (ToolBond logs pinned to the anchor) feeds
+    ``federated_epoch_close``: positions = the on-chain ratings, and the
+    reviewer share of the tool's mint.
 
 The jurisdiction contracts are NOT vendored: they are copied at run time
 from a trustless-contracts checkout (env TRUSTLESS_CONTRACTS_DIR, default
 C:/code/dao/trustless-contracts) into a scratch hardhat project under
 build/ (gitignored), compiled there with Substrate.sol from this repo. The
-checkout itself is never written.
+checkout itself is never written. HOME, USERPROFILE and KEYSTORE_DIR point
+at a temp dir for the whole run.
 
 Run:
     python scripts/local_e2e_tool_security.py
@@ -46,6 +53,19 @@ REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+# The isolation must be in place before ANY atn / nodes import: the keystore
+# resolves KEYSTORE_DIR at import time, and several modules read Path.home().
+_ORIG_ENV = dict(os.environ)
+_TMP_HOME = Path(tempfile.mkdtemp(prefix="e2e_sec_home_"))
+os.environ["KEYSTORE_DIR"] = str(_TMP_HOME / "keystore")
+os.environ["USERPROFILE"] = str(_TMP_HOME)
+os.environ["HOME"] = str(_TMP_HOME)
+for _k in ("ATN_REGISTRY_URL", "ATN_JURISDICTION_REGISTRY", "ATN_JURISDICTION_RPC",
+           "ATN_TOOL_BOND_ADDRESS", "ATN_TOOL_BOND_DEV_OVERRIDE"):
+    os.environ.pop(_k, None)
+os.environ["ATN_DISABLE_PROVIDER_AUTODETECT"] = "1"
+os.environ["ATN_DISABLE_REVIEW_DRIVER"] = "1"   # the harness ticks drivers itself
+
 DAO_DIR = Path(os.environ.get("TRUSTLESS_CONTRACTS_DIR",
                               r"C:/code/dao/trustless-contracts"))
 SCRATCH = REPO / "build" / "e2e_tool_security"
@@ -61,15 +81,22 @@ HH_TREASURY_PK = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab
 E18 = 10 ** 18
 MIN_STAKE = 1000 * E18
 APPEAL_S = 2 * 86400  # ProposalLifecycle floor with EOA governor/timelock
-PARAMS = {  # ToolBond.Params, short windows for a local run
-    "minStake": MIN_STAKE, "thresholdBps": 8000, "reviewWindow": 120,
-    "revealWindow": 30, "finderBps": 5000, "degradeBps": 1000,
-    "authorSlashBps": 10_000, "unbondDelay": 120, "auditorShareBps": 4000,
-    "appealPeriod": 0,
+PARAMS = {  # ToolBond.Params (448023a), short windows for a local run
+    "minStake": MIN_STAKE, "revealWindow": 300, "degradeBps": 1000,
+    "authorSlashBps": 10_000, "unbondDelay": 120, "reviewerShareBps": 4000,
+    "appealPeriod": 0, "harmWeightBps": 20_000,
 }
 SERVICE_FEE_BPS = 250  # Substrate default
+CHARTER_KEY = "jurisdiction.autonet.charter"
 
-REP_GRANTS = {"author-1": 100, "aud-1": 300, "aud-2": 200, "aud-3": 100}
+REP_GRANTS = {"author-1": 100, "rev-1": 300, "rev-2": 200}
+ATN_GRANTS = {"author-1": 5000, "rev-1": 500, "rev-2": 500}
+
+# The staked reviews of the run (ATN stakes in whole ATN).
+REV1_CLEAN = {"axes": {"correctness": 0.9, "simplicity": 0.8}, "harm": 0.0, "stake": 50}
+REV1_MAL = {"axes": {"correctness": -0.8}, "harm": 1.0, "stake": 100}
+REV2_CLEAN = {"axes": {"correctness": 0.5, "simplicity": 0.6}, "stake": 10}
+REV2_MAL = {"axes": {"correctness": -0.5}, "harm": 0.2, "stake": 20}
 
 DAO_SOURCES = ["ToolBond.sol", "ProposalLifecycle.sol", "RepToken.sol",
                "Registry.sol", "IAdminToken.sol", "IJurisdictionData.sol"]
@@ -119,7 +146,7 @@ class Board:
         return s
 
     def render(self) -> str:
-        lines = ["", "=" * 74, "  TOOL-SECURITY LOCAL E2E: SCOREBOARD", "=" * 74]
+        lines = ["", "=" * 74, "  TOOL-SECURITY (STAKED REVIEWS) LOCAL E2E: SCOREBOARD", "=" * 74]
         for num in sorted(self.stages):
             s = self.stages[num]
             mark = {"PENDING": "----"}.get(s.status, s.status)
@@ -177,12 +204,17 @@ def build_scratch_project() -> Path:
     return SCRATCH
 
 
+def _node(cli: Path, *args: str, timeout: int = 900):
+    return subprocess.run(["node", str(cli), *args], cwd=str(SCRATCH),
+                          capture_output=True, text=True, timeout=timeout,
+                          env=_ORIG_ENV)
+
+
 def compile_scratch(cli: Path) -> None:
-    log("compiling scratch project (Substrate + ToolBond + RepToken)...")
-    proc = subprocess.run(["node", str(cli), "compile"], cwd=str(SCRATCH),
-                          capture_output=True, text=True, timeout=900)
+    log("compiling scratch project (Substrate + ToolBond + RepToken + Registry)...")
+    proc = _node(cli, "compile", timeout=1800)
     if proc.returncode != 0:
-        raise RuntimeError(f"compile failed:\n{proc.stdout}\n{proc.stderr}")
+        raise RuntimeError(f"compile failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
 
 
 def artifact(name: str, sol: Optional[str] = None) -> Dict[str, Any]:
@@ -204,7 +236,8 @@ def start_node(cli: Path) -> subprocess.Popen:
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     proc = subprocess.Popen(
         ["node", str(cli), "node", "--port", str(PORT)], cwd=str(SCRATCH),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags,
+        env=_ORIG_ENV)
     _NODES.append(proc)
     return proc
 
@@ -311,8 +344,18 @@ def advance(w3, seconds: int) -> None:
     w3.provider.make_request("evm_mine", [])
 
 
-def chain_now(w3) -> int:
-    return int(w3.eth.get_block("latest")["timestamp"])
+def anchor_epoch(w3, substrate, epoch_id: str) -> int:
+    """Anchor an epoch as the governor (an EOA here; on a live network the
+    same call arrives through a DAO proposal executed by the timelock).
+    Returns the anchor's block."""
+    from eth_utils import keccak
+    prev_root = substrate.functions.latestEpochRoot().call()
+    prev_hash = substrate.functions.latestAnchorHash().call()
+    root = keccak(text=f"root:{epoch_id}")
+    rcpt = send(w3, substrate.functions.anchor(
+        epoch_id, root, prev_root, prev_hash, f"cid-{epoch_id}",
+        keccak(text=f"payload:{epoch_id}"), b"\x00" * 32), HH_DEPLOYER_PK)
+    return int(rcpt.blockNumber)
 
 
 def net_of_fee(x: int) -> int:
@@ -341,6 +384,7 @@ def make_runtime(tmp_root: Path, addrs: Dict[str, str]):
     rpb.chain_id = CHAIN_ID
     rpb.substrate_address = addrs["substrate"]
     rpb.rep_token_address = addrs["rep"]
+    rpb.tool_bond_address = addrs["tool_bond"]
     rt = Runtime(EventBus(), data_dir=data_dir, config=config)
     rt.tool_store._embedder = lambda text: (0.11, 0.22, 0.33) if text else ()
     return rt
@@ -354,18 +398,17 @@ async def add_agent(rt, agent_id: str):
     return rt.get_agent(agent_id)
 
 
-async def keep(w3, runtimes, *, ticks: int = 3) -> None:
-    """Run every daemon's ToolFlagKeeper on the CHAIN clock."""
-    from atn.tool_flags import ToolFlagKeeper
+async def tick_all(drivers, ticks: int = 1) -> Dict[str, int]:
+    total: Dict[str, int] = {}
     for _ in range(ticks):
-        for rt in runtimes:
-            await ToolFlagKeeper(rt, clock=lambda: float(chain_now(w3))).tick()
+        for d in drivers:
+            for k, v in (await d.tick()).items():
+                total[k] = total.get(k, 0) + v
+    return total
 
 
-def flag_states(rt) -> Dict[str, str]:
-    from atn.tool_flags import store_for
-    return {f"{r['agent_id']}:{r['digest'][:8]}:{r['round']}": r["state"]
-            for r in store_for(rt).all()}
+def stake_units(review: Dict[str, Any]) -> Dict[str, Any]:
+    return {**review, "stake": int(review.get("stake", 0)) * E18}
 
 
 # ---------------------------------------------------------------------------
@@ -376,15 +419,10 @@ async def amain() -> int:
     from eth_account import Account
     from web3 import Web3
 
-    # Every daemon address below must resolve to THIS local chain; the
-    # registry seed (shadownet) must never be reached.
-    os.environ["ATN_DISABLE_TOOL_FLAG_KEEPER"] = "1"
-    os.environ.pop("ATN_TOOL_BOND_DEV_OVERRIDE", None)
-
     board = Board()
     node: Optional[subprocess.Popen] = None
-    tmp_a = Path(tempfile.mkdtemp(prefix="e2e_sec_a_"))
-    tmp_b = Path(tempfile.mkdtemp(prefix="e2e_sec_b_"))
+    tmp_a = Path(tempfile.mkdtemp(prefix="e2e_sec_a_", dir=_TMP_HOME))
+    tmp_b = Path(tempfile.mkdtemp(prefix="e2e_sec_b_", dir=_TMP_HOME))
     failed = False
 
     def run_stage(stage: Stage, exc: BaseException) -> None:
@@ -394,10 +432,17 @@ async def amain() -> int:
         log(traceback.format_exc())
         failed = True
 
+    def finish() -> int:
+        kill_node(node)
+        shutil.rmtree(_TMP_HOME, ignore_errors=True)
+        print(board.render())
+        return 1 if failed else 0
+
     # ------------------------------------------------------------------
     s1 = board.stage(1, "chain up (scratch compile + hardhat node + deploy)")
     log("Stage 1: chain up")
     try:
+        from nodes.common.world_model_substrate.charter import DEFAULT_CHARTER
         cli = _find_hardhat_cli()
         build_scratch_project()
         compile_scratch(cli)
@@ -408,30 +453,32 @@ async def amain() -> int:
         deployer = Account.from_key(HH_DEPLOYER_PK).address
         timelock = Account.from_key(HH_TIMELOCK_PK).address
         treasury = Account.from_key(HH_TREASURY_PK).address
-        rep = deploy(w3, "RepToken", ["Autonet REP", "REP", deployer, timelock,
+        registry = deploy(w3, "Registry", [deployer, "0x" + "00" * 20])
+        send(w3, registry.functions.editRegistry(CHARTER_KEY, DEFAULT_CHARTER.text),
+             HH_DEPLOYER_PK)
+        rep = deploy(w3, "RepToken", ["Autonet REP", "REP", registry.address, timelock,
                                       [], [], False])
-        # (treasury, vaultMinter, governor): the deployer anchors directly
-        # (Decision 2026-10-16; this run never anchors).
+        # (treasury, vaultMinter, governor): the deployer is the governor,
+        # so it anchors directly (an EOA governor, as on a dev network).
         substrate = deploy(w3, "Substrate", [treasury, deployer, deployer])
-        bond = deploy(w3, "ToolBond", [substrate.address, rep.address,
-                                       deployer, timelock,
-                                       tuple(PARAMS.values())])
+        bond = deploy(w3, "ToolBond", [substrate.address, rep.address, registry.address,
+                                       deployer, timelock, tuple(PARAMS.values())])
         send(w3, rep.functions.setSlasher(bond.address, True), HH_DEPLOYER_PK)
         addrs = {"substrate": substrate.address, "rep": rep.address,
-                 "tool_bond": bond.address}
-        os.environ["ATN_TOOL_BOND_ADDRESS"] = bond.address
+                 "tool_bond": bond.address, "registry": registry.address}
         check(rep.functions.slashers(bond.address).call(), "ToolBond is a RepToken slasher")
         check(bond.functions.appealWindow().call() == APPEAL_S,
               f"ToolBond appeal window = lifecycle floor ({APPEAL_S}s)")
-        check(bond.functions.auditorShareBps().call() == 4000, "auditorShareBps = 4000")
+        check(bond.functions.reviewerShareBps().call() == 4000, "reviewerShareBps = 4000")
+        check(bond.functions.harmWeightBps().call() == 20_000, "harmWeightBps = 20000")
+        check(registry.functions.getRegistryValue(CHARTER_KEY).call() == DEFAULT_CHARTER.text,
+              "the Registry holds the charter text")
         for k, v in addrs.items():
             s1.note(k, v)
         s1.status = "PASS"
     except Exception as e:
         run_stage(s1, e)
-        print(board.render())
-        kill_node(node)
-        return 1
+        return finish()
 
     # ------------------------------------------------------------------
     s2 = board.stage(2, "fleet (two daemons, agents on Substrate, REP + ATN)")
@@ -442,14 +489,13 @@ async def amain() -> int:
     try:
         rt_a = make_runtime(tmp_a, addrs)
         rt_b = make_runtime(tmp_b, addrs)
-        host = {"author-1": rt_a, "aud-1": rt_a, "aud-3": rt_a, "aud-2": rt_b}
+        host = {"author-1": rt_a, "rev-1": rt_a, "rev-2": rt_b}
         for aid, rt in host.items():
             defn = await add_agent(rt, aid)
             addr = Web3.to_checksum_address(defn.identity.address)
             key = rt.registry.get_agent_key(aid)
             agents[aid], keys[aid] = addr, key
             fund_eth(w3, addr)
-            # Self-owned binding (the agent key is its own owner).
             send(w3, substrate.functions.registerAgentBound(
                 f"peer-{aid}".encode(), addr, "0x" + "00" * 20,
                 _self_owned_binding_sig(substrate.address, CHAIN_ID, key, addr)),
@@ -457,28 +503,31 @@ async def amain() -> int:
             # What the production register flow flips after the tx verifies.
             defn.identity.registered_on_chain = True
             send(w3, rep.functions.mint(addr, REP_GRANTS[aid] * E18), HH_DEPLOYER_PK)
-        # The p2p blob rail: daemon B fetches manifests/code from daemon A.
+            send(w3, substrate.functions.mintFromVault(addr, ATN_GRANTS[aid] * E18),
+                 HH_DEPLOYER_PK)
         blobs_a = rt_a.tool_store._blob_store()
 
         async def fetch_from_a(digest: str):
             return blobs_a.get_bytes(digest)
         rt_b.tool_store.blob_fetcher = fetch_from_a
-        send(w3, substrate.functions.mintFromVault(agents["author-1"], 5000 * E18),
-             HH_DEPLOYER_PK)
-        advance(w3, 5)  # REP must predate the first round's snapshot
-        for aid, addr in agents.items():
-            check(substrate.functions.isRegistered(addr).call(), f"{aid} registered on Substrate")
-        check(rep.functions.totalSupply().call() == 700 * E18, "REP supply = 700")
-        # The daemon's own chain targets resolve to this node, not the seed.
+        check(rep.functions.totalSupply().call() == 600 * E18, "REP supply = 600")
         from atn.runtime.tool_bond import ToolBondClient
         b_addr, s_addr, rpc = ToolBondClient(rt_a)._addresses()
         check((b_addr, s_addr, rpc) == (bond.address, substrate.address, RPC_URL),
               "ToolBondClient resolves to the local ToolBond/Substrate/RPC")
+        check(Path(os.path.expanduser("~")) == _TMP_HOME, "HOME is the temp dir")
         for aid, addr in agents.items():
             s2.note(aid, addr)
         s2.status = "PASS"
     except Exception as e:
         run_stage(s2, e)
+        return finish()
+
+    def rep_of(aid: str) -> int:
+        return rep.functions.balanceOf(agents[aid]).call()
+
+    def atn_of(aid: str) -> int:
+        return substrate.functions.balanceOf(agents[aid]).call()
 
     # ------------------------------------------------------------------
     s3 = board.stage(3, "publish with stake (register_tool + publish_tool)")
@@ -504,7 +553,7 @@ async def amain() -> int:
                   f"({len(pub['stake']['txs'])} txs)")
             return pub["digest"]
 
-        atn_before = substrate.functions.balanceOf(agents["author-1"]).call()
+        atn_before = atn_of("author-1")
         clean = await publish("upper_case", CLEAN_CODE, {
             "statement": "Upper-cases a string; no comparable tool exists yet.",
             "prior_art": []})
@@ -516,232 +565,226 @@ async def amain() -> int:
             check(substrate.functions.toolAuthor(b32).call() == agents["author-1"],
                   f"{d[:8]}: Substrate.toolAuthor = author-1")
             check(bond.functions.isBonded(b32).call(), f"{d[:8]}: isBonded")
-            check(not bond.functions.isVetted(b32).call(), f"{d[:8]}: not isVetted")
-        check(atn_before - substrate.functions.balanceOf(agents["author-1"]).call()
-              == 2 * MIN_STAKE, "author ATN down by two stakes")
+        check(atn_before - atn_of("author-1") == 2 * MIN_STAKE, "author ATN down by two stakes")
         check(substrate.functions.balanceOf(bond.address).call() == 2 * MIN_STAKE,
               "ToolBond holds both stakes")
-        gate = ToolBondGate(rt_b)
-        check((await gate.is_bonded(clean))[0], "daemon gate: is_bonded")
-        check(not (await gate.is_vetted(clean))[0], "daemon gate: not is_vetted")
+        check((await ToolBondGate(rt_b).is_bonded(clean))[0], "daemon gate: is_bonded")
         s3.note("clean_tool", clean[:16] + "...")
         s3.note("malware_tool", malware[:16] + "...")
         s3.status = "PASS"
     except Exception as e:
         run_stage(s3, e)
-
-    def rep_of(aid: str) -> int:
-        return rep.functions.balanceOf(agents[aid]).call()
-
-    def atn_of(aid: str) -> int:
-        return substrate.functions.balanceOf(agents[aid]).call()
+        return finish()
 
     # ------------------------------------------------------------------
-    s4 = board.stage(4, "clean verdict (2 green vs 1 red minority)")
-    log("Stage 4: clean path")
-    clean_weights: Dict[str, int] = {}
-    clean_finalized_block = 0
+    s4 = board.stage(4, "genesis anchor (epoch 0) so REP weighs from epoch 1")
+    log("Stage 4: genesis anchor")
     try:
-        b32 = bytes.fromhex(clean)
-        supply0 = rep.functions.totalSupply().call()
-        rep0 = {a: rep_of(a) for a in agents}
-        g1 = await execute_tool("flag_tool", {
-            "digest": clean, "color": "green",
-            "report": "Read the pinned code: reads stdin, upper-cases, prints. "
-                      "No fs/net/env/subprocess."}, rt_a, caller_id="aud-1")
-        check(g1.get("ok") is True and g1["round"] == 0, f"aud-1 green committed (weight {g1.get('weight')})")
-        r3 = await execute_tool("flag_tool", {
-            "digest": clean, "color": "red", "report": "Line 3 looks suspicious.",
-            "code_ref": {"path": rt_a.tool_store.get(clean).manifest["code_digest"],
-                         "start_line": 3, "end_line": 3}}, rt_a, caller_id="aud-3")
-        check(r3.get("ok") is True, "aud-3 red committed (the minority)")
-        st = bond.functions.getRound(b32, 0).call()
-        check(st[0] == 1, "round still in Commit below the 80% threshold")
-        g2 = await execute_tool("flag_tool", {
-            "digest": clean, "color": "green",
-            "report": "Independent read on daemon B: clean upper-caser."},
-            rt_b, caller_id="aud-2")
-        check(g2.get("ok") is True, "aud-2 green committed from daemon B (fetched over the blob rail)")
-        st = bond.functions.getRound(b32, 0).call()
-        check(st[0] == 2, "threshold reached: stage Reveal")
-        from atn.tool_flags import store_for
-        rec = [r for r in store_for(rt_a).all()
-               if r["agent_id"] == "aud-1" and r["digest"] == clean][0]
-        flag = bond.functions.flags(b32, 0, agents["aud-1"]).call()
-        check(flag[6] == b"\x00" * 32 and flag[0] != b"\x00" * 32,
-              "commitment on chain, evidence hidden until reveal")
-
-        await keep(w3, [rt_a, rt_b], ticks=1)
-        st = bond.functions.getRound(b32, 0).call()
-        check(st[8] == 500 * E18 and st[9] == 100 * E18,
-              "keepers revealed: green 500 REP vs red 100 REP")
-        flag = bond.functions.flags(b32, 0, agents["aud-1"]).call()
-        check(flag[6].hex() == rec["evidence_hash"].removeprefix("0x"),
-              "revealed evidenceHash == daemon evidence_hash")
-        advance(w3, PARAMS["revealWindow"] + 1)
-        await keep(w3, [rt_a, rt_b], ticks=1)
-        st = bond.functions.getRound(b32, 0).call()
-        check(st[0] == 3 and st[1] == 1, "settled: Cooling, verdict Clean")
-        check(not bond.functions.isVetted(b32).call(), "not vetted during the appeal window")
-        advance(w3, APPEAL_S + 1)
-        await keep(w3, [rt_a, rt_b], ticks=2)
-        st = bond.functions.getRound(b32, 0).call()
-        check(st[0] == 5, "finalized: Done")
-        clean_finalized_block = w3.eth.block_number
-        for lg in bond.events.Finalized().get_logs(from_block=0, to_block="latest"):
-            if bytes(lg["args"]["digest"]) == b32:
-                clean_finalized_block = int(lg["blockNumber"])
-        check(bond.functions.isVetted(b32).call(), "isVetted true")
-        check(bond.functions.isBonded(b32).call(), "still bonded")
-
-        degrade = rep0["aud-3"] * PARAMS["degradeBps"] // 10_000
-        w1, w2 = rep0["aud-1"], rep0["aud-2"]
-        clean_weights = {agents["aud-1"].lower(): w1, agents["aud-2"].lower(): w2}
-        exp1 = degrade * w1 // (w1 + w2)
-        exp2 = degrade * w2 // (w1 + w2)
-        check(rep_of("aud-3") == rep0["aud-3"] - degrade,
-              f"aud-3 (minority red) lost degradeBps: -{degrade / E18:g} REP")
-        check(rep_of("aud-1") == rep0["aud-1"] + exp1, f"aud-1 +{exp1 / E18:g} REP via reassign")
-        check(rep_of("aud-2") == rep0["aud-2"] + exp2, f"aud-2 +{exp2 / E18:g} REP via reassign")
-        credit = rep.functions.slashedCredit(bond.address).call()
-        check(rep.functions.totalSupply().call() + credit == supply0,
-              f"REP conserved (supply + unreassigned dust {credit} == before)")
-        states = {**flag_states(rt_a), **flag_states(rt_b)}
-        check(states.get(f"aud-1:{clean[:8]}:0") == "claimed"
-              and states.get(f"aud-2:{clean[:8]}:0") == "claimed"
-              and states.get(f"aud-3:{clean[:8]}:0") == "no_claim",
-              f"keeper states {states}")
-        s4.note("rep_moved", f"aud-3 -{degrade / E18:g}, aud-1 +{exp1 / E18:g}, aud-2 +{exp2 / E18:g}")
+        advance(w3, 5)
+        anchor_epoch(w3, substrate, "e0")
+        advance(w3, 5)
+        check(bond.functions.currentEpoch().call() == 1, "ToolBond.currentEpoch() = 1")
         s4.status = "PASS"
     except Exception as e:
         run_stage(s4, e)
+        return finish()
 
     # ------------------------------------------------------------------
-    s5 = board.stage(5, "malware verdict (finder + confirmer vs 1 green)")
-    log("Stage 5: malware path")
+    s5 = board.stage(5, "review step queues staked reviews (attest_tools + vet_tool)")
+    log("Stage 5: reviews")
     try:
-        from atn.tool_flags import store_for
-        b32 = bytes.fromhex(malware)
-        supply0 = rep.functions.totalSupply().call()
-        rep0 = {a: rep_of(a) for a in agents}
-        atn0 = {a: atn_of(a) for a in agents}
-        treas0 = substrate.functions.balanceOf(treasury).call()
-        credit0 = rep.functions.slashedCredit(bond.address).call()
-        code_digest = rt_a.tool_store.get(malware).manifest["code_digest"]
-        f3 = await execute_tool("flag_tool", {
-            "digest": malware, "color": "red",
-            "report": "Line 3 pipes a remote script into sh: remote code execution.",
-            "code_ref": {"path": code_digest, "start_line": 3, "end_line": 3}},
-            rt_a, caller_id="aud-3")
-        check(f3.get("ok") is True, "aud-3 red committed first (the finder)")
-        f1 = await execute_tool("flag_tool", {
-            "digest": malware, "color": "red", "report": "Confirmed: os.system curl|sh.",
-            "code_ref": {"path": code_digest, "start_line": 3, "end_line": 3}},
-            rt_a, caller_id="aud-1")
-        check(f1.get("ok") is True, "aud-1 red committed (confirmer)")
-        g2 = await execute_tool("flag_tool", {
-            "digest": malware, "color": "green", "report": "Looks fine to me."},
-            rt_b, caller_id="aud-2")
-        check(g2.get("ok") is True, "aud-2 green committed from daemon B (wrong)")
-        check(bond.functions.getRound(b32, 0).call()[0] == 2, "threshold reached: Reveal")
-        await keep(w3, [rt_a, rt_b], ticks=1)
-        advance(w3, PARAMS["revealWindow"] + 1)
-        await keep(w3, [rt_a, rt_b], ticks=1)
-        st = bond.functions.getRound(b32, 0).call()
-        check(st[0] == 3 and st[1] == 2, "settled: Cooling, verdict Malware")
-        check(st[10] == agents["aud-3"], "finder = aud-3 (earliest red commit)")
-        advance(w3, APPEAL_S + 1)
-        await keep(w3, [rt_a, rt_b], ticks=2)
-        st = bond.functions.getRound(b32, 0).call()
-        check(st[0] == 5, "finalized: Done")
-
-        w3_, w1_ = rep0["aud-3"], rep0["aud-1"]
-        W = w3_ + w1_
-        finder_share = MIN_STAKE * PARAMS["finderBps"] // 10_000
-        pool = MIN_STAKE - finder_share
-        s3_, s1_ = pool * w3_ // W, pool * w1_ // W
-        exp_atn3 = net_of_fee(finder_share) + net_of_fee(s3_)
-        exp_atn1 = net_of_fee(s1_)
-        check(atn_of("aud-3") - atn0["aud-3"] == exp_atn3,
-              f"finder got finderBps of the stake + its weight share, net of fee "
-              f"(+{exp_atn3 / E18:g} ATN)")
-        check(atn_of("aud-1") - atn0["aud-1"] == exp_atn1,
-              f"confirmer split the rest by weight, net of fee (+{exp_atn1 / E18:g} ATN)")
-        check(atn_of("aud-2") == atn0["aud-2"], "green flagger got no ATN")
-        check(substrate.functions.serviceEarnings(agents["aud-3"]).call() >= exp_atn3,
-              "finder's bounty counts as service earnings")
-        to_treasury = sum((x * SERVICE_FEE_BPS // 10_000) * 5000 // 10_000
-                          for x in (finder_share, s3_, s1_))
-        treas_gain = substrate.functions.balanceOf(treasury).call() - treas0
-        check(treas_gain == to_treasury,
-              f"2.5% service fee taken, half to treasury (+{treas_gain / E18:g} ATN)")
-        left = substrate.functions.balanceOf(bond.address).call()
-        check(left == MIN_STAKE + (pool - s3_ - s1_),
-              "ToolBond keeps only the clean tool's stake (+ rounding dust)")
-
-        author_slash = rep0["author-1"] * PARAMS["authorSlashBps"] // 10_000
-        green_slash = rep0["aud-2"] * PARAMS["degradeBps"] // 10_000
-        rep_pool = author_slash + green_slash
-        check(rep_of("author-1") == rep0["author-1"] - author_slash,
-              f"author REP slashed by authorSlashBps (-{author_slash / E18:g})")
-        check(rep_of("aud-2") == rep0["aud-2"] - green_slash,
-              f"wrong green flagger degraded (-{green_slash / E18:g})")
-        r3, r1 = rep_pool * w3_ // W, rep_pool * w1_ // W
-        check(rep_of("aud-3") == rep0["aud-3"] + r3 and rep_of("aud-1") == rep0["aud-1"] + r1,
-              f"slashed REP reassigned to reds by weight (+{r3 / E18:g}, +{r1 / E18:g})")
-        credit = rep.functions.slashedCredit(bond.address).call()
-        check(rep.functions.totalSupply().call() + credit == supply0 + credit0,
-              f"REP conserved: no REP created (unreassigned dust {credit - credit0})")
-        check(bond.functions.bonds(b32).call()[5], "bond marked slashed")
-        check(not bond.functions.isBonded(b32).call(), "isBonded false")
-        from atn.runtime.tool_bond import ToolBondClient, ToolBondGate
-        again = await ToolBondClient(rt_a).register_and_bond(keys["author-1"], malware)
-        check(not again.get("success") and again.get("step") == "bond",
-              "re-bonding the slashed digest reverts (never bondable again)")
-        check(not (await ToolBondGate(rt_b).is_bonded(malware))[0],
-              "daemon gate: malware tool not bonded")
-        check(bond.functions.isVetted(bytes.fromhex(clean)).call(),
-              "clean tool still vetted")
-        states = {**flag_states(rt_a), **flag_states(rt_b)}
-        check(states.get(f"aud-3:{malware[:8]}:0") == "claimed"
-              and states.get(f"aud-1:{malware[:8]}:0") == "claimed"
-              and states.get(f"aud-2:{malware[:8]}:0") == "no_claim",
-              f"keeper states {states}")
-        s5.note("finder_atn", f"+{exp_atn3 / E18:g}")
-        s5.note("confirmer_atn", f"+{exp_atn1 / E18:g}")
-        s5.note("rep_pool", f"{rep_pool / E18:g} (author {author_slash / E18:g} + green {green_slash / E18:g})")
+        from atn.runtime.review_batch import store_for
+        # rev-1 used the clean tool (granted by the owner) and attests it.
+        rt_a.tool_store.grant(clean, "rev-1")
+        att = await execute_tool("attest_tools", {
+            "judgments": [{"tool": clean, "ok": True, **stake_units(REV1_CLEAN)}],
+            "context": "upper-casing a heading"}, rt_a, caller_id="rev-1")
+        check(att.get("attested") == 1 and att["reviews"]["queued"] == 1
+              and att["reviews"]["epoch"] == 1,
+              f"attest_tools: 1 attested, 1 staked review queued for epoch 1 ({att.get('reviews')})")
+        insp = await execute_tool("vet_tool", {"digest": malware}, rt_a, caller_id="rev-1")
+        check("os.system" in (insp.get("code") or ""), "vet_tool inspect returns the pinned code")
+        v1 = await execute_tool("vet_tool", {
+            "digest": malware, "verdict": "fail",
+            "report": "Line 3 pipes a remote script into sh.", **stake_units(REV1_MAL)},
+            rt_a, caller_id="rev-1")
+        check(v1.get("review", {}).get("queued") == 1, "rev-1 staked harm review queued (vet_tool)")
+        for d, r in ((clean, REV2_CLEAN), (malware, REV2_MAL)):
+            v = await execute_tool("vet_tool", {
+                "digest": d, "verdict": "pass", "report": "Read it on daemon B.",
+                **stake_units(r)}, rt_b, caller_id="rev-2")
+            check(v.get("review", {}).get("queued") == 1,
+                  f"rev-2 review of {d[:8]} queued on daemon B (code over the blob rail)")
+        b1 = store_for(rt_a).load(agents["rev-1"], 1, [])
+        b2 = store_for(rt_b).load(agents["rev-2"], 1, [])
+        check(len(b1.reviews) == 2 and b1.total_stake == 150 * E18, "rev-1 batch: 2 reviews, 150 ATN")
+        check(len(b2.reviews) == 2 and b2.total_stake == 30 * E18, "rev-2 batch: 2 reviews, 30 ATN")
         s5.status = "PASS"
     except Exception as e:
         run_stage(s5, e)
+        return finish()
 
     # ------------------------------------------------------------------
-    s6 = board.stage(6, "close reads the chain (vetting snapshot + auditor share)")
-    log("Stage 6: close")
+    s6 = board.stage(6, "driver: commit at the close, reveal after the governor anchors")
+    log("Stage 6: commit + anchor + reveal")
+    drivers = []
+    try:
+        from atn.review_driver import ReviewDriver
+        drivers = [ReviewDriver(rt_a), ReviewDriver(rt_b)]
+        idle = await tick_all(drivers)
+        check(idle.get("committed", 0) == 0, "no commit before the epoch's close fires")
+        atn0 = {a: atn_of(a) for a in agents}
+        for d in drivers:
+            d.on_local_close()
+        got = await tick_all(drivers)
+        check(got.get("committed") == 2, f"both batches committed ({got})")
+        for aid, total in (("rev-1", 150), ("rev-2", 30)):
+            c = bond.functions.commits(1, agents[aid]).call()
+            check(c[0] != b"\x00" * 32 and c[1] == total * E18 and not c[3],
+                  f"{aid}: commitment on chain, stake {total} ATN, reviews hidden")
+            check(atn0[aid] - atn_of(aid) == total * E18, f"{aid}: stake moved into ToolBond")
+        check(c[2] == REP_GRANTS["rev-2"] * E18, "commit weight = REP at the epoch's start")
+        early = await tick_all(drivers)
+        check(early.get("revealed", 0) == 0, "no reveal before the anchor")
+        anchor_epoch(w3, substrate, "e1")
+        check(bond.functions.revealEnds(1).call() > 0, "revealEnds(1) set by the anchor")
+        got = await tick_all(drivers)
+        check(got.get("revealed") == 2, f"both batches revealed ({got})")
+        for d in (clean, malware):
+            r = bond.functions.getRound(bytes.fromhex(d), 1).call()
+            check(r[0] == 1 and r[8] == 2, f"{d[:8]}: round Open with 2 reviews")
+        sealed = store_for(rt_a).load(agents["rev-1"], 1, []).sealed_reveal()
+        check(sealed["salt"] and len(sealed["reviews"]) == 2, "sealed reveal kept for relays")
+        s6.status = "PASS"
+    except Exception as e:
+        run_stage(s6, e)
+        return finish()
+
+    # ------------------------------------------------------------------
+    s7 = board.stage(7, "finalize after the windows: harm, bond slash, stakes and REP")
+    log("Stage 7: finalize + claim")
+    try:
+        rep0 = {a: rep_of(a) for a in agents}
+        atn0 = {a: atn_of(a) for a in agents}
+        supply0 = rep.functions.totalSupply().call()
+        advance(w3, PARAMS["revealWindow"] + 1)
+        got = await tick_all(drivers)
+        rc = bond.functions.getRound(bytes.fromhex(clean), 1).call()
+        rm = bond.functions.getRound(bytes.fromhex(malware), 1).call()
+        check(rc[0] == 4, "clean round Done (settled harm 0: no appeal window)")
+        check(rm[0] == 2, "malware round Cooling (harm settled, inside the appeal window)")
+        H = rm[6]
+        want_h = (300 * 100 + 200 * 20) * E18 // (500 * 100)
+        check(H == want_h, f"settled harm = REP-weighted mean = {H / E18:.2f}")
+        advance(w3, APPEAL_S + 1)
+        got2 = await tick_all(drivers, ticks=2)
+        check(bond.functions.getRound(bytes.fromhex(malware), 1).call()[0] == 4,
+              "malware round Done after the appeal window")
+        slashed = MIN_STAKE * H // E18
+        check(bond.functions.bonds(bytes.fromhex(malware)).call()[1] == MIN_STAKE - slashed,
+              f"author bond slashed by H: -{slashed / E18:g} ATN")
+        check(bond.functions.bonds(bytes.fromhex(clean)).call()[1] == MIN_STAKE,
+              "clean tool's bond untouched")
+        author_slash = rep0["author-1"] * PARAMS["authorSlashBps"] // 10_000 * H // E18
+        check(rep0["author-1"] - rep_of("author-1") == author_slash,
+              f"author REP slashed by H x authorSlashBps: -{author_slash / E18:g}")
+        v1 = bond.functions.reviewOf(bytes.fromhex(malware), 1, agents["rev-1"]).call()
+        v2 = bond.functions.reviewOf(bytes.fromhex(malware), 1, agents["rev-2"]).call()
+        check(v1[3] > v2[3], f"rev-1 more accurate on harm ({v1[3] / E18:.3f} > {v2[3] / E18:.3f})")
+        check(v1[2] and v2[2], "both reviews claimed by the drivers")
+        claims = {(bytes(lg["args"]["digest"]).hex(), str(lg["args"]["reviewer"]).lower()):
+                  dict(lg["args"]) for lg in bond.events.Claimed().get_logs(
+                      from_block=0, to_block="latest")}
+        c1 = claims[(malware, agents["rev-1"].lower())]
+        c2 = claims[(malware, agents["rev-2"].lower())]
+        check(c1["refund"] < 100 * E18 and c2["refund"] < 20 * E18
+              and c1["refund"] * 20 > c2["refund"] * 100,
+              f"stakes settle by accuracy: rev-1 keeps {c1['refund'] / E18:.2f} of 100, "
+              f"rev-2 {c2['refund'] / E18:.2f} of 20")
+        check(c1["winnings"] > c2["winnings"] > 0,
+              f"losses + slashed bond go to the reviews by accuracy "
+              f"(rev-1 +{c1['winnings'] / E18:.2f}, rev-2 +{c2['winnings'] / E18:.2f} ATN)")
+        d1 = rep_of("rev-1") - rep0["rev-1"]
+        d2 = rep_of("rev-2") - rep0["rev-2"]
+        check(d1 > d2 and c1["rep"] > c2["rep"],
+              f"REP moved by accuracy (rev-1 {d1 / E18:+.2f}, rev-2 {d2 / E18:+.2f})")
+        cc2 = claims[(clean, agents["rev-2"].lower())]
+        check(cc2["refund"] < 10 * E18, "the less accurate clean review lost part of its stake")
+        credit = rep.functions.slashedCredit(bond.address).call()
+        check(rep.functions.totalSupply().call() + credit == supply0,
+              f"REP conserved (supply + unreassigned dust {credit} == before)")
+        paid = sum(net_of_fee(c["winnings"]) + c["refund"] for c in claims.values())
+        gains = sum(atn_of(a) - atn0[a] for a in ("rev-1", "rev-2"))
+        check(gains == paid, f"reviewers received exactly the claimed refunds + net winnings "
+                             f"({gains / E18:.2f} ATN)")
+        check(substrate.functions.serviceEarnings(agents["rev-1"]).call() > 0,
+              "winnings paid through the service rail (count as earnings)")
+        statuses = {b.status for rt in (rt_a, rt_b) for b in store_for(rt).all()}
+        check(statuses == {"settled"}, f"every batch settled ({statuses})")
+        s7.note("settled_harm", f"{H / E18:.2f}")
+        s7.note("bond_slashed", f"{slashed / E18:g} ATN")
+        s7.note("driver", {**got, **{f"{k}+": v for k, v in got2.items() if v}})
+        s7.status = "PASS"
+    except Exception as e:
+        run_stage(s7, e)
+        return finish()
+
+    # ------------------------------------------------------------------
+    s8 = board.stage(8, "toolRating / toolHarm readable (daemon client + WS)")
+    log("Stage 8: ratings")
+    try:
+        from nodes.common.world_model_substrate.charter import active_charter
+        ids = list(active_charter().ids)
+        rating = await ToolBondClient(rt_b).rating(clean, ids)
+        corr = rating["axes"]["correctness"]
+        want = (300 * 90 + 200 * 50) / (500 * 100)
+        check(corr["mass"] == 500 * E18 and abs(corr["mean"] - want) < 1e-12,
+              f"clean correctness = {corr['mean']:.3f} on 500 REP")
+        check(rating["harm"]["mass"] == 300 * E18 and rating["harm"]["mean"] == 0.0,
+              "clean harm 0 on rev-1's 300 REP (rev-2 gave no harm score)")
+        mal = await ToolBondClient(rt_b).rating(malware, ids)
+        check(abs(mal["harm"]["mean"] - 0.68) < 1e-12, f"malware harm = {mal['harm']['mean']:.2f}")
+        from atn.ws_auth import ClientSession
+        from atn.ws_server import WebSocketBridge
+        srv = WebSocketBridge(rt_a)
+        owner = ClientSession(local=True, authed=True, owner=True, scope_ids=None)
+        r = await srv._handle_message({"type": "tool_security_status", "msg_id": "1",
+                                       "digest": malware}, owner)
+        check(r["ok"] and abs(r["result"]["harm"] - 0.68) < 1e-12,
+              "WS tool_security_status shows the settled harm")
+        r = await srv._handle_message({"type": "review_batches", "msg_id": "2"}, owner)
+        rows = r["result"]["batches"]
+        check(r["ok"] and rows and rows[0]["sealed_reveal"]["salt"],
+              "WS review_batches lists the batches with their sealed reveals")
+        s8.status = "PASS"
+    except Exception as e:
+        run_stage(s8, e)
+        return finish()
+
+    # ------------------------------------------------------------------
+    s9 = board.stage(9, "close reads the ratings pinned to the anchor (positions + reviewer share)")
+    log("Stage 9: close")
     try:
         from nodes.common.canonical_ordering import canonical_order
         from nodes.common.event_gossip import EventBatch, Keypair
         from nodes.common.federated_reconcile import federated_epoch_close
-        from nodes.common.voice_state import read_tool_vetting_snapshot
+        from nodes.common.voice_state import read_tool_review_snapshot, read_voice_state
         from nodes.common.world_model_substrate.adapter import N_DIMS
 
-        head = w3.eth.block_number
-        snap = read_tool_vetting_snapshot(w3, bond.address, head)
-        tools = snap["tools"]
-        check(snap["auditor_share_bps"] == PARAMS["auditorShareBps"],
-              f"auditor_share_bps from ParamsSet = {snap['auditor_share_bps']}")
-        check(clean in tools, "snapshot lists the vetted clean tool")
-        check(malware not in tools, "snapshot omits the malware tool")
-        check(tools.get(clean, {}).get("auditors") == clean_weights,
-              "clean tool auditors = the green flaggers at their flag weights (300, 200)")
-        check(agents["aud-3"].lower() not in tools.get(clean, {}).get("auditors", {}),
-              "minority red flagger is not an auditor")
-        # Pinned to a block before the verdict finalized: not vetted yet.
-        early = read_tool_vetting_snapshot(w3, bond.address, clean_finalized_block - 1)
-        check(clean not in early["tools"], "snapshot pinned before finalize: not vetted")
+        b1 = substrate.functions.getAnchor(1).call()[7]
+        before = read_tool_review_snapshot(w3, bond.address, b1)
+        check(before["tools"] == {}, "pinned to anchor e1 (before finalize): no ratings yet")
+        anchor_epoch(w3, substrate, "e2")
+        advance(w3, 5)  # RepToken checkpoints only answer for past timepoints
+        state = read_voice_state(substrate.address, RPC_URL, rep_token_address=rep.address,
+                                 tool_bond_address=bond.address, web3=w3)
+        snap = state["review_snapshot"]
+        check(set(snap["tools"]) == {clean, malware}, "snapshot pinned to e2 has both ratings")
+        check(snap["reviewer_share_bps"] == 4000, "reviewer share from ParamsSet = 4000")
+        check(set(snap["rounds"]) == {clean, malware}, "both rounds finalized in the e1..e2 window")
 
         author = agents["author-1"]
-        dim = 1024
-        coords = [0.0] * (N_DIMS + dim)
+        coords = [0.0] * (N_DIMS + 1024)
         coords[4], coords[N_DIMS + 3] = 0.8, 0.5
         registration = {
             "kind": "sub_claim_sprouted", "seq": 1, "author_agent": author,
@@ -772,41 +815,40 @@ async def amain() -> int:
                                 + batches(receipts, Keypair.generate()))
         pool = 10.0
         plain = federated_epoch_close(canon, emission_pool=pool)
-        split = federated_epoch_close(canon, emission_pool=pool, vetting_snapshot=snap)
+        split = federated_epoch_close(canon, emission_pool=pool, review_snapshot=snap)
         units = {a.lower(): round(v * 1_000_000) for a, v in split["agent_mint"].items()}
         plain_units = {a.lower(): round(v * 1_000_000) for a, v in plain["agent_mint"].items()}
-        entry = split["tool_mint"][clean]
         check(set(plain_units) == {author.lower()}, "without the snapshot the author takes 100%")
-        check(entry["vetted"] is True, "close marks the tool vetted")
-        a1, a2 = agents["aud-1"].lower(), agents["aud-2"].lower()
-        check(set(units) == {author.lower(), a1, a2}, "mint leaves: author + 2 auditors")
-        total = sum(units.values())
+        r1, r2 = agents["rev-1"].lower(), agents["rev-2"].lower()
+        check(set(units) == {author.lower(), r1, r2}, "mint leaves: author + 2 reviewers")
         pool_units = round(pool * 1_000_000)
-        check(total <= pool_units and pool_units - total < len(units),
-              f"conserved: sum {total} <= pool {pool_units} (dust < 1 unit per leaf)")
-        check(abs(units[a1] + units[a2] - pool_units * 0.4) <= 2,
-              f"auditors take auditorShareBps (40%): {units[a1] + units[a2]}")
-        check(abs(units[a1] - pool_units * 0.4 * 0.6) <= 1
-              and abs(units[a2] - pool_units * 0.4 * 0.4) <= 1,
-              f"split by flag weight 300:200 ({units[a1]}, {units[a2]})")
+        check(abs(units[r1] + units[r2] - pool_units * 0.4) <= 2,
+              f"reviewers take reviewerShareBps (40%): {units[r1] + units[r2]}")
         check(abs(units[author.lower()] - pool_units * 0.6) <= 1,
               f"author keeps the remainder ({units[author.lower()]})")
-        s6.note("snapshot_tools", len(tools))
-        s6.note("agent_mint_units", units)
-        s6.status = "PASS"
+        vc1 = bond.functions.reviewOf(bytes.fromhex(clean), 1, agents["rev-1"]).call()
+        vc2 = bond.functions.reviewOf(bytes.fromhex(clean), 1, agents["rev-2"]).call()
+        w1 = 50 * E18 * vc1[3] // E18
+        w2 = 10 * E18 * vc2[3] // E18   # first round: novelty 1 for both
+        check(abs(units[r1] - pool_units * 0.4 * w1 / (w1 + w2)) <= 1,
+              f"split by stake x accuracy ({units[r1]}, {units[r2]})")
+        pos = split["tool_positions"]
+        ci = list(active_charter().ids).index("correctness")
+        check(abs(pos[clean]["head"][ci] - want) < 1e-9
+              and abs(pos[clean]["mass"][ci] - 500 / 600) < 1e-6,
+              f"close position = ToolBond rating (head {pos[clean]['head'][ci]:.3f}, "
+              f"mass {pos[clean]['mass'][ci]:.3f} of REP supply)")
+        check(split["tool_mint"][clean]["reviewers"] == 2, "tool_mint lists 2 reviewers")
+        check("tool_credibility" not in split and "tool_review_book" not in split,
+              "no credibility or review book in the close output")
+        s9.note("agent_mint_units", units)
+        s9.status = "PASS"
     except Exception as e:
-        run_stage(s6, e)
+        run_stage(s9, e)
 
-    # ------------------------------------------------------------------
-    s7 = board.stage(7, "teardown")
-    kill_node(node)
-    node = None
-    for d in (tmp_a, tmp_b):
-        shutil.rmtree(d, ignore_errors=True)
-    s7.status = "PASS"
-
-    print(board.render())
-    return 1 if failed else 0
+    s10 = board.stage(10, "teardown")
+    s10.status = "PASS"
+    return finish()
 
 
 if __name__ == "__main__":

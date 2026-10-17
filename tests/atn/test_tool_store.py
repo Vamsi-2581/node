@@ -647,12 +647,11 @@ class TestAdoption:
     async def _adopter(self, tmp_path, source_blobs):
         rt = _make_runtime(tmp_path / "adopter_daemon")
         await _register_agent(rt, "worker")
-        # Run gate (Decision 2026-10-13): network tools run only bonded and
-        # vetted (or owner opt-in). These tests are about containment, so
-        # the fake chain says both; the gate has its own tests.
+        # Run gate: network tools run only while bonded. These tests are
+        # about containment, so the fake chain says bonded; the gate has
+        # its own tests.
         from atn.runtime.tool_bond import ToolBondGate
-        rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: True,
-                                         vetted_checker=lambda d: True)
+        rt.tool_bond_gate = ToolBondGate(rt, checker=lambda d: True)
 
         async def _fetch(digest: str) -> bytes | None:
             return source_blobs.get_bytes(digest)
@@ -839,7 +838,10 @@ class TestVetting:
         assert "verdict" not in out
 
     @pytest.mark.asyncio
-    async def test_vet_pass_emits_vet_event(self, tmp_path):
+    async def test_vet_pass_records_locally_and_gossips_nothing(self, tmp_path):
+        """An inspection is a staked ToolBond review now (docs/
+        multi_jurisdiction.md decision 10): recorded locally with its
+        report blob, never gossiped as a consensus event."""
         rt = _make_runtime(tmp_path)
         await _family(rt)
         res = await _register_echo(rt)
@@ -854,28 +856,23 @@ class TestVetting:
             rt, caller_id="sibling",
         )
         assert out["verdict"] == "pass"
-        assert len(sunk) == 1
-        ev = sunk[0]
-        assert ev["kind"] == "tool_used"
-        assert ev["vet"] is True
-        assert ev["ok"] is True
+        assert sunk == []
+        report = store._blob_store().get_json(out["review_digest"])
+        assert report["kind"] == "tool_vet_report"
         # sibling is not registered on-chain; wallet-less env → local-id
         # fallback (ruling 2026-07-24).
-        assert ev["author_agent"] == "sibling"
-        assert ev.get("attested") is None       # a vet is NOT usage
-        report = store._blob_store().get_json(ev["review_digest"])
-        assert report["kind"] == "tool_vet_report"
         assert report["validator"] == "sibling"
+        # Not registered on chain: the staked review is not queued.
+        assert out["review"]["queued"] == 0
         # Local ledgers: vet_summary sees it, attestation_summary must not.
         assert store.vet_summary()[res["digest"]]["pass_count"] == 1
         assert res["digest"] not in store.attestation_summary()
 
     @pytest.mark.asyncio
-    async def test_vet_axes_ride_event_and_report(self, tmp_path):
-        """v4.1: an inspection carries optional per-charter-axis scores
-        that ride the vet event and land in the report blob, so the close
-        can drift the tool's position like a usage review. It still mints
-        nothing (no ``attested`` flag)."""
+    async def test_vet_axes_and_harm_land_in_the_report(self, tmp_path):
+        """An inspection's per-charter-axis scores and harm land in the
+        report blob and the local row (history and UI); the staked review
+        itself goes to ToolBond, nothing rides a gossip event."""
         rt = _make_runtime(tmp_path)
         await _family(rt)
         res = await _register_echo(rt)
@@ -888,17 +885,15 @@ class TestVetting:
             {"digest": res["digest"], "verdict": "pass",
              "report": "read the code; echoes x cleanly",
              "axes": {"correctness": 0.9, "simplicity": 0.5,
-                      "bogus_axis": "nope"}},
+                      "bogus_axis": "nope"}, "harm": 0.1},
             rt, caller_id="sibling",
         )
         assert out["verdict"] == "pass"
-        ev = sunk[0]
-        assert ev["vet"] is True
-        assert ev.get("attested") is None            # still not usage
+        assert sunk == []
+        report = store._blob_store().get_json(out["review_digest"])
         # Garbage axis dropped; valid axes clamped-through and sorted.
-        assert ev["axes"] == {"correctness": 0.9, "simplicity": 0.5}
-        report = store._blob_store().get_json(ev["review_digest"])
         assert report["axes"] == {"correctness": 0.9, "simplicity": 0.5}
+        assert report["harm"] == 0.1
 
     @pytest.mark.asyncio
     async def test_self_vet_rejected(self, tmp_path):
@@ -968,8 +963,7 @@ class TestVetting:
             report="fetched by digest; code matches manifest",
         )
         assert out["verdict"] == "pass"
-        assert sunk[0]["vet"] is True
-        assert sunk[0]["manifest_digest"] == res["digest"]
+        assert out["digest"] == res["digest"] and sunk == []
         # The fetched blobs are now cached locally (content-addressed).
         assert store_val._blob_store().get_bytes(code_digest) is not None
 

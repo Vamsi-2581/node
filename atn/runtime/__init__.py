@@ -132,9 +132,6 @@ class Runtime:
         # Bridge npm-dependency updater loop (providers.bridge_auto_update).
         self._bridge_update_task: asyncio.Task | None = None
         self._model_catalog_task: asyncio.Task | None = None
-        # ToolBond flag keeper (atn/tool_flags.py): reveal/settle/finalize/
-        # claim for this daemon's auditor flags. None until start().
-        self._tool_flag_keeper: asyncio.Task | None = None
         inject_connector_credentials(self.connectors, self.credential_store)
 
         # Group threads (docs/group_chat.md): shared transcripts several
@@ -745,12 +742,6 @@ class Runtime:
             self._model_catalog_task = asyncio.create_task(
                 self.providers.model_catalog_loop())
 
-        # Auditor flags walk their ToolBond rounds in the background (reveal
-        # once the REP threshold is met, settle, finalize, claim). Off under
-        # the same test gate; ATN_DISABLE_TOOL_FLAG_KEEPER=1 turns it off alone.
-        from ..tool_flags import start_keeper
-        self._tool_flag_keeper = start_keeper(self)
-
         # Spawn the semantic embed worker now, on its own thread, so the
         # first caller (Services-page topic clustering, substrate coords)
         # finds the model loaded instead of paying the import + load at
@@ -917,14 +908,6 @@ class Runtime:
             except (asyncio.CancelledError, Exception):  # noqa: B014
                 pass
             self._model_catalog_task = None
-
-        if self._tool_flag_keeper is not None:
-            self._tool_flag_keeper.cancel()
-            try:
-                await self._tool_flag_keeper
-            except (asyncio.CancelledError, Exception):  # noqa: B014
-                pass
-            self._tool_flag_keeper = None
 
         # Close active cognitive-mode providers
         for provider in list(self.providers._active_providers.values()):

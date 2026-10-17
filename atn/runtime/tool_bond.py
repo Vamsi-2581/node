@@ -3,10 +3,10 @@ Decision 2026-10-12).
 
 A pinned tool may replace a core built-in (shell / file tools) only while
 its manifest digest is BONDED on-chain: ``ToolBond.isBonded(bytes32)`` is
-true while the author's stake >= minStake, no unbond is pending, and the
-tool was never slashed (contract: trustless-contracts/contracts/ToolBond.sol).
-The bond is what an accuser can take: ``accuse(digest, evidenceCid)`` with
-the daemon-signed evidence trace (shell_provider.capture_evidence).
+true while the author's stake >= minStake and no unbond is pending
+(contract: trustless-contracts/contracts/ToolBond.sol, 448023a). The bond is
+what staked reviews can take: a settled harm H slashes H of it
+(docs/multi_jurisdiction.md decision 10; reviews live in review_batch.py).
 
 FAIL CLOSED. The address comes from the jurisdiction registry
 (``contracts.tool_bond`` in atn/registry.json, or ATN_REGISTRY_URL), or the
@@ -17,6 +17,10 @@ every digest as bonded and logs a warning each time it is consulted.
 
 Results are cached briefly (positive 60s, negative 15s) so a dispatch hot
 path does not hit the RPC per call. The web3 call runs in a thread.
+
+There is no "vetted" flag: ratings are a gradient (``ToolBondClient.rating``
+returns the REP-weighted per-axis means, harm and the REP mass behind them),
+and the owner or agent decides how much backing is enough.
 """
 from __future__ import annotations
 
@@ -38,10 +42,6 @@ TOOL_BOND_ABI = [{
     "name": "isBonded", "type": "function", "stateMutability": "view",
     "inputs": [{"name": "digest", "type": "bytes32"}],
     "outputs": [{"name": "", "type": "bool"}],
-}, {
-    "name": "isVetted", "type": "function", "stateMutability": "view",
-    "inputs": [{"name": "digest", "type": "bytes32"}],
-    "outputs": [{"name": "", "type": "bool"}],
 }]
 
 
@@ -60,22 +60,17 @@ def _registry_seed(runtime: Any) -> dict[str, Any]:
 
 
 class ToolBondGate:
-    """``await gate.is_bonded(digest) -> (bonded, reason)`` and
-    ``await gate.is_vetted(digest) -> (vetted, reason)``. Never raise.
+    """``await gate.is_bonded(digest) -> (bonded, reason)``. Never raises.
 
-    ``checker`` / ``vetted_checker`` (tests / alternate transports): sync
-    callables ``digest -> bool`` used instead of web3 when given. A gate
-    built with only ``checker`` answers is_vetted False (fail closed).
+    ``checker`` (tests / alternate transports): a sync callable
+    ``digest -> bool`` used instead of web3 when given.
     """
 
     def __init__(self, runtime: Any = None, *,
-                 checker: Optional[Callable[[str], bool]] = None,
-                 vetted_checker: Optional[Callable[[str], bool]] = None) -> None:
+                 checker: Optional[Callable[[str], bool]] = None) -> None:
         self._runtime = runtime
         self._checker = checker
-        self._vetted_checker = vetted_checker
         self._cache: dict[str, tuple[bool, float, str]] = {}
-        self._vetted_cache: dict[str, tuple[bool, float, str]] = {}
         self._address: Optional[str] = None
         self._rpc_url: Optional[str] = None
 
@@ -98,59 +93,44 @@ class ToolBondGate:
         return self._address or "", self._rpc_url or ""
 
     def configured(self) -> bool:
-        return (bool(self._checker) or bool(self._vetted_checker)
-                or bool(self._resolve_target()[0]))
+        return bool(self._checker) or bool(self._resolve_target()[0])
 
     # -- query ---------------------------------------------------------
-    def _query(self, digest: str, fn: str = "isBonded") -> bool:
-        checker = self._checker if fn == "isBonded" else self._vetted_checker
-        if checker is not None:
-            return bool(checker(digest))
-        if self._checker is not None or self._vetted_checker is not None:
-            return False  # test transport without this answer: fail closed
+    def _query(self, digest: str) -> bool:
+        if self._checker is not None:
+            return bool(self._checker(digest))
         addr, rpc = self._resolve_target()
         from web3 import Web3
         w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": _RPC_TIMEOUT_S}))
         c = w3.eth.contract(address=Web3.to_checksum_address(addr),
                             abi=TOOL_BOND_ABI)
-        return bool(getattr(c.functions, fn)(bytes.fromhex(digest)).call())
+        return bool(c.functions.isBonded(bytes.fromhex(digest)).call())
 
-    async def _ask(self, digest: str, fn: str,
-                   cache: dict[str, tuple[bool, float, str]]) -> tuple[bool, str]:
-        word = "bonded" if fn == "isBonded" else "vetted"
+    async def is_bonded(self, digest: str) -> tuple[bool, str]:
         digest = str(digest or "").lower().removeprefix("0x")
         if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             return False, "malformed manifest digest"
-        if (self._checker is None and self._vetted_checker is None
-                and dev_override()):
-            log.warning("ToolBond DEV OVERRIDE: treating %s as %s "
+        if self._checker is None and dev_override():
+            log.warning("ToolBond DEV OVERRIDE: treating %s as bonded "
                         "(%s=1; never set this outside local testing)",
-                        digest[:16], word, DEV_OVERRIDE_ENV)
+                        digest[:16], DEV_OVERRIDE_ENV)
             return True, "dev override"
         now = time.monotonic()
-        hit = cache.get(digest)
+        hit = self._cache.get(digest)
         if hit is not None and hit[1] > now:
             return hit[0], f"{hit[2]} (cached)"
         if not self.configured():
             return False, ("no ToolBond address configured (registry key "
                            "'tool_bond'); fails closed")
         try:
-            ok = await asyncio.to_thread(self._query, digest, fn)
-            reason = word if ok else f"not {word} on ToolBond"
+            ok = await asyncio.to_thread(self._query, digest)
+            reason = "bonded" if ok else "not bonded on ToolBond"
         except Exception as exc:  # noqa: BLE001 — fail closed
-            log.warning("ToolBond %s(%s) failed: %s", fn, digest[:16], exc)
+            log.warning("ToolBond isBonded(%s) failed: %s", digest[:16], exc)
             ok, reason = False, f"ToolBond query failed: {exc}"
         ttl = _POSITIVE_TTL_S if ok else _NEGATIVE_TTL_S
-        cache[digest] = (ok, now + ttl, reason)
+        self._cache[digest] = (ok, now + ttl, reason)
         return ok, reason
-
-    async def is_bonded(self, digest: str) -> tuple[bool, str]:
-        return await self._ask(digest, "isBonded", self._cache)
-
-    async def is_vetted(self, digest: str) -> tuple[bool, str]:
-        """``ToolBond.isVetted``: bonded AND found clean by a finalized
-        round with no malware verdict pending. What nodes run by default."""
-        return await self._ask(digest, "isVetted", self._vetted_cache)
 
 
 def gate_for(runtime: Any) -> ToolBondGate:
@@ -167,15 +147,12 @@ def gate_for(runtime: Any) -> ToolBondGate:
 
 
 # ---------------------------------------------------------------------------
-# ToolBond v2 client (docs/tool_substrate.md, Decision 2026-10-13): stakes,
-# commit-reveal flags and REP-settled verdicts. Reads never raise (None on
-# fault); writes sign with the AGENT key and return {success, tx_hash} or
-# {success: False, error}. Contract: trustless-contracts/contracts/ToolBond.sol.
+# ToolBond client (trustless-contracts ToolBond 448023a): the author's bond
+# and the settled ratings. Reviews (commit / reveal / finalize / claim) are in
+# review_batch.py, which reuses this client's plumbing. Reads never raise
+# (None on fault); writes sign with the AGENT key and return {success,
+# tx_hash} or {success: False, error}.
 # ---------------------------------------------------------------------------
-
-STAGES = ("none", "commit", "reveal", "cooling", "finalizing", "done")
-VERDICTS = ("none", "clean", "malware", "void")
-
 
 def _fn(name: str, inputs: list, outputs: list = (), mutability: str = "nonpayable") -> dict[str, Any]:
     return {"name": name, "type": "function", "stateMutability": mutability,
@@ -183,37 +160,19 @@ def _fn(name: str, inputs: list, outputs: list = (), mutability: str = "nonpayab
             "outputs": [{"name": n, "type": t} for n, t in outputs]}
 
 
-TOOL_BOND_V2_ABI = [
+TOOL_BOND_CLIENT_ABI = [
     _fn("isBonded", [("digest", "bytes32")], [("", "bool")], "view"),
-    _fn("isVetted", [("digest", "bytes32")], [("", "bool")], "view"),
     _fn("minStake", [], [("", "uint256")], "view"),
+    _fn("reviewerShareBps", [], [("", "uint256")], "view"),
     _fn("bonds", [("", "bytes32")],
         [("author", "address"), ("stake", "uint256"), ("unbondRequestedAt", "uint256"),
-         ("round", "uint32"), ("vetted", "bool"), ("slashed", "bool")], "view"),
-    _fn("getRound", [("digest", "bytes32"), ("round", "uint32")],
-        [("stage", "uint8"), ("verdict", "uint8"), ("overruled", "bool"),
-         ("snapshot", "uint48"), ("revealEnds", "uint48"), ("appealEnds", "uint48"),
-         ("threshold", "uint256"), ("committed", "uint256"), ("greenWeight", "uint256"),
-         ("redWeight", "uint256"), ("finder", "address"), ("auditorCount", "uint256")], "view"),
-    _fn("auditorAt", [("digest", "bytes32"), ("round", "uint32"), ("i", "uint256")],
-        [("", "address")], "view"),
-    _fn("flags", [("", "bytes32"), ("", "uint32"), ("", "address")],
-        [("commitment", "bytes32"), ("weight", "uint256"), ("index", "uint32"),
-         ("revealed", "bool"), ("red", "bool"), ("claimed", "bool"),
-         ("evidenceHash", "bytes32")], "view"),
-    _fn("commitmentOf", [("digest", "bytes32"), ("round", "uint32"), ("auditor", "address"),
-                         ("red", "bool"), ("evidenceHash", "bytes32"), ("salt", "bytes32")],
-        [("", "bytes32")], "pure"),
+         ("unbondEpoch", "uint256"), ("pending", "uint32")], "view"),
+    _fn("toolRating", [("digest", "bytes32"), ("axisId", "bytes32")],
+        [("sum", "int256"), ("mass", "uint256")], "view"),
+    _fn("toolHarm", [("digest", "bytes32")], [("sum", "uint256"), ("mass", "uint256")], "view"),
     _fn("bond", [("digest", "bytes32"), ("amount", "uint256")]),
     _fn("requestUnbond", [("digest", "bytes32")]),
     _fn("withdraw", [("digest", "bytes32")]),
-    _fn("commitFlag", [("digest", "bytes32"), ("commitment", "bytes32")]),
-    _fn("revealFlag", [("digest", "bytes32"), ("red", "bool"), ("evidenceHash", "bytes32"),
-                       ("salt", "bytes32")]),
-    _fn("settle", [("digest", "bytes32")]),
-    _fn("lapse", [("digest", "bytes32")]),
-    _fn("finalize", [("digest", "bytes32"), ("maxAuditors", "uint256")]),
-    _fn("claim", [("digest", "bytes32"), ("round", "uint32")]),
 ]
 
 SUBSTRATE_TOOL_ABI = [
@@ -232,8 +191,14 @@ def _b32(hex_digest: str) -> bytes:
     return bytes.fromhex(h)
 
 
+def axis_key(axis_id: str) -> bytes:
+    """ToolBond's axis key: keccak256 of the charter axis id."""
+    from eth_utils import keccak
+    return keccak(text=str(axis_id))
+
+
 class ToolBondClient:
-    """Chain surface of the tool security rail for one runtime.
+    """Chain surface of the tool bond for one runtime.
 
     Addresses resolve like ``ToolBondGate`` (env, config, registry seed);
     Substrate comes from ``rpb.substrate_address``. Cheap to construct per use.
@@ -267,7 +232,7 @@ class ToolBondClient:
         bond_addr, sub, _ = self._addresses()
         if not bond_addr or not sub:
             raise ValueError("ToolBond or Substrate address not configured")
-        return (w3.eth.contract(address=Web3.to_checksum_address(bond_addr), abi=TOOL_BOND_V2_ABI),
+        return (w3.eth.contract(address=Web3.to_checksum_address(bond_addr), abi=TOOL_BOND_CLIENT_ABI),
                 w3.eth.contract(address=Web3.to_checksum_address(sub), abi=SUBSTRATE_TOOL_ABI))
 
     def _send(self, w3, account, func, gas_floor: int) -> dict[str, Any]:
@@ -319,39 +284,33 @@ class ToolBondClient:
         return await self._read(lambda b, s: s.functions.toolAuthor(_b32(digest)).call())
 
     async def status(self, digest: str) -> Optional[dict[str, Any]]:
-        """Bond + current round in one read: what the UI and gates show."""
+        """The author's bond: what the UI and the bond gate show."""
         def fn(b, s):
             d = _b32(digest)
-            author, stake, unbond_at, rnd, vetted, slashed = b.functions.bonds(d).call()
-            r = b.functions.getRound(d, rnd).call()
+            author, stake, unbond_at, unbond_epoch, pending = b.functions.bonds(d).call()
             return {
                 "author": author, "stake": int(stake), "unbond_requested_at": int(unbond_at),
-                "round": int(rnd), "vetted": bool(vetted), "slashed": bool(slashed),
+                "unbond_epoch": int(unbond_epoch), "pending_rounds": int(pending),
                 "bonded": bool(b.functions.isBonded(d).call()),
-                "stage": STAGES[r[0]] if r[0] < len(STAGES) else str(r[0]),
-                "verdict": VERDICTS[r[1]] if r[1] < len(VERDICTS) else str(r[1]),
-                "overruled": bool(r[2]), "snapshot": int(r[3]), "reveal_ends": int(r[4]),
-                "appeal_ends": int(r[5]), "threshold": int(r[6]), "committed": int(r[7]),
-                "green_weight": int(r[8]), "red_weight": int(r[9]), "finder": r[10],
-                "auditor_count": int(r[11]),
             }
         return await self._read(fn)
 
-    async def flag_of(self, digest: str, round_: int, auditor: str) -> Optional[dict[str, Any]]:
-        def fn(b, s):
-            from web3 import Web3
-            c, w, i, revealed, red, claimed, ev = b.functions.flags(
-                _b32(digest), int(round_), Web3.to_checksum_address(auditor)).call()
-            return {"commitment": c.hex(), "weight": int(w), "index": int(i),
-                    "revealed": bool(revealed), "red": bool(red), "claimed": bool(claimed),
-                    "evidence_hash": ev.hex()}
-        return await self._read(fn)
-
-    async def auditors(self, digest: str, round_: int) -> Optional[list[str]]:
+    async def rating(self, digest: str, axis_ids: list[str]) -> Optional[dict[str, Any]]:
+        """The settled rating over every finalized round, per charter axis:
+        the REP-weighted sum and REP mass (``mean`` = sum / mass / 100, in
+        -1..1), and harm the same way (``mean`` in 0..1). Numbers, not a
+        verdict: what is trustworthy enough is the reader's call."""
         def fn(b, s):
             d = _b32(digest)
-            n = int(b.functions.getRound(d, int(round_)).call()[11])
-            return [b.functions.auditorAt(d, int(round_), i).call() for i in range(n)]
+            axes: dict[str, Any] = {}
+            for axis_id in axis_ids:
+                total, mass = b.functions.toolRating(d, axis_key(axis_id)).call()
+                axes[axis_id] = {"sum": int(total), "mass": int(mass),
+                                 "mean": (int(total) / int(mass) / 100.0) if mass else None}
+            h_sum, h_mass = b.functions.toolHarm(d).call()
+            return {"axes": axes,
+                    "harm": {"sum": int(h_sum), "mass": int(h_mass),
+                             "mean": (int(h_sum) / int(h_mass) / 100.0) if h_mass else None}}
         return await self._read(fn)
 
     # -- writes: author ------------------------------------------------
@@ -398,52 +357,13 @@ class ToolBondClient:
     async def withdraw(self, private_key: str, digest: str) -> dict[str, Any]:
         return await self._write(private_key, lambda b, s, a: b.functions.withdraw(_b32(digest)))
 
-    # -- writes: auditors ----------------------------------------------
-    async def commit_flag(self, private_key: str, digest: str, red: bool,
-                          evidence_hash: str, salt: str) -> dict[str, Any]:
-        """Commit a hidden flag. The commitment binds the round number, so it
-        targets the round the commit will land in: the current one, or the
-        next if the current one is done (the commit opens it)."""
-        st = await self.status(digest)
-        if st is None:
-            return {"success": False, "error": "chain unreachable"}
-        round_ = st["round"] + (1 if st["stage"] == "done" else 0)
-
-        def build(b, s, a):
-            c = b.functions.commitmentOf(_b32(digest), round_, a.address, bool(red),
-                                         _b32(evidence_hash), _b32(salt)).call()
-            return b.functions.commitFlag(_b32(digest), c)
-        return {**await self._write(private_key, build, gas_floor=400_000), "round": round_}
-
-    async def reveal_flag(self, private_key: str, digest: str, red: bool,
-                          evidence_hash: str, salt: str) -> dict[str, Any]:
-        return await self._write(private_key, lambda b, s, a: b.functions.revealFlag(
-            _b32(digest), bool(red), _b32(evidence_hash), _b32(salt)))
-
-    async def claim(self, private_key: str, digest: str, round_: int) -> dict[str, Any]:
-        return await self._write(private_key, lambda b, s, a: b.functions.claim(_b32(digest), int(round_)))
-
-    # -- writes: keepers (anyone may call) -------------------------------
-    async def settle(self, private_key: str, digest: str) -> dict[str, Any]:
-        return await self._write(private_key, lambda b, s, a: b.functions.settle(_b32(digest)))
-
-    async def lapse(self, private_key: str, digest: str) -> dict[str, Any]:
-        return await self._write(private_key, lambda b, s, a: b.functions.lapse(_b32(digest)))
-
-    async def finalize(self, private_key: str, digest: str, max_auditors: int = 50) -> dict[str, Any]:
-        return await self._write(private_key, lambda b, s, a: b.functions.finalize(
-            _b32(digest), int(max_auditors)), gas_floor=600_000)
-
 
 def evidence_hash(*, tool_digest: str, transcript_hash: str, dep_digests: list,
                   code_ref: Optional[dict[str, Any]] = None) -> str:
-    """The daemon-defined evidenceHash a flag commits to (hex, no 0x).
-
-    keccak256 of canonical JSON {tool, transcript, deps (sorted), code_ref}.
-    A red flag's code_ref names the exact malicious code ({path, start, end,
-    sha256 of the cited lines}); a green flag has none. Only the hash goes
-    on chain; the transcript stays local as appeal evidence.
-    """
+    """A review's evidenceHash (hex, no 0x): keccak256 of canonical JSON
+    {tool, transcript, deps (sorted), code_ref}. A harm claim's code_ref names
+    the exact malicious code ({path, start, end, sha256 of the cited lines}).
+    Only the hash goes on chain; the evidence stays local."""
     import json
     from eth_utils import keccak
 

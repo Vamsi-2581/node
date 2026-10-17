@@ -1592,13 +1592,20 @@ class ToolStore:
         usage the mint counts (docs/tool_substrate.md — two receipt tiers).
 
         ``judgments`` — list of ``{"tool", "ok", "score"?, "axes"?,
-        "own_share"?, "note"?}``. Each
+        "harm"?, "stake"?, "own_share"?, "note"?}``. Each
         tool is resolved via ``self.resolve`` and scoping-checked; a tool the
         caller may not use (or can't resolve) is skipped and reported, never
         failing the batch. ``context_text`` (the work item) is embedded ONCE
         into ``problem_coords``; if the substrate package is unavailable the
         rows still record locally with ``problem_coords=[]`` — never crash the
-        agent."""
+        agent.
+
+        Reviews are NOT gossiped (docs/multi_jurisdiction.md decision 10):
+        the consensus ``tool_used`` event carries the usage (and the
+        composition ``own_share`` estimate), never the axis scores. Each
+        judgment's axes / harm / stake come back under ``_reviews`` for the
+        caller to queue as a staked ToolBond review; the local attestation
+        row keeps them for history and the UI."""
         caller = caller_id if caller_id else OWNER_AUTHOR
 
         # Embed the work-item context once. Degrade to [] if the substrate
@@ -1618,6 +1625,7 @@ class ToolStore:
 
         attested = 0
         skipped: list[dict[str, Any]] = []
+        reviews: list[dict[str, Any]] = []
         ts = int(time.time())
         self._dir.mkdir(parents=True, exist_ok=True)
 
@@ -1651,6 +1659,18 @@ class ToolStore:
                         axes[str(axis_id)] = max(-1.0, min(1.0, float(value)))
                     except (TypeError, ValueError):
                         continue
+            harm: float | None = None
+            raw_harm = judgment.get("harm")
+            if raw_harm is not None and not isinstance(raw_harm, bool):
+                try:
+                    harm = max(0.0, min(1.0, float(raw_harm)))
+                except (TypeError, ValueError):
+                    harm = None
+            stake = 0
+            try:
+                stake = max(0, int(judgment.get("stake") or 0))
+            except (TypeError, ValueError):
+                stake = 0
             # Reviewed composition split (Decision 2026-10-13 §9): optional
             # estimate in [0,1] of how much of a composite's value is its
             # own logic vs its declared deps. Garbage is dropped.
@@ -1679,6 +1699,8 @@ class ToolStore:
                 }
                 if axes:
                     review["axes"] = dict(sorted(axes.items()))
+                if harm is not None:
+                    review["harm"] = harm
                 if own_share is not None:
                     review["own_share"] = own_share
                 try:
@@ -1700,6 +1722,10 @@ class ToolStore:
             }
             if axes:
                 row["axes"] = dict(sorted(axes.items()))
+            if harm is not None:
+                row["harm"] = harm
+            if stake:
+                row["stake"] = stake
             if own_share is not None:
                 row["own_share"] = own_share
             # Stamp the CALLER's harness distro (docs/tool_substrate.md —
@@ -1736,8 +1762,7 @@ class ToolStore:
                     "problem_coords": list(problem_coords),
                     "review_digest": review_digest,
                 }
-                if axes:
-                    event["axes"] = dict(sorted(axes.items()))
+                # No axes on the wire: reviews settle on ToolBond.
                 if own_share is not None:
                     event["own_share"] = own_share
                 if _loadout:
@@ -1748,8 +1773,13 @@ class ToolStore:
                     log.warning("attested tool_used event sink failed: %s", exc)
 
             attested += 1
+            if axes or harm is not None:
+                reviews.append({"digest": record.digest, "axes": dict(axes),
+                                "harm": harm, "stake": stake,
+                                "evidence_hash": review_digest,
+                                "author": str(record.manifest.get("author") or "")})
 
-        return {"attested": attested, "skipped": skipped}
+        return {"attested": attested, "skipped": skipped, "_reviews": reviews}
 
     def recent_attestations(
         self, digest: str, *, limit: int = 50,
@@ -1796,6 +1826,8 @@ class ToolStore:
                 "ok": bool(row.get("ok")),
                 "score": row.get("score"),
                 "axes": row.get("axes") or {},
+                "harm": row.get("harm"),
+                "stake": row.get("stake", 0),
                 "note": "",
             }
             review_digest = str(row.get("review_digest") or "")
@@ -2103,25 +2135,21 @@ class ToolStore:
         verdict: str | None = None,
         report: str = "",
         axes: dict[str, float] | None = None,
+        harm: Any = None,
     ) -> dict[str, Any]:
-        """Inspection-review flow (v4.1 gradient trust — memory
-        tool-economy-v4-gradient-trust), two steps in one rail:
+        """Inspection-review flow (docs/multi_jurisdiction.md decision 10),
+        two steps in one rail:
 
         - ``verdict=None`` — INSPECT: resolve the manifest (locally or
           fetched from the network by digest) and return it with the
           pinned source code, so the validator can actually read what
           it is judging.
         - ``verdict="pass"|"fail"`` — ATTEST: record the inspection
-          locally and emit the consensus ``tool_used`` event with
-          ``vet=True``. ``report`` (required) is blob-stored as the
-          inspection report — inspectors show their work; the report is
-          what a later exploit CON gets argued against. Optional
-          per-charter-axis scores (``axes`` — ``{axis_id: [-1,1]}``,
-          same shape as ``attest_usage``) ride the event so the
-          inspection moves the tool's public position/rating exactly
-          like a usage review — weighted at close by the inspector's
-          reputation share × credibility. An inspection MINTS NOTHING;
-          it only moves position/rating.
+          locally. ``report`` (required) is blob-stored as the inspection
+          report (its digest becomes the review's evidence hash). The
+          review itself (``axes`` ``{axis_id: [-1,1]}`` and ``harm`` in
+          [0,1]) is queued by the caller as a staked ToolBond review; no
+          consensus event is gossiped. An inspection MINTS NOTHING.
 
         Self-vetting is rejected here for the local-author case; the
         close voids it structurally anyway (fleet + wire exclusions).
@@ -2194,6 +2222,12 @@ class ToolStore:
                     norm_axes[str(axis_id)] = max(-1.0, min(1.0, float(value)))
                 except (TypeError, ValueError):
                     continue
+        norm_harm: float | None = None
+        if harm is not None and not isinstance(harm, bool):
+            try:
+                norm_harm = max(0.0, min(1.0, float(harm)))
+            except (TypeError, ValueError):
+                norm_harm = None
         review_digest = ""
         try:
             blobs: Any = self._blob_store()
@@ -2212,6 +2246,8 @@ class ToolStore:
                 }
                 if norm_axes:
                     report_blob["axes"] = dict(sorted(norm_axes.items()))
+                if norm_harm is not None:
+                    report_blob["harm"] = norm_harm
                 review_digest = blobs.add_json(report_blob) or ""
             except Exception as exc:
                 log.warning("vet report blob failed: %s", exc)
@@ -2230,32 +2266,15 @@ class ToolStore:
         }
         if norm_axes:
             row["axes"] = dict(sorted(norm_axes.items()))
+        if norm_harm is not None:
+            row["harm"] = norm_harm
         self._dir.mkdir(parents=True, exist_ok=True)
         with self._attestations_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
 
-        if self.event_sink is not None:
-            event = {
-                "kind": "tool_used",
-                "seq": self._receipt_seq,
-                "author_agent": consensus_caller,
-                "manifest_digest": digest,
-                "tool_author": str(manifest.get("author") or ""),
-                "receipt_digest": review_digest,
-                "ok": ok,
-                "fee_atn": 0.0,
-                "vet": True,
-                "review_digest": review_digest,
-            }
-            if norm_axes:
-                event["axes"] = dict(sorted(norm_axes.items()))
-            try:
-                self.event_sink(event)
-            except Exception as exc:
-                log.warning("vet event sink failed: %s", exc)
-
         return {"digest": digest, "verdict": verdict,
-                "review_digest": review_digest}
+                "review_digest": review_digest,
+                "tool_author": str(manifest.get("author") or "")}
 
     # ------------------------------------------------------------------
     # Evidence-replay (docs/tool_substrate.md — Evidence section)
