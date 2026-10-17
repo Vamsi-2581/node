@@ -191,6 +191,11 @@ class AutonetConfig:
     # (plain interval epochs). Consensus-relevant like the rate.
     epoch_min_seconds: float = 0.0
     epoch_candle_window_seconds: float = 0.0
+    # "<chain_id>:<DAO address>" (docs/multi_jurisdiction.md decision 2):
+    # the gossip topic and the key this jurisdiction's world data lives
+    # under. Set by the atn bridge from the resolved jurisdiction. Empty
+    # only in local, chain-free runs.
+    jurisdiction_key: str = ""
 
     blockchain: BlockchainConfig = field(default_factory=BlockchainConfig)
     blob_store: BlobStoreConfig = field(default_factory=BlobStoreConfig)

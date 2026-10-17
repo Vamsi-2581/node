@@ -89,6 +89,13 @@ class AutonetState:
     # Local charter vs the jurisdiction's governed charter (registry key
     # jurisdiction.<id>.charter): True / False, None = none published.
     charter_match: bool | None = None
+    # The jurisdiction's identity "<chain_id>:<DAO address>" (gossip topic,
+    # substrate data key) and why it can't start, if it can't.
+    jurisdiction_key: str = ""
+    dao_registry_address: str = ""
+    tool_bond_address: str = ""
+    epoch_rules: str = ""
+    jurisdiction_errors: list[str] = field(default_factory=list)
     # Constitution CID loaded from registry
     constitution_cid: str = ""
     # Full constitution text (loaded from RPB.constitution() or local file)
@@ -134,6 +141,11 @@ class AutonetState:
             "economy_address": self.economy_address,
             "timelock_address": self.timelock_address,
             "charter_match": self.charter_match,
+            "jurisdiction_key": self.jurisdiction_key,
+            "dao_registry_address": self.dao_registry_address,
+            "tool_bond_address": self.tool_bond_address,
+            "epoch_rules": self.epoch_rules,
+            "jurisdiction_errors": list(self.jurisdiction_errors),
             "constitution_cid": self.constitution_cid,
             "constitution_text": self.constitution_text,
         }
@@ -174,10 +186,9 @@ class AutonetBridge:
         if config.chain_id:
             self.state.chain_id = config.chain_id
 
-        # Always run the jurisdiction discovery hook so substrate_address
-        # gets surfaced. The Governor-discovery body inside is a no-op
-        # when dao_address/rpc_url are empty.
-        self._discover_jurisdiction()
+        # Surface whatever the config already holds (the registry is only
+        # resolved at join).
+        self._mirror_jurisdiction()
 
         # Subscribe to execution events for training data feed
         if self._events:
@@ -229,66 +240,84 @@ class AutonetBridge:
             self.state.rpc_url = self.config.rpc_url
         if self.config.chain_id:
             self.state.chain_id = self.config.chain_id
-        self._discover_jurisdiction()
+        self._mirror_jurisdiction()
         return self.network_joined
 
-    def _discover_jurisdiction(self) -> None:
-        """Discover all contract addresses from the DAO Governor at startup."""
-        # Always surface substrate_address + gas token info from config —
-        # they're seeded from registry.json and don't depend on the
-        # on-chain Governor being reachable. (The block below may fail if
-        # the Governor's Registry is unresponsive or the network is down;
-        # these basics shouldn't depend on that.)
-        self.state.substrate_address = getattr(
-            self.config, "substrate_address", ""
-        )
-        self.state.gas_symbol = getattr(self.config, "gas_symbol", "XTZ") or "XTZ"
-        self.state.gas_decimals = int(getattr(self.config, "gas_decimals", 18) or 18)
+    def _mirror_jurisdiction(self) -> None:
+        """Mirror the resolved jurisdiction into the WS state and record why
+        it can't start, if it can't (docs/multi_jurisdiction.md decisions
+        3-5). Every address comes from one resolution of the chosen DAO's
+        Registry (or the packaged registry.json that names it)."""
+        from .config import epoch_rules_error, jurisdiction_key, missing_prerequisites
+
+        c = self.config
+        st = self.state
+        st.gas_symbol = getattr(c, "gas_symbol", "XTZ") or "XTZ"
+        st.gas_decimals = int(getattr(c, "gas_decimals", 18) or 18)
+        st.dao_address = c.dao_address
+        st.rpb_contract_address = c.rpb_contract_address
+        st.substrate_address = getattr(c, "substrate_address", "")
+        st.registry_address = c.registry_address
+        st.dao_registry_address = getattr(c, "dao_registry_address", "")
+        st.tool_bond_address = getattr(c, "tool_bond_address", "")
+        st.token_address = c.token_address
+        st.economy_address = c.economy_address
+        st.timelock_address = c.timelock_address
+        st.epoch_rules = (getattr(c, "epoch_rules", "") or "1")
+        st.jurisdiction_key = jurisdiction_key(c)
+
+        errors: list[str] = []
+        if self.network_joined:
+            missing = missing_prerequisites(c)
+            if missing:
+                errors.append("missing jurisdiction addresses: " + ", ".join(missing))
+            rules = epoch_rules_error(c)
+            if rules:
+                errors.append(rules)
+            charter = self._charter_error()
+            if charter:
+                errors.append(charter)
+        st.jurisdiction_errors = errors
+        for e in errors:
+            log.warning("Jurisdiction %s can't start: %s",
+                        st.jurisdiction_key or "(unknown)", e)
+
+    def _charter_error(self) -> str:
+        """Check the jurisdiction's charter against what this build computes.
+
+        The Registry holds the charter text (2026-10-17). Until the close
+        takes the axis set as data, this build only runs the built-in
+        charter, so a DAO with different axes is refused instead of forked.
+        A missing charter (pre-2026-10-17 deploys) falls back to the hash
+        comparison, which only warns."""
+        text = getattr(self.config, "charter_text", "") or ""
+        if not text:
+            try:
+                from .on_chain import verify_charter
+                self.state.charter_match = verify_charter(
+                    getattr(self.config, "charter_hash", ""),
+                    getattr(self.config, "charter_uri", ""),
+                )["match"]
+            except Exception:
+                log.debug("charter check skipped", exc_info=True)
+            return ""
         try:
-            from .on_chain import discover_jurisdiction
-            discovered = discover_jurisdiction(
-                self.config.rpc_url, self.config.dao_address,
-            )
-            # Populate config so OnChainService can use them
-            self.config.rpb_contract_address = discovered.get("rpb", "")
-            self.config.registry_address = discovered.get("registry", "")
-            self.config.token_address = discovered.get("token", "")
-            self.config.economy_address = discovered.get("economy", "")
-            self.config.timelock_address = discovered.get("timelock", "")
-            # Populate state for WS API
-            self.state.dao_address = self.config.dao_address
-            self.state.rpb_contract_address = self.config.rpb_contract_address
-            # substrate_address is set from registry.json by the config
-            # builder (not the on-chain Registry, since the Governor's
-            # registry doesn't index substrate yet). Mirror it here.
-            self.state.substrate_address = getattr(
-                self.config, "substrate_address", ""
-            )
-            self.state.registry_address = self.config.registry_address
-            self.state.token_address = self.config.token_address
-            self.state.economy_address = self.config.economy_address
-            self.state.timelock_address = self.config.timelock_address
-            self.state.jurisdiction_name = discovered.get("jurisdiction_name", "")
-            # Load constitution from registry if available
-            cid = discovered.get("registry.rpb.prompt.current", "")
-            if cid:
-                self.state.constitution_cid = cid
-                self._constitution_loaded = True
-            log.info("Jurisdiction '%s' contracts discovered from %s",
-                     self.state.jurisdiction_name, self.config.dao_address)
-        except ImportError:
-            log.info("Contract discovery skipped (web3 not available)")
-        except Exception as e:
-            log.warning("Failed to discover jurisdiction from %s: %s",
-                        self.config.dao_address, e)
-        try:
-            from .on_chain import verify_charter
-            self.state.charter_match = verify_charter(
-                getattr(self.config, "charter_hash", ""),
-                getattr(self.config, "charter_uri", ""),
-            )["match"]
+            axes = json.loads(text)["axes"]
+            theirs = [(str(a["id"]), str(a["thesis"])) for a in axes]
         except Exception:
-            log.debug("charter check skipped", exc_info=True)
+            self.state.charter_match = False
+            return "the jurisdiction's charter is not valid JSON {\"axes\": [...]}"
+        ids = {i for i, _ in theirs}
+        if not {"correctness", "simplicity"} <= ids:
+            self.state.charter_match = False
+            return "the jurisdiction's charter lacks the mandatory axes correctness and simplicity"
+        from nodes.common.world_model_substrate.adapter import CHARTER
+        ours = [(c["id"], c["thesis"]) for c in CHARTER]
+        self.state.charter_match = (theirs == ours)
+        if theirs != ours:
+            return ("the jurisdiction's charter differs from the one this build "
+                    "computes; custom charters need a newer build")
+        return ""
 
     # ------------------------------------------------------------------
     # P2P agent advertisement
@@ -788,13 +817,18 @@ class AutonetBridge:
         # Starting autonet IS joining the network: resolve the registry now
         # (never at boot).
         self.ensure_network_config()
+        if self.state.jurisdiction_errors:
+            self.state.status = AutonetStatus.ERROR
+            self.state.last_error = "; ".join(self.state.jurisdiction_errors)
+            return {"status": "error", "error": self.state.last_error}
 
         # Pre-flight cache refresh
         try:
             from ._cache import validate
-            if self.config.rpc_url and self.config.registry_address:
+            dao_registry = getattr(self.config, "dao_registry_address", "")
+            if self.config.rpc_url and dao_registry:
                 validate(
-                    self.config.rpc_url, self.config.registry_address,
+                    self.config.rpc_url, dao_registry,
                     __import__("atn").__version__,
                 )
         except Exception:
@@ -828,6 +862,9 @@ class AutonetBridge:
                 value = getattr(self.config, atn_key, "") or ""
                 if value:
                     setattr(bc, node_key, value)
+            # The jurisdiction's identity keys its gossip topic and its
+            # parked substrate data (docs/multi_jurisdiction.md decision 2).
+            self._autonet_config.jurisdiction_key = self.state.jurisdiction_key
 
             # Create the service. Note: AutonetService.start() blocks,
             # so we create here and start in an executor below. We wire

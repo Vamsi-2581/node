@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import hashlib
 import json
 
 import yaml
@@ -252,7 +253,18 @@ class RPBConfig:
                                         # hex), changed by DAO proposal. The
                                         # daemon compares its local charter_hash
                                         # against it and warns on drift.
-    charter_uri: str = ""               # jurisdiction.<id>.charter_uri
+    charter_uri: str = ""               # Legacy (pre 2026-10-17): the charter
+                                        # text lives in the Registry now.
+    charter_text: str = ""              # jurisdiction.<id>.charter: the charter
+                                        # JSON {"axes":[{"id","thesis"}]}, exact
+                                        # registry bytes (charter_hash = their
+                                        # sha256). docs/multi_jurisdiction.md 5.
+    epoch_rules: str = ""               # jurisdiction.<id>.epoch_rules: the
+                                        # epoch computation version the DAO's
+                                        # network runs. Empty = "1".
+    dao_registry_address: str = ""      # The DAO's governance Registry (the
+                                        # jurisdiction's key-value store).
+    tool_bond_address: str = ""         # ToolBond (trustless-contracts).
     registry_address: str = ""          # Discovered from RepToken.registryAddress()
                                         # — the DAO governance Registry, populated
                                         # at runtime by _discover_jurisdiction().
@@ -531,10 +543,27 @@ def _parse_registry_data(data: dict[str, Any], jurisdiction_id: str) -> dict[str
         seed["substrate_address"] = contracts["substrate"]
     if contracts.get("rep_token"):
         seed["rep_token_address"] = contracts["rep_token"]
-    if contracts.get("charter"):
-        seed["charter_hash"] = contracts["charter"]
+    charter = contracts.get("charter") or ""
+    if charter.lstrip().startswith("{"):
+        # The charter text itself (2026-10-17). Hash the exact registry
+        # bytes, never a re-serialization, so every daemon agrees.
+        seed["charter_text"] = charter
+        seed["charter_hash"] = "0x" + hashlib.sha256(
+            charter.encode("utf-8")).hexdigest()
+    elif charter:
+        seed["charter_hash"] = charter
     if contracts.get("charter_uri"):
         seed["charter_uri"] = contracts["charter_uri"]
+    if contracts.get("epoch_rules"):
+        seed["epoch_rules"] = str(contracts["epoch_rules"]).strip()
+    if contracts.get("timelock"):
+        seed["timelock_address"] = contracts["timelock"]
+    # On chain the key is "registry"; registry.json calls it "dao_registry".
+    dao_registry = contracts.get("dao_registry") or contracts.get("registry")
+    if dao_registry:
+        seed["dao_registry_address"] = dao_registry
+    if contracts.get("economy"):
+        seed["economy_address"] = contracts["economy"]
     if contracts.get("service_registry"):
         # Populate the clearly-named field AND the legacy shared name, so
         # existing consumers of ``registry_address`` (the audit noted this
@@ -545,11 +574,52 @@ def _parse_registry_data(data: dict[str, Any], jurisdiction_id: str) -> dict[str
     if contracts.get("payment_channel"):
         seed["payment_channel_address"] = contracts["payment_channel"]
     if contracts.get("tool_bond"):
-        # ToolBond (core-replacement bond gate, Decision 2026-10-12). Read by
-        # atn/runtime/tool_bond.py; no RPBConfig field, so the join merge
-        # skips it.
+        # ToolBond (publish stakes, core-replacement bond gate).
         seed["tool_bond_address"] = contracts["tool_bond"]
     return seed
+
+
+# A jurisdiction does not start unless every one of these resolved
+# (docs/multi_jurisdiction.md decision 3). A missing RepToken would
+# otherwise run the close in the genesis regime, and daemons that disagree
+# on it fork.
+REQUIRED_JURISDICTION_FIELDS = (
+    ("substrate_address", "substrate"),
+    ("rep_token_address", "rep_token"),
+    ("tool_bond_address", "tool_bond"),
+    ("dao_address", "dao (governor)"),
+    ("timelock_address", "timelock"),
+)
+
+# Epoch rules versions this build computes (decision 4). Bumped only when
+# the epoch computation changes; feature releases leave it alone.
+SUPPORTED_EPOCH_RULES = frozenset({"1"})
+
+
+def missing_prerequisites(an: "RPBConfig") -> list[str]:
+    """Names of the required jurisdiction addresses ``an`` lacks."""
+    return [label for field_name, label in REQUIRED_JURISDICTION_FIELDS
+            if not (getattr(an, field_name, "") or "").strip()]
+
+
+def epoch_rules_error(an: "RPBConfig") -> str:
+    """Why this build can't join ``an``'s jurisdiction, or "" if it can."""
+    rules = (getattr(an, "epoch_rules", "") or "1").strip()
+    if rules not in SUPPORTED_EPOCH_RULES:
+        return (f"the jurisdiction runs epoch rules version {rules}; this "
+                f"daemon computes {sorted(SUPPORTED_EPOCH_RULES)}. Upgrade to "
+                "a build that supports it.")
+    return ""
+
+
+def jurisdiction_key(an: "RPBConfig") -> str:
+    """``<chain_id>:<DAO address>``: the jurisdiction's identity, used as its
+    gossip topic and the key its local substrate data is parked under."""
+    dao = (getattr(an, "dao_address", "") or "").strip().lower()
+    chain_id = int(getattr(an, "chain_id", 0) or 0)
+    if not dao or not chain_id:
+        return ""
+    return f"{chain_id}:{dao}"
 
 
 def _fetch_registry(url: str) -> dict[str, Any] | None:
@@ -867,6 +937,10 @@ def _load_autonet_config(raw: dict[str, Any]) -> RPBConfig:
         rep_token_address=resolved.get("rep_token_address", ""),
         charter_hash=resolved.get("charter_hash", ""),
         charter_uri=resolved.get("charter_uri", ""),
+        charter_text=resolved.get("charter_text", ""),
+        epoch_rules=str(resolved.get("epoch_rules", "") or ""),
+        dao_registry_address=resolved.get("dao_registry_address", ""),
+        tool_bond_address=resolved.get("tool_bond_address", ""),
         registry_address=resolved.get("registry_address", ""),
         service_registry_address=resolved.get("service_registry_address", ""),
         payment_channel_address=resolved.get("payment_channel_address", ""),

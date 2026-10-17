@@ -630,9 +630,12 @@ class AutonetService:
         """
         try:
             from .common.world_service import WorldService
-            rpb_address = getattr(self.config, "rpb_address", None) \
-                or getattr(self.config, "node_id", None) \
-                or "default"
+            # The jurisdiction key "<chain_id>:<DAO address>" names the
+            # gossip topic and the world dir, so each jurisdiction's
+            # substrate data is parked under its own key. "default" only
+            # for local, chain-free runs.
+            rpb_address = (getattr(self.config, "jurisdiction_key", "")
+                           or "default")
             # Token-economics knob: tokens minted per second of epoch
             # duration (fixed-emission). Unset/None = legacy uncapped.
             emission_rate = getattr(self.config, "epoch_emission_rate", None)
