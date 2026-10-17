@@ -359,6 +359,34 @@ class TestReviewSnapshotFold:
                                               accuracies={}, axis_ids=AXES)
         assert set(snap["tools"][DIGEST]["axes"]) == {"correctness"}
 
+    def test_overruled_round_counts_at_the_daos_harm(self):
+        # ToolBond baab631: an overruled round's harm counts at the DAO's
+        # value with the same REP mass, so discovery follows the appeal.
+        recs = self._round1()[:-1] + [
+            _rec(8, "Overruled", digest=D, epoch=1, harm=0), _finalized(9)]
+        assert _fold(recs)["tools"][DIGEST]["harm"] == {"sum": 0, "mass": 500}
+
+    def test_settlement_and_epoch_logs_replace_the_views(self):
+        # ReviewSettled carries each accuracy and EpochStarted the axis ids
+        # (baab631), so no view read is needed.
+        recs = [
+            _rec(2, "EpochStarted", epoch=1, charterHash=b"\x00" * 32,
+                 axisIds=[bytes.fromhex(k.removeprefix("0x")) for k in KEYS],
+                 snapshot=1, supply=SUPPLY),
+            *self._round1()[1:3],
+            _rec(9, "ReviewSettled", index=0, digest=D, epoch=1, reviewer=AUD_A,
+                 accuracy=E18, harmAccuracy=E18),
+            _rec(9, "ReviewSettled", index=1, digest=D, epoch=1, reviewer=AUD_B,
+                 accuracy=2 ** 64 - 1, harmAccuracy=0),
+            _finalized(9, index=2),
+        ]
+        snap = tool_review_snapshot_from_logs(recs, block=10, since_block=0, epochs={},
+                                              accuracies={}, axis_ids=AXES)
+        revs = snap["rounds"][DIGEST][0]["reviews"]
+        assert [r["accuracy"] for r in revs] == [E18, None]
+        assert snap["rounds"][DIGEST][0]["supply"] == SUPPLY
+        assert snap["tools"][DIGEST]["axes"]["correctness"]["mass"] == 500
+
     def test_default_bps_without_params_event(self):
         snap = _fold(self._round1()[1:])
         assert snap["reviewer_share_bps"] == REVIEWER_SHARE_BPS_DEFAULT

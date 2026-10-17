@@ -284,6 +284,16 @@ _TOOL_BOND_EVENTS_ABI = [
     _ev("Finalized", [("digest", "bytes32", True), ("epoch", "uint256", True),
                       ("harm", "uint256", False), ("bondSlashed", "uint256", False),
                       ("lossPool", "uint256", False), ("repPool", "uint256", False)]),
+    _ev("Overruled", [("digest", "bytes32", True), ("epoch", "uint256", True),
+                      ("harm", "uint256", False)]),
+    # Added in trustless-contracts baab631; older deploys simply emit none
+    # and the views below fill in.
+    _ev("ReviewSettled", [("digest", "bytes32", True), ("epoch", "uint256", True),
+                          ("reviewer", "address", True), ("accuracy", "uint256", False),
+                          ("harmAccuracy", "uint256", False)]),
+    _ev("EpochStarted", [("epoch", "uint256", True), ("charterHash", "bytes32", False),
+                         ("axisIds", "bytes32[]", False), ("snapshot", "uint48", False),
+                         ("supply", "uint256", False)]),
     _ev("ParamsSet", [("minStake", "uint256", False), ("revealWindow", "uint256", False),
                       ("degradeBps", "uint256", False), ("authorSlashBps", "uint256", False),
                       ("unbondDelay", "uint256", False), ("reviewerShareBps", "uint256", False),
@@ -356,6 +366,9 @@ def tool_review_snapshot_from_logs(
     bps: Optional[int] = None
     reviews: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
     finalized: List[Tuple[str, int, int]] = []   # (digest, epoch, block), in order
+    overruled: Dict[Tuple[str, int], int] = {}    # DAO's harm 0..100 for a round
+    settled: Dict[Tuple[str, int, str], int] = {}  # (digest, epoch, reviewer) -> accuracy
+    epochs = dict(epochs)
     for r in ordered:
         if int(r["block"]) > int(block):
             break
@@ -370,6 +383,15 @@ def tool_review_snapshot_from_logs(
             })
         elif name == "Finalized":
             finalized.append((_hex32(a["digest"]), int(a["epoch"]), int(r["block"])))
+        elif name == "Overruled":
+            overruled[(_hex32(a["digest"]), int(a["epoch"]))] = int(a["harm"])
+        elif name == "ReviewSettled":
+            settled[(_hex32(a["digest"]), int(a["epoch"]),
+                     str(a["reviewer"]).lower())] = int(a["accuracy"])
+        elif name == "EpochStarted":
+            epochs.setdefault(int(a["epoch"]), {
+                "axis_ids": [_hex32(x) for x in a["axisIds"]],
+                "supply": int(a["supply"])})
 
     tools: Dict[str, Dict[str, Any]] = {}
     rounds: Dict[str, List[Dict[str, Any]]] = {}
@@ -392,6 +414,10 @@ def tool_review_snapshot_from_logs(
             if v["harm"] != _NO_HARM and w > 0:
                 h_sum += w * v["harm"]
                 h_mass += w
+        if (digest, epoch) in overruled:
+            # The DAO's ruling replaces the round's harm, at the same REP
+            # mass (as ToolBond.toolHarm counts it since baab631).
+            h_sum = h_mass * overruled[(digest, epoch)]
         tool = tools.setdefault(digest, {"axes": {}, "harm": {"sum": 0, "mass": 0}})
         prior = {a: int(c["mass"]) for a, c in tool["axes"].items()}
         prior["harm"] = int(tool["harm"]["mass"])
@@ -400,7 +426,8 @@ def tool_review_snapshot_from_logs(
             for i, v in enumerate(revs):
                 scored = [key_to_axis[keys[j]] for j, b in enumerate(v["scores"][:len(keys)])
                           if _int8(b) != _NO_SCORE and keys[j] in key_to_axis]
-                acc = accuracies.get((digest, epoch, i))
+                acc = settled.get((digest, epoch, v["reviewer"]),
+                                  accuracies.get((digest, epoch, i)))
                 entries.append({
                     "reviewer": v["reviewer"], "stake": v["stake"],
                     "accuracy": None if acc is None or int(acc) == _UNINFORMATIVE else int(acc),
@@ -461,14 +488,18 @@ def read_tool_review_snapshot(
             review_counts[k] = review_counts.get(k, 0) + 1
         elif r["event"] == "Finalized":
             e = int(r["args"]["epoch"])
-            if e not in epochs:
+            if e not in epochs and not any(
+                    x["event"] == "EpochStarted" and int(x["args"]["epoch"]) == e
+                    for x in records):
                 info = contract.functions.epochInfo(e).call()
                 epochs[e] = {"axis_ids": [_hex32(x) for x in info[2]],
                              "supply": int(info[4])}
             if int(r["block"]) > int(since_block):
                 window.append((_hex32(r["args"]["digest"]), e))
     accuracies: Dict[Tuple[str, int, int], Optional[int]] = {}
-    for digest, e in sorted(set(window)):
+    settled_keys = {(_hex32(x["args"]["digest"]), int(x["args"]["epoch"]))
+                    for x in records if x["event"] == "ReviewSettled"}
+    for digest, e in sorted(set(window) - settled_keys):
         for i in range(review_counts.get((digest, e), 0)):
             v = contract.functions.reviewAt(bytes.fromhex(digest), e, i).call()
             accuracies[(digest, e, i)] = int(v[3])
