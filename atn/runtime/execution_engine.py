@@ -264,6 +264,11 @@ class ExecutionEngine:
             return False
         if getattr(self, "supervisor", None) is None:
             return False
+        # An imported Claude Code session keeps its claude process live
+        # between runs (bridge liveImported); a worker exits after each run
+        # and would take it down.
+        if getattr(defn, "claude_session", None):
+            return False
         try:
             from .worker_provider import classify_manifest_provider
             classify_manifest_provider(provider)

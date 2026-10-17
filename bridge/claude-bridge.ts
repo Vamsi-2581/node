@@ -978,6 +978,18 @@ let activeAgentLoop: {
   bgTasks?: BgTaskTracker
 } | null = null
 
+// Imported Claude Code sessions kept live between runs, by session id. Their
+// claude process idles with the conversation loaded, as in a terminal, until
+// a run ends badly or the bridge exits.
+const liveImported = new Map<string, {
+  query: Query
+  inputQueue: AsyncQueue<SDKUserMessage>
+  iterator: AsyncIterator<SDKMessage, void>
+  bgTasks: BgTaskTracker
+  totals: { inputTokens: number; outputTokens: number;
+            cacheReadTokens: number; cacheCreationTokens: number }
+}>()
+
 // -- Injection consumption tracking (§5 delivery ack, finding 8) --
 // A delegate_message written to stdin is only "delivered" when the SDK loop
 // actually pulls it out of the input queue. We tag each injected message with
@@ -1030,9 +1042,18 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
     // If native_tools is true, don't restrict — allow all tools including Bash, Read, Write, etc.
     const allowedTools = req.native_tools ? undefined : req.tools.map(t => `mcp__atn__${t.name}`)
 
+    // An imported Claude Code session keeps its query (and so its claude
+    // process) open between runs, the way a terminal keeps the session live:
+    // the next run's message joins the same query instead of a new resume.
+    const imported = req.claude_session && req.claude_session.folder
+      ? req.claude_session : null
+    const liveKey = imported ? imported.session_id : ""
+    const reused = liveKey ? liveImported.get(liveKey) : undefined
+    if (reused) log("request.agent_loop.reuse", { session: liveKey })
+
     // Use streaming input (async generator) — required for MCP tools.
     // Queue stays open so mid-turn user messages and interrupt can be injected.
-    const inputQueue = new AsyncQueue<SDKUserMessage>()
+    const inputQueue = reused ? reused.inputQueue : new AsyncQueue<SDKUserMessage>()
 
     // The message is now just the user's input — no system prompt or history
     // prepended.  System prompt goes via SDK option (cached).  History comes
@@ -1081,8 +1102,6 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
       sdkOptions.effort = pinnedEffort
     }
 
-    const imported = req.claude_session && req.claude_session.folder
-      ? req.claude_session : null
     if (imported) {
       sdkOptions.cwd = imported.folder
       // User, project and local settings: CLAUDE.md, hooks, MCP servers and
@@ -1090,14 +1109,13 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
       sdkOptions.settingSources = ["user", "project", "local"]
       sdkOptions.strictMcpConfig = false
       sdkOptions.systemPrompt = { type: "preset", preset: "claude_code" }
-      // Every tool, subagents included; only the claude.ai connectors stay
-      // out (the rule for every agent the daemon runs).
+      // Configured like the user's own session: every tool, subagents and
+      // claude.ai connectors included, no turn cap, and the effort and
+      // context window the user's settings choose rather than ATN's pins.
       sdkOptions.allowedTools = undefined
-      sdkOptions.disallowedTools = [
-        "mcp__claude_ai_Gmail",
-        "mcp__claude_ai_Google_Calendar",
-        "mcp__claude_ai_Google_Drive",
-      ]
+      sdkOptions.disallowedTools = []
+      delete sdkOptions.maxTurns
+      delete sdkOptions.effort
       log("request.agent_loop.imported", { cwd: imported.folder })
     }
 
@@ -1116,7 +1134,7 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
 
     // Enable 1M context window for models that support it (Sonnet 4.x,
     // Opus 4.7+, Fable/Mythos 5).  Version-aware so new releases work unedited.
-    if (modelHasLargeContext(model)) {
+    if (modelHasLargeContext(model) && !imported) {
       sdkOptions.betas = ["context-1m-2025-08-07"]
       log("request.agent_loop.beta", { betas: sdkOptions.betas })
     }
@@ -1148,12 +1166,15 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
     })
 
     // Ack injected messages the moment the SDK dequeues them (finding 8).
-    attachConsumptionAcks(inputQueue)
+    if (!reused) attachConsumptionAcks(inputQueue)
 
-    const q = query({
+    const q = reused ? reused.query : query({
       prompt: inputQueue,
       options: sdkOptions,
     })
+    // Set when this run ends cleanly on an imported session: the query stays
+    // open for the next run.
+    let keepAlive = false
 
     // onFatal lets the global unhandledRejection/uncaughtException handlers
     // abort THIS collection loop (via a rejected race) instead of leaving the
@@ -1162,7 +1183,7 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
     const fatalPromise = new Promise<never>((_, reject) => { fatalReject = reject })
 
     // Expose to stdin handler for interrupt / user_message
-    const bgTasks = new BgTaskTracker()
+    const bgTasks = reused ? reused.bgTasks : new BgTaskTracker()
     activeAgentLoop = {
       query: q,
       inputQueue,
@@ -1203,7 +1224,7 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
       Number(process.env.ATN_BRIDGE_FIRST_EVENT_TIMEOUT || "120") * 1000
     let firstMessageSeen = false
 
-    const orchIterator = q[Symbol.asyncIterator]()
+    const orchIterator = reused ? reused.iterator : q[Symbol.asyncIterator]()
 
     try {
       while (true) {
@@ -1410,6 +1431,12 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
             continue
           }
 
+          if (imported && !wasInterrupted) {
+            // The session stays live for the next run (see liveImported).
+            keepAlive = true
+            break
+          }
+
           // Close the input queue — this turn is done.
           // If a user_message was already pushed before this result, the SDK
           // will have consumed it.  Any future user_messages should start a
@@ -1444,9 +1471,29 @@ async function handleAgentLoopRequest(req: AgentLoopRequest): Promise<void> {
       if (bgTasks.tasks.size > 0) {
         emitEvent({ type: "background_tasks", tasks: [...bgTasks.tasks.values()] })
       }
-      // Clean up — close the input queue and clear active agent-loop run
-      try { inputQueue.done() } catch {}
+      if (keepAlive) {
+        liveImported.set(liveKey, {
+          query: q, inputQueue, iterator: orchIterator, bgTasks,
+          totals: { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens },
+        })
+      } else {
+        if (liveKey && liveImported.has(liveKey)) {
+          liveImported.delete(liveKey)
+          try { q.close() } catch {}
+        }
+        // Clean up — close the input queue and clear active agent-loop run
+        try { inputQueue.done() } catch {}
+      }
       activeAgentLoop = null
+    }
+
+    // modelUsage is the query's running total; a live session reports only
+    // what this run added.
+    if (reused) {
+      inputTokens -= reused.totals.inputTokens
+      outputTokens -= reused.totals.outputTokens
+      cacheReadTokens -= reused.totals.cacheReadTokens
+      cacheCreationTokens -= reused.totals.cacheCreationTokens
     }
 
     emitEvent({ type: "done" })
