@@ -89,8 +89,20 @@ extension with exactly one slot).
       missed reveal forfeits the whole stake, so revealing always beats
       withholding, whatever others revealed first. A round with no REP
       weight leaves stakes withdrawable (pulled, never pushed).
-    - Malware: the side with more REP wins (accusers vs defenders, e.g. the
-      author rallying REP). Stake never decides it. The appeal path stays.
+    - Harm is a gradient, not a flag: every review carries a harm score
+      in [0, 1]. An audit is a review with high harm. Harm settles like any
+      axis (REP-weighted), counts extra in accuracy (a DAO parameter), and
+      the author's bond is slashed in proportion to the settled harm, with
+      no dead zone; earnings soften it for tools that are actually used.
+      The slashed bond goes to the reviewers who called the harm right.
+      The appeal path overrides the settled harm.
+    - No "vetted" flag: ratings are a gradient, and daemons, agents and
+      owners decide how much REP backing is enough.
+    - A missed reveal costs the worst case a revealed review could have
+      cost: the whole stake and the full REP penalty, staked or not. So
+      withholding never beats revealing, and ATN's price never enters.
+      Reveals are relayable (anyone holding the plaintext can submit), so
+      a daemon can leave a sealed backup with the owner's other devices.
     - A wrong review costs REP in proportion to how far off it was; REP is
       the reputation, so no separate credibility. This applies to every
       reviewer with REP, staked or not.
