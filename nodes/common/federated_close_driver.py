@@ -241,6 +241,10 @@ class FederatedCloseDriver:
         # the output of the epoch IMMEDIATELY before the one being closed
         # (epoch ids are per-daemon, so roots are the shared identity).
         self._last_observed_root: Optional[str] = None
+        # Set while the latest anchor may be a genesis seed this daemon has
+        # not installed (bundle unretrievable or rejected): closing on the
+        # pre-seed local state would fork from peers that adopted it.
+        self._seed_blocker: Optional[str] = None
 
     def carry_over_paths(self) -> Dict[str, Optional[Path]]:
         """The on-disk carry-over files every close reads as INPUTS."""
@@ -281,6 +285,35 @@ class FederatedCloseDriver:
         self._tool_vetting = self._load_tool_vetting()
         self._tool_positions = self._load_tool_positions()
 
+    def seed_marker_path(self) -> Optional[Path]:
+        """Marker recording the installed genesis seed (its carry_cid),
+        next to the carry files. Its presence means the seed anchor's
+        bundle was installed here once and must not overwrite later
+        closes' output."""
+        p = self._tool_registrations_path
+        return None if p is None else p.parent / "carry_seed_installed.json"
+
+    def installed_seed_cid(self) -> Optional[str]:
+        path = self.seed_marker_path()
+        if path is None or not path.exists():
+            return None
+        try:
+            return str(json.loads(path.read_text(encoding="utf-8"))
+                       .get("carry_cid", "")) or None
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return None
+
+    def _write_seed_marker(self, carry_cid: str, epoch_id: str) -> None:
+        path = self.seed_marker_path()
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(
+            {"carry_cid": str(carry_cid), "epoch_id": str(epoch_id)},
+            sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+
     def _carry_files_missing(self) -> bool:
         paths = self.carry_over_paths()
         return any(v is not None and not v.exists() for v in paths.values())
@@ -294,33 +327,80 @@ class FederatedCloseDriver:
         anchor (the winner failed to anchor the last epoch) or a partially
         observed prior epoch means the bundle would be stale: observe.
 
+        Genesis seed (docs/multi_jurisdiction.md decision 9): when the
+        latest anchor is a seed at anchor index 0, its bundle is an adopted
+        snapshot no daemon observed, so it installs WITHOUT the prev_root
+        match and even over existing carry files (they can only hold
+        pre-seed, never-anchored state). It installs exactly once: a marker
+        with its carry_cid is persisted next to the carry files.
+
         Returns the epoch_id whose close produced the installed bundle,
         or None when nothing was installed (the daemon keeps observing).
         """
+        self._seed_blocker = None
         if self.carry_source is None or self._chain_at_genesis is not False:
             return None
         paths = self.carry_over_paths()
         if any(v is None for v in paths.values()):
             return None
-        if not self._carry_files_missing():
+        files_missing = self._carry_files_missing()
+        # A seed can only be the latest anchor while anchorCount == 1
+        # (None = count unknown, check anyway).
+        seed_window = (
+            self.snapshot_anchor_count in (None, 1)
+            and (files_missing or self.installed_seed_cid() is None)
+        )
+        if not files_missing and not seed_window:
             return None
-        if prev_root is None:
+        if files_missing and prev_root is None and not seed_window:
             logger.info(
                 "federated close: joiner has not observed a prior epoch yet; "
                 "observing this one before fetching the anchored carry-over")
             return None
+        unknown_seed = (
+            "latest anchor may be an uninstalled genesis seed (anchor 0) "
+            "whose snapshot could not be fetched; not closing on pre-seed "
+            "local state")
         try:
             fetch = self.carry_source()
         except ValueError as e:
             logger.error(
                 "federated close: REJECTED anchored carry-over bundle "
                 "(integrity check failed, staying in observe mode): %s", e)
+            if seed_window:
+                self._seed_blocker = unknown_seed
             return None
         except Exception as e:
             logger.warning(
                 "federated close: carry-over fetch failed (observing): %s", e)
+            if seed_window:
+                self._seed_blocker = unknown_seed
             return None
         status = getattr(fetch, "status", "")
+        is_seed = (getattr(fetch, "seed", False) is True
+                   and getattr(fetch, "anchor_index", -1) == 0)
+        if is_seed and status == "ok":
+            if not seed_window:
+                return None   # already installed here
+            self.install_carry_over(fetch.carry)
+            self._write_seed_marker(fetch.carry_cid, fetch.epoch_id)
+            logger.info(
+                "federated close: installed the genesis seed snapshot from "
+                "anchor 0 (epoch %s, carry_cid=%s)",
+                fetch.epoch_id, str(fetch.carry_cid)[:16])
+            return str(fetch.epoch_id)
+        if seed_window and status != "ok" and (
+                is_seed or status != "pre_schema"):
+            # The seed's bundle (or the payload that would say whether
+            # anchor 0 is a seed) is not retrievable yet.
+            self._seed_blocker = unknown_seed
+        if not files_missing:
+            return None
+        if prev_root is None:
+            logger.info(
+                "federated close: joiner has not observed a prior epoch yet; "
+                "observing this one before fetching the anchored carry-over")
+            return None
         if status == "ok" and str(
                 getattr(fetch, "epoch_root_hex", "") or "") != prev_root:
             logger.warning(
@@ -380,6 +460,8 @@ class FederatedCloseDriver:
                    else "genesis status unknown")
             blockers.append(
                 f"missing carry-over files ({why}): " + ", ".join(missing))
+        if self._seed_blocker:
+            blockers.append(self._seed_blocker)
         return blockers
 
     def _refresh_voice(self) -> None:

@@ -32,6 +32,12 @@ The authoritative payload is a dict with these fields, in this order:
                        fetch + verify the carry-over instead of trusting a
                        peer. Added in schema 4; schema <= 3 anchors on
                        chain predate it (and cannot be joined trustlessly).
+  15. seed:            true, ONLY on a genesis seed anchor
+                       (docs/multi_jurisdiction.md decision 9): the
+                       carry bundle is an adopted snapshot, not the output
+                       of an observed epoch. Omitted entirely otherwise, so
+                       every ordinary close payload keeps its exact bytes
+                       (no schema bump).
 
 Float formatting
 ----------------
@@ -179,6 +185,10 @@ def encode_authoritative_payload(
     # We rebuild a fresh dict in that order so dict-iteration order
     # matches the spec.
     ordered = {field: canonical[field] for field in _FIELD_ORDER}
+    # Genesis seed marker (decision 9): appended last and only when set,
+    # so ordinary payload bytes are unchanged.
+    if payload.get("seed") is True:
+        ordered["seed"] = True
 
     # Compact JSON, no whitespace, UTF-8.
     return json.dumps(

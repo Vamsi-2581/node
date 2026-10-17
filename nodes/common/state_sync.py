@@ -238,6 +238,8 @@ class AnchoredPayload:
     epoch_root_hex: str
     payload_hash_hex: str
     payload: Dict[str, Any]
+    # 0-based position of this anchor on chain (anchorCount - 1).
+    anchor_index: int = 0
 
 
 def read_latest_anchored_payload(
@@ -281,6 +283,7 @@ def read_latest_anchored_payload(
         epoch_root_hex=epoch_root_hex,
         payload_hash_hex=payload_hash_hex,
         payload=payload,
+        anchor_index=count - 1,
     )
 
 
@@ -295,6 +298,11 @@ class CarryOverFetch:
       - ``"pre_schema"``: the latest anchor's payload has no
         ``carry_cid`` (payload schema <= 3); nothing to verify against.
       - ``"unavailable"``: a required blob is not retrievable (yet).
+
+    ``seed`` is True when the anchor is a genesis seed (payload
+    ``"seed": true`` at anchor index 0, docs/multi_jurisdiction.md
+    decision 9): its bundle is an adopted snapshot, not the output of an
+    observed epoch. A seed flag on any later anchor is ignored (logged).
     """
     status: str
     epoch_id: str = ""
@@ -304,6 +312,8 @@ class CarryOverFetch:
     epoch_root_hex: str = ""
     carry_cid: str = ""
     payload_schema: Any = None
+    seed: bool = False
+    anchor_index: int = -1
     carry: Dict[str, Any] = field(repr=False, default_factory=dict)
 
 
@@ -326,11 +336,21 @@ def fetch_carry_over_from_chain(
         return CarryOverFetch(status=status)
 
     schema = anchored.payload.get("schema")
+    idx = anchored.anchor_index
+    seed = anchored.payload.get("seed") is True
+    if seed and idx != 0:
+        logger.warning(
+            "anchor %d (epoch %s) carries a seed flag; only anchor 0 may "
+            "seed a jurisdiction, treating it as an ordinary anchor",
+            idx, anchored.epoch_id,
+        )
+        seed = False
     carry_cid = str(anchored.payload.get("carry_cid", "") or "")
     if not carry_cid:
         return CarryOverFetch(
             status="pre_schema", epoch_id=anchored.epoch_id,
             epoch_root_hex=anchored.epoch_root_hex, payload_schema=schema,
+            seed=seed, anchor_index=idx,
         )
 
     blob = get_blob(carry_cid)
@@ -343,6 +363,7 @@ def fetch_carry_over_from_chain(
             status="unavailable", epoch_id=anchored.epoch_id,
             epoch_root_hex=anchored.epoch_root_hex,
             carry_cid=carry_cid, payload_schema=schema,
+            seed=seed, anchor_index=idx,
         )
     if cid_for_blob(blob) != carry_cid:
         raise ValueError(
@@ -361,6 +382,8 @@ def fetch_carry_over_from_chain(
         epoch_root_hex=anchored.epoch_root_hex,
         carry_cid=carry_cid,
         payload_schema=schema,
+        seed=seed,
+        anchor_index=idx,
         carry=bundle["carry"],
     )
 

@@ -111,6 +111,40 @@ extension with exactly one slot).
     simultaneous multi-jurisdiction, cross-jurisdiction provenance or
     ratings.
 
+## Merging by genesis (operator steps)
+
+Decision 9, as built. The seed is the new DAO's anchor 0: its payload
+carries `"seed": true` and a `carry_cid` for the merged carry bundle
+(tool registrations, vetting, positions). It mints nothing (agentMintRoot
+zero, agentMintCid empty). Daemons install it once at their next close,
+without the usual "observed the previous epoch" check, and replace any
+pre-seed local carry state. A seed flag on any later anchor is ignored.
+
+1. Agree the genesis REP list off-chain and deploy the new DAO with it
+   (plus its Substrate, with the DAO timelock as governor and no anchors
+   yet).
+2. Build the snapshot:
+   `python scripts/build_genesis_seed.py --chain-id <new chain id>
+   --source chain:<rpc>,<substrate A> --source chain:<rpc>,<substrate B>
+   --source-blobs <dir holding A and B blobs> --out seed_out
+   --blob-store <daemon blob dir>`. Each chain source's latest anchored
+   bundle is hash-verified against its chain. Sources are listed in
+   priority order: on a conflict the first wins, and the conflict is
+   printed. `--source bundle:<file>` takes a local bundle (unverified).
+3. Post the blobs: the two files named by their cids in `seed_out`
+   (bundle and payload). `--blob-store` puts them in a daemon's store
+   (`<world data root>/<rpb>/blobs`), which serves them peer to peer.
+4. Propose the anchor: target the new Substrate, calldata from
+   `seed_out/seed_anchor.json` (`calldata`, or `anchor_args_ordered`), and
+   the exact description `Anchor epoch seed 0x<epochRoot>`. epochRoot is
+   sha256 over `autonet:genesis-seed:v1|<chain id>|<carry_cid>`.
+5. Members verify before voting: fetch both blobs, check sha256 against
+   `carry_cid` and `payloadHash`, check the payload's `carry_cid`, and read
+   the printed counts and conflicts (or rerun the builder themselves:
+   the bytes are deterministic).
+6. Vote. Members who don't take part simply didn't merge. Tokens move by
+   ordinary treasury transfer proposals.
+
 ## Backlog
 
 Contracts (must land before the Shadownet redeploy):
