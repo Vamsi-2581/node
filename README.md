@@ -217,9 +217,9 @@ The Python suite is large and slow, so **never run the whole `pytest tests/`**; 
 The codebase splits into a **core-protected layer** (seven files enforcing the jurisdiction's constitutional guarantees: constitution injection, lineage-hash verification, alignment-hash computation, on-chain integrity check, all hashed into an on-chain fingerprint) and an **extensible surface** (everything else: providers, tools, connectors, CLI, config). Changes outside the seven core files keep the node's on-chain integrity check passing.
 
 1. Fork the repo.
-2. Make changes (extensible surface).
-3. Run targeted test subsets, never the full suite.
-4. Open a PR.
+2. Make changes (extensible surface) on a short topic branch off `master`.
+3. Run targeted test subsets, never the full suite, plus the end-to-end scripts for the areas you touched.
+4. Open a PR. Merges follow [`docs/merging.md`](docs/merging.md): rebase onto `master`, fast-forward only, docs updated with the code.
 
 ## Related repositories
 
