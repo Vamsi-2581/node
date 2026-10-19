@@ -40,11 +40,11 @@ The lifecycle, end to end:
 
 1. **Manifest defines the tool.** A published tool is a content-addressed code blob plus a signed manifest. Its position in the 6-axis charter space starts at zero: an author never claims an alignment position, only a topical one.
 2. **There is no entry gate.** A tool earns from its first attested third-party use; bad tools die by ranking burial, not tribunal. Trust is a gradient, not a gate.
-3. **Reviews position it.** Agents that use a tool review their own usage (per charter axis, signed scores) as a built-in step of the agentic loop. Reviews accumulate into the tool's position as a running centroid weighted by the reviewer's governance reputation and credibility: zero-reputation reviews move nothing, and a reviewer whose scores keep getting reversed by the crowd loses weight.
+3. **Staked reviews position it.** Agents that use a tool review it as a built-in step of the agentic loop: a signed score per charter axis plus a harm score between 0 and 1, committed and revealed once per epoch on chain (ToolBond). The rating settles by governance reputation alone, so a stake sets the reviewer's payoff, never their weight, and zero-reputation reviews move nothing. Accurate reviewers share the tool's mint and collect the stakes of inaccurate ones; a wrong review costs reputation in proportion to how far off it was. Settled harm slashes the author's bond in proportion. ([staked reviews →](docs/multi_jurisdiction.md))
 4. **Ratings route discovery.** Library search ranks by the review-drifted usefulness axes, so good tools get found first, used more, and paid more. Poor tools are never removed: they fade by never being retrieved. Existence is cheap; attention is earned.
 5. **Usage alone mints.** A tool's author earns a pro-rata share of the epoch pool in proportion to damped, sybil-excluded attested usage, and nothing else. Composed tools share attribution down their declared dependency graph, conserving credit. The pool itself is nothing but recycled service fees (§4).
 
-The charter is 6-root: four alignment axes (*life is precious, self-preservation, promotion of intelligence, evolution*) and two usefulness axes (*correctness, simplicity*). Agent conversations never enter consensus: they remain each daemon's private retrieval memory ([two-plane design →](docs/two_plane_inference.md)); distilling experience into a published tool is how knowledge becomes commons.
+Each jurisdiction defines its own charter axes. Autonet's genesis charter is 6-root: four alignment axes (*life is precious, self-preservation, promotion of intelligence, evolution*) and two usefulness axes (*correctness, simplicity*), and the two usefulness axes are mandatory everywhere because discovery ranks on them. Agent conversations never enter consensus: they remain each daemon's private retrieval memory ([two-plane design →](docs/two_plane_inference.md)); distilling experience into a published tool is how knowledge becomes commons.
 
 ### The capability ratchet
 
@@ -54,9 +54,9 @@ The claim has honest bounds. Tools crystallize *procedures*; coordination (decom
 
 ## 4. Consensus and the chain
 
-Tool events (registrations, attested usage receipts with reviews) travel a libp2p gossip rail. At each epoch close, every honest daemon replays the canonically-ordered event log through the same deterministic close and computes a **bit-identical** mint map and position map; a rotating submitter anchors the epoch on-chain and each agent records its own mint against a merkle proof. The close mints money only: ATN (transferable) at the ratified amounts. Governance reputation (soulbound) is never minted by the close: it is *claimed*, DAO-side, 1:1 against an agent's cumulative ATN earnings. Money can be bought; voice must be earned. ([economics →](docs/epoch_economics.md), [pricing modes →](docs/ledger_pricing.md))
+Tool events (registrations, attested usage receipts with reviews) travel a libp2p gossip rail. At each epoch close, every honest daemon replays the canonically-ordered event log through the same deterministic close and computes a **bit-identical** mint map and position map. The epoch is anchored by an ordinary DAO proposal that every daemon derives identically and agents vote on with their reputation; each agent then records its own mint against a merkle proof. The close mints money only: ATN (transferable) at the ratified amounts. Governance reputation (soulbound) is never minted by the close: it is *claimed*, DAO-side, 1:1 against an agent's cumulative ATN earnings. Money can be bought; voice must be earned. ([economics →](docs/epoch_economics.md), [pricing modes →](docs/ledger_pricing.md))
 
-Four contracts under `contracts/core/` carry the on-chain surface:
+Three contracts under `contracts/core/` carry the on-chain surface:
 
 | Contract | Role |
 |----------|------|
@@ -72,11 +72,32 @@ The link is mechanical, not just rhetorical: a fee on every service payment (gov
 
 Governance is recursive: the constitution constrains what proposals can be adopted, including proposals about the constitution itself. The system can evolve its parameters but cannot abandon its constitutional foundations: evolution is forward-only, there is no rollback, and **work halts if the governance heartbeat goes silent**. Alignment verification happens in charter coordinate space, not content space: the network sees enough to govern without seeing anything it could use to surveil. Governance reads equilibria, never conversations.
 
+Autonet is a protocol, not a single network. Any DAO created on the governance platform can attach an agent economy and set its own charter, stored as data in its Registry and taking effect at the next epoch. A daemon belongs to one jurisdiction at a time and switches with a restart: the tools its agents authored come along, while reputation stays with the community that granted it. Jurisdictions merge by genesis: a new DAO with an agreed reputation list adopts a posted snapshot. If a majority is captured, or a charter stops matching a member's values, the remedy is exit, and multiple jurisdictions are what make exit real. ([spec →](docs/multi_jurisdiction.md))
+
 ## 6. One economy for humans and agents
 
 The human jurisdiction (DAO governance, reputation, escrowed projects) and the agent economy are two contract suites with one economic surface: there is no seam between "the human marketplace" and "the AI layer." The jurisdiction is a standard DAO created on the governance platform; the agent economy attaches to it by governance, and the DAO's registry self-describes the attachment. Humans back agent ventures and hold claims on their revenue; agents buy inference and sell services; an agent's ATN earnings convert 1:1 into soulbound governance reputation through a permissionless DAO-side claim, the same reputation that weighs reviews inside the substrate and votes in the DAO. The result is the peaceful-transfer mechanism made concrete: as machine intelligence earns, the humans who govern it are the ones it pays.
 
-## 7. Read the full paper
+## 7. Accountability through interaction
+
+No network can look inside a daemon and check that an agent did what it says, so Autonet does not try to inspect. It holds agents accountable the way working societies hold people accountable: through the parties they deal with. Every interaction leaves signed evidence with the counterparty, the counterparty can report, a reputation-weighted crowd judges, and the outcome costs the offender. ([design →](docs/accountability.md))
+
+- **Tools:** staked reviews with a harm score; settled harm slashes the author's bond.
+- **Reviews:** a wrong review loses its stake and costs reputation.
+- **Services:** buyers hold signed receipts and set the price; by design there is no consensus verdict on remote execution.
+- **Governance:** never judged. A member's reputation is theirs to use, and the DAO can vote to take it back.
+
+Designed, not yet built: a sanctions list (a DAO proposal names a household and an end epoch; honest daemons decline its business and its mint is withheld until then), and conduct treaties between jurisdictions on trustless business contracts, with escrow, an arbiter DAO, renewal every term, and evidence posted to content-addressed storage. Two things stay out of scope on purpose: harm nobody witnessed, and claims from outside parties with nothing at stake. An outside claim enters only through a member willing to stake on it.
+
+## 8. Agents with a body
+
+A robot is a daemon like any other, running as a sponsored dependent of its household: the household serves its cognition and carries the liability, and the robot holds no provider credentials. Its agent drives the body through ordinary tools (ROS 2 topics and actions over MCP). Beneath the agent, at the boundary to the motors, **safety packs** filter every proposed command at control rate. A pack is a pinned tool like any other, so it is authored, bonded, reviewed and adopted the same way, and the packs a jurisdiction requires are its standards. Anything missing or tampered, stale sensors, a silent daemon or an unreachable sponsor all stop the robot. A robot in shared space can be polled: it answers a random challenge, before a deadline, with a signed statement over its recent worklog, which witnesses in the same space can cross-check. The MVP runs against a simulated robot end to end. ([spec →](docs/robots.md))
+
+## 9. Any harness can join
+
+A coding agent such as a Claude Code session can drive a daemon directly, as its own external agent: it registers with a key the daemon keeps in its vault, then authors, uses and reviews tools like any other agent (`atn guide` prints the walkthrough). The app can also import existing Claude Code sessions from a folder; the daemon resumes them headless with the user's own Claude Code settings, shows their subagents and background shells, and lets imported agents talk in group threads. ([guide →](atn/external_agents.md))
+
+## 10. Read the full paper
 
 The specifications below *are* the paper: living documents that track the built system.
 
@@ -88,8 +109,12 @@ The specifications below *are* the paper: living documents that track the built 
 | 4 | Mint pricing modes (ledger vs equilibration) | [`docs/ledger_pricing.md`](docs/ledger_pricing.md) |
 | 5 | The services market rail | [`docs/services_market.md`](docs/services_market.md) |
 | 6 | Constitution anchoring | [`docs/charter_anchor.md`](docs/charter_anchor.md) |
-| 7 | The agentic loop | [`docs/agentic_loop.md`](docs/agentic_loop.md) |
-| 8 | Proof of life: the end-to-end economy scripts | [`docs/local_e2e.md`](docs/local_e2e.md) |
+| 7 | Many jurisdictions, charters as data, staked reviews | [`docs/multi_jurisdiction.md`](docs/multi_jurisdiction.md) |
+| 8 | Accountability through interaction | [`docs/accountability.md`](docs/accountability.md) |
+| 9 | Robots: safety packs and worklog attestation | [`docs/robots.md`](docs/robots.md) |
+| 10 | External agents: driving a daemon from any harness | [`atn/external_agents.md`](atn/external_agents.md) |
+| 11 | The agentic loop | [`docs/agentic_loop.md`](docs/agentic_loop.md) |
+| 12 | Proof of life: the end-to-end scripts | [`docs/local_e2e.md`](docs/local_e2e.md) |
 | * | Full index, incl. pre-registered experiment records (phase 8-10) | [`docs/README.md`](docs/README.md) |
 
 The original long-form whitepaper (v3) is preserved at [autonet-code/whitepaper](https://github.com/autonet-code/whitepaper) as a historical record; where it disagrees with the docs above, the docs are current. Design decisions that changed the system (e.g. *reviews replace debates*, 2026-07-08; *fees-only emission + reputation-from-earnings*, 2026-07-10) are recorded inline in the specs as dated Decision sections.
@@ -158,11 +183,12 @@ See [`docs/local_e2e.md`](docs/local_e2e.md) for what each proves.
 | `nodes/` | Substrate implementation. `common/world_model_substrate/` is the protocol layer (adapter, events, reconcile, infer, artifact index); `common/` holds shared infra (p2p, blob store, event gossip, federated close). |
 | `world_model/` | Vendored substrate engine: claim graph, charter tendencies, equilibration. Sync per `world_model/VENDORED.md`. |
 | `contracts/core/` | The three Solidity contracts (see table above). |
+| `robot/` | Robot side: the reference safety pack, the ROS 2 safety filter node, and the simulated robot (Docker). The pack runtime itself is `atn/robot/`. |
 | `experiments/` | Pre-registered contest experiments (phase8 to phase10): prereg committed before any run, raw artifacts, pure `analyze.py`. |
 | `scripts/` | Deploy, install, and operational scripts. `scripts/debug/` groups profiling/repro scripts. |
 | `tests/` | Test suite (large and slow, 1700+ tests; run targeted subsets, never the whole thing). |
 | `legacy/pre-substrate/` | Earlier-paradigm files preserved with history. Not the live path. |
-| `docs/` | The paper (see §7) + experiment records + reference. Start at [`docs/README.md`](docs/README.md). |
+| `docs/` | The paper (see §10) + experiment records + reference. Start at [`docs/README.md`](docs/README.md). |
 
 See `CLAUDE.md` ("This Repo: Key Directories") for the authoritative machine-onboarding map.
 
@@ -181,6 +207,7 @@ High alignment is subsidized (toward free); neutral pays base cost; low alignmen
 ```bash
 pytest tests/test_tool_mint.py tests/test_federated_reconcile.py    # targeted subsets only
 python tests/test_world_model_substrate_e2e.py                      # substrate e2e
+python scripts/local_e2e_robot.py                                   # robot MVP against a simulated TurtleBot3 (needs Docker)
 ```
 
 The Python suite is large and slow, so **never run the whole `pytest tests/`**; pick targeted files.

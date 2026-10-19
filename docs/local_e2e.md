@@ -609,3 +609,32 @@ USERPROFILE and KEYSTORE_DIR point at a temp dir for the whole run.
 Not covered: anchoring through a real DAO proposal (the governor is an EOA
 here), DAO overrule (`daoOverrule` is timelock-only), forfeit of a missed
 reveal, unbond/withdraw.
+
+# Local end-to-end: the robot MVP
+
+`scripts/local_e2e_robot.py` runs the robot side (docs/robots.md) against a
+simulated TurtleBot3 in headless Gazebo, in Docker (`robot/sim/`). The
+daemon's robot service runs in-process against a temp home.
+
+## Run
+
+```bash
+python scripts/local_e2e_robot.py          # 10 stages; builds the image on first run
+E2E_ROBOT_KEEP=1 python scripts/local_e2e_robot.py   # leave the container up to inspect
+```
+
+## What it proves
+
+1. The sim is up: rosbridge reachable, `/scan` and `/odom` flowing.
+2. The daemon exports the required pack and the filter verifies and loads it.
+3. Driving at an obstacle over the speed cap is slowed, then stopped short of it.
+4. Reversing away is allowed.
+5. A pack edited in place is refused, and nothing moves.
+6. Re-exporting restores motion.
+7. A stale daemon heartbeat stops the robot.
+8. An unreachable sponsor stops the robot.
+9. A challenge answer verifies; a tampered chunk, a wrong key and a late answer fail.
+10. The agent's ros-mcp connector pushing forward is clipped and never crosses
+    the stop distance.
+
+Limits are listed in docs/robots.md ("Known limits of the MVP").
