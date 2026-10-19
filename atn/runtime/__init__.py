@@ -762,6 +762,14 @@ class Runtime:
         # Start scheduler loops
         self.scheduler.start()
 
+        # Robot side (docs/robots.md): pack export + heartbeat for the
+        # robot's safety filter. Off unless robot.enabled.
+        self.robot = None
+        if self._config.robot.enabled:
+            from ..robot.service import RobotService
+            self.robot = RobotService(self, self._config)
+            self.robot.start()
+
         # Start voice service if configured
         if self._config.voice.enabled:
             await self.start_voice()
@@ -849,6 +857,9 @@ class Runtime:
     async def stop(self) -> None:
         self._shutdown_event.set()
         await self.control.kill_all()
+
+        if getattr(self, "robot", None) is not None:
+            await self.robot.stop()
 
         # Stop the supervisor monitor loop (idempotent; no-op if never started).
         try:

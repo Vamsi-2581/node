@@ -442,6 +442,25 @@ class SecretsConfig:
 
 
 @dataclass
+class RobotConfig:
+    """This daemon runs a robot (docs/robots.md). Off unless ``enabled``.
+
+    ``bundle_dir`` is where the daemon exports the required safety packs and
+    writes its heartbeat for the robot's filter node. ``required_packs`` are
+    tool names or digests in this daemon's tool store (the jurisdiction's
+    standards, from config until they move to the Registry). ``bag_dir`` holds
+    the robot's MCAP worklog chunks, which ``robot_attest`` hashes.
+    ``agent_id`` is the robot's own agent; its key signs attestations.
+    """
+    enabled: bool = False
+    agent_id: str = ""
+    bundle_dir: str = ""
+    bag_dir: str = ""
+    required_packs: list[str] = field(default_factory=list)
+    heartbeat_interval_s: float = 1.0
+
+
+@dataclass
 class ATNConfig:
     """Top-level ATN configuration."""
     data_dir: Path = field(default_factory=lambda: _DEFAULT_DIR)
@@ -461,6 +480,7 @@ class ATNConfig:
     auto_update: AutoUpdateConfig = field(default_factory=AutoUpdateConfig)
     worker_isolation: WorkerIsolationConfig = field(default_factory=WorkerIsolationConfig)
     secrets: SecretsConfig = field(default_factory=SecretsConfig)
+    robot: RobotConfig = field(default_factory=RobotConfig)
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     connectors: dict[str, ConnectorConfig] = field(default_factory=dict)
     # Seconds an MCP connector may sit idle before the daemon stops it.
@@ -1010,6 +1030,18 @@ def _load_worker_isolation(wi_raw: dict[str, Any]) -> WorkerIsolationConfig:
     return WorkerIsolationConfig(enabled=wi_enabled, memory_cap_mb=memory_cap_mb)
 
 
+def _load_robot(raw: dict[str, Any]) -> RobotConfig:
+    packs = raw.get("required_packs") or []
+    return RobotConfig(
+        enabled=bool(raw.get("enabled", False)),
+        agent_id=str(raw.get("agent_id") or ""),
+        bundle_dir=str(raw.get("bundle_dir") or ""),
+        bag_dir=str(raw.get("bag_dir") or ""),
+        required_packs=[str(p) for p in packs] if isinstance(packs, list) else [],
+        heartbeat_interval_s=float(raw.get("heartbeat_interval_s", 1.0) or 1.0),
+    )
+
+
 def _load_secrets(secrets_raw: dict[str, Any]) -> SecretsConfig:
     """Build the secrets config (secret-allowance / tripwire track).
 
@@ -1304,6 +1336,8 @@ def load_config(path: Path | None = None) -> ATNConfig:
     secrets_raw = raw.get("secrets", {})
     config.secrets = _load_secrets(
         secrets_raw if isinstance(secrets_raw, dict) else {})
+    robot_raw = raw.get("robot", {})
+    config.robot = _load_robot(robot_raw if isinstance(robot_raw, dict) else {})
 
     # Idle-connector reaping. Top-level (not per-connector): the cost being
     # managed is the daemon's total resident footprint, not any one server's.

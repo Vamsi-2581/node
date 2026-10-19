@@ -262,6 +262,7 @@ INTEGRATION_DENIED_MESSAGES = frozenset({
     "autonet_publish_standards", "autonet_set_capture_config",
     "autonet_switch", "autonet_jurisdictions",
     "claude_sessions", "claude_session_import",
+    "robot_status", "robot_export_packs", "robot_attest",
     # Whole-fleet reads (snapshot carries owner-global sections).
     "snapshot", "get_snapshot", "list_agents",
 })
@@ -2836,6 +2837,25 @@ class WebSocketBridge:
 
         if msg_type == "claude_session_import":
             return {"msg_id": msg_id, **(await self._import_claude_session(msg))}
+
+        # Robot side (docs/robots.md). A challenge answer is signed by the
+        # robot agent's key over its recent worklog chunks.
+        if msg_type in ("robot_status", "robot_export_packs", "robot_attest"):
+            robot = getattr(self.runtime, "robot", None)
+            if robot is None:
+                return {"msg_id": msg_id, "ok": False,
+                        "error": "this daemon is not a robot (robot.enabled is off)"}
+            try:
+                if msg_type == "robot_status":
+                    result = robot.status()
+                elif msg_type == "robot_export_packs":
+                    result = robot.export_packs()
+                else:
+                    result = robot.attest(str(msg.get("challenge") or ""),
+                                          float(msg.get("window_s") or 60.0))
+            except ValueError as exc:
+                return {"msg_id": msg_id, "ok": False, "error": str(exc)}
+            return {"msg_id": msg_id, "ok": True, "result": result}
 
         if msg_type == "autonet_jurisdictions":
             return {"msg_id": msg_id, "ok": True,
