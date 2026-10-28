@@ -86,8 +86,8 @@ contract Substrate is EIP712 {
     /// @param governor_ The DAO timelock. The only address that may anchor
     ///        an epoch (anchor) and retune the service fee
     ///        (setServiceFeeBps). Anchors arrive as ordinary DAO proposals
-    // Cumulative net service revenue per recipient. This payment ledger
-    // does not accrue REP; DAO-side claims use agentMintTotal only.
+    ///        (Decision 2026-10-16), so the DAO's REP vote is the anchor
+    ///        authority and the DAO can cancel a bad anchor in the timelock.
     ///        Immutable and non-zero.
     constructor(
         address treasury_,
@@ -943,7 +943,7 @@ contract Substrate is EIP712 {
     /// @dev The one ATN mint primitive: bumps balance + supply, checkpoints
     ///      both, and emits the canonical mint transfer (from address(0)).
     ///      Substrate mints ATN only and never reputation (REP is a DAO-side
-    ///      claim on earnings, Decision 2026-07-10). The training path
+    ///      claim on ratified tool-pool earnings, Decision 2026-07-10). The training path
     ///      additionally accrues the earnings ledger (agentMintTotal) around
     ///      its call to this; the purchased-money path (mintFromVault) does
     ///      not, because bought ATN grants no REP claim.
@@ -1114,6 +1114,7 @@ contract Substrate is EIP712 {
     ///         ledger is not a REP claim base; DAO-side REP claims use
     ///         agentMintTotal only. Bumped by payForService with the post-fee
     ///         `net`; monotonic.
+    mapping(address => uint256) public serviceEarnings;
 
     // -------------------------------------------------------------------------
     // Vault minter (purchased-money rail).
@@ -1122,8 +1123,8 @@ contract Substrate is EIP712 {
     // recordTrainingForEpoch (which also accrues the REP claim ledger),
     // and PURCHASED money via mintFromVault (which does not). The two are
     // kept strictly separate on purpose: a venture backer who buys ATN
-    //     through the DAO-repo AutonetVault accrues no tool-pool earnings
-    //     and therefore no REP claim — money can be bought, voice must be
+    // through the DAO-repo AutonetVault accrues no tool-pool earnings
+    // and therefore no REP claim — money can be bought, voice must be
     // earned (Decision 2026-07-10).
     //
     // vaultMinter is the single privileged address (the AutonetVault
